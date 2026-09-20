@@ -67,7 +67,7 @@ def directory_browsing():
                 in_pane(app, index, r"raw\xFF")
                 assert ".hidden" not in pane_text(app, index)
 
-            app.send("\x1b[B\r")
+            app.send("\x1b[B\x1b[B\r")
             in_pane(app, 0, "inside.txt")
             assert "inside.txt" not in pane_text(app, 1), (
                 "navigation changed the other pane"
@@ -90,7 +90,7 @@ def directory_browsing():
             in_pane(app, 0, "9 items | 0 marked")
 
             # Alpha is the first regular file after three directory entries.
-            app.send("\x1b[H" + "\x1b[B" * 4 + " ")
+            app.send("\x1b[H" + "\x1b[B" * 5 + " ")
             in_pane(app, 0, "1 marked")
             in_pane(app, 0, "* alpha.txt")
             app.send("s")
@@ -184,13 +184,13 @@ def shift_marking():
         try:
             app.start()
             in_pane(app, 0, "30 items")
-            app.send("\x1b[1;2A")  # Shift+Up on parent cannot mark it.
+            app.send("\x1b[1;2A")  # Shift+Up on Current row cannot mark it.
             in_pane(app, 0, "0 marked")
-            app.send("\x1b[B" + "\x1b[1;2B" * 3)
+            app.send("\x1b[B\x1b[B" + "\x1b[1;2B" * 3)
             in_pane(app, 0, "3 marked")
             in_pane(app, 1, "0 marked")
             # Traverse the same rows again: all three marks are removed.
-            app.send("\x1b[H\x1b[B" + "\x1b[1;2B" * 3)
+            app.send("\x1b[H\x1b[B\x1b[B" + "\x1b[1;2B" * 3)
             in_pane(app, 0, "0 marked")
             app.send("\x1b[H\x1b[1;2F")  # Toggle the entire range on.
             in_pane(app, 0, "30 marked")
@@ -207,7 +207,7 @@ def shift_marking():
             app.send("\x1b[H\x12")
             in_pane(app, 0, "30 marked")
             # Shift+PageDown retains its terminal-history binding.
-            app.send("\x1b[6;2~\x1b[B ")
+            app.send("\x1b[6;2~\x1b[B\x1b[B ")
             in_pane(app, 0, "29 marked")
             assert "* item00" not in pane_text(app, 0)
             # Shift navigation in shell focus is not applied to either pane.

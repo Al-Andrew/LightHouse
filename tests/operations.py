@@ -38,19 +38,19 @@ def file_actions():
             go(app, dest)
             in_pane(app, 1, "0 items")
             app.send("\t")
-            # Synthetic parent is never an operation source.
+            # Current row is never an operation source.
             app.send(F5)
             app.pump(0.1)
             assert "Source:" not in app.screen.text()
             # Copy a directory with the other pane as default destination.
-            app.send("\x1b[B" + F5)
+            app.send("\x1b[B\x1b[B" + F5)
             app.expect("Source: tree")
             app.send("\r")
             completed(app)
             assert (dest / "tree" / ".hidden").read_text() == "nested"
             assert os.readlink(dest / "tree" / "loop") == "."
             in_pane(app, 1, "tree")
-            # Select two files and leave cursor on the parent. Marks win.
+            # Select two files and leave Cursor on the Current row. Marks win.
             app.send("\x1b[B\x1b[2~\x1b[2~\x1b[H" + F5)
             app.expect("2 marked items")
             app.send("\r")
@@ -68,7 +68,7 @@ def file_actions():
             app.expect("Partial")
             app.send("\r")
             # Clear marks, rename a single file relative to the source pane.
-            app.send("\x1b[H\x1b[B\x1b[B\x1b[2~\x1b[2~\x1b[A" + F6)
+            app.send("\x1b[H\x1b[B\x1b[B\x1b[B\x1b[2~\x1b[2~\x1b[A" + F6)
             app.expect("Move / Rename")
             app.expect("Source: a.txt")
             submit(app, "renamed.txt")
@@ -123,7 +123,7 @@ def partial_copy():
         try:
             app.start()
             in_pane(app, 0, "1 items")
-            app.send("\x1b[B" + F5)
+            app.send("\x1b[B\x1b[B" + F5)
             submit(app, "copy")
             app.expect("Unsupported file type")
             assert (root / "tree" / "pipe").exists()
@@ -155,7 +155,7 @@ def cross_filesystem_move():
         try:
             app.start()
             in_pane(app, 0, "1 items")
-            app.send("\x1b[B" + F6)
+            app.send("\x1b[B\x1b[B" + F6)
             submit(app, destination)
             app.expect("Moves between filesystems are not supported yet")
             assert (root / "source").read_text() == "preserve me"
@@ -188,8 +188,8 @@ def delete_actions():
             app.send(F8)  # Never delete the synthetic parent entry.
             app.pump(0.1)
             assert "Permanently delete" not in app.screen.text()
-            # Mark a tree and a directory link; the cursor returns to parent.
-            app.send("\x1b[B\x1b[2~\x1b[2~\x1b[H" + F8)
+            # Mark a tree and a directory link; the Cursor returns to the Current row.
+            app.send("\x1b[B\x1b[B\x1b[2~\x1b[2~\x1b[H" + F8)
             app.expect("Permanently delete 2 item(s)?")
             app.expect("This cannot be undone")
             app.send(b"\x1b[200~\r\nn\x1b[201~")
@@ -211,7 +211,7 @@ def delete_actions():
                 in_pane(app, index, "3 items")
             # Delete one file, then a broken link without dereferencing it.
             for name, count in [("c_file", 2), ("d_broken", 1)]:
-                app.send("\x1b[H\x1b[B" + F8)
+                app.send("\x1b[H\x1b[B\x1b[B" + F8)
                 app.expect("Permanently delete 1 item(s)?")
                 app.expect(str(source / name))
                 app.send("\r")
@@ -219,7 +219,7 @@ def delete_actions():
                 assert not os.path.lexists(source / name)
                 in_pane(app, 0, f"{count} items")
             # A stale source fails in the app instead of affecting another entry.
-            app.send("\x1b[H\x1b[B" + F8)
+            app.send("\x1b[H\x1b[B\x1b[B" + F8)
             app.expect("Permanently delete 1 item(s)?")
             (source / "z_keep").unlink()
             app.send("\r")
@@ -246,7 +246,7 @@ def delete_permission_error():
         try:
             app.start()
             in_pane(app, 0, "1 items")
-            app.send("\x1b[B" + F8)
+            app.send("\x1b[B\x1b[B" + F8)
             app.expect("Permanently delete 1 item(s)?")
             app.send("\r")
             app.expect("Permission denied")
@@ -274,11 +274,11 @@ def shift_marked_actions():
                 app.send("\t")
                 go(app, destination)
                 in_pane(app, 1, "0 items")
-                app.send("\t\x1b[B" + "\x1b[1;2B" * 2)  # Mark a/b; cursor on keep.
+                app.send("\t\x1b[B\x1b[B" + "\x1b[1;2B" * 2)  # Mark a/b; cursor on keep.
                 in_pane(app, 0, "2 marked")
-                app.send("\x1b[H\x1b[B" + "\x1b[1;2B" * 2)  # Unmark a/b.
+                app.send("\x1b[H\x1b[B\x1b[B" + "\x1b[1;2B" * 2)  # Unmark a/b.
                 in_pane(app, 0, "0 marked")
-                app.send("\x1b[H\x1b[B" + "\x1b[1;2B" * 2)  # Mark them again.
+                app.send("\x1b[H\x1b[B\x1b[B" + "\x1b[1;2B" * 2)  # Mark them again.
                 in_pane(app, 0, "2 marked")
                 in_pane(app, 1, "0 marked")
                 app.send("\x1b[F")  # Cursor on unmarked keep; actions use a/b.
@@ -316,7 +316,7 @@ def merge_decisions():
             app.start()
             in_pane(app, 0, "1 items")
             app.send("\x07sleep 0.2; printf BACKGROUND_; printf FINISHED\r\x07")
-            app.send("\x1b[B" + F5)
+            app.send("\x1b[B\x1b[B" + F5)
             submit(app, dest)
             app.expect("Destination conflict")
             app.expect("[ ] Apply to all")

@@ -41,8 +41,10 @@ pub const Pane = opaque {
         loading,
         failed: struct { err: anyerror, path: ?[]const u8 },
     };
+    pub const RowKind = enum { current, parent, entry };
     pub const Row = struct {
-        // Null denotes the parent row, never a filesystem entry.
+        kind: RowKind,
+        // Reference rows are never filesystem entries.
         entry: ?*const directory.Entry,
         focused: bool,
         marked: bool,
@@ -60,31 +62,35 @@ pub const Pane = opaque {
         options: directory.Options,
         status: Status,
 
+        pub fn referenceRowCount(self: View) usize {
+            return 1 + @as(usize, @intFromBool(self.has_parent));
+        }
+
         fn entryAt(self: View, index: usize) ?*const directory.Entry {
-            const parent_offset: usize = @intFromBool(self.has_parent);
-            if (index < parent_offset or index - parent_offset >= self.entries.len) return null;
-            return &self.entries[index - parent_offset];
+            const reference_offset: usize = self.referenceRowCount();
+            if (index < reference_offset or index - reference_offset >= self.entries.len) return null;
+            return &self.entries[index - reference_offset];
         }
 
         pub fn focusedMarked(self: View) bool {
-            return self.focused() != null and self.marks[self.cursor - @intFromBool(self.has_parent)];
+            return self.focused() != null and self.marks[self.cursor - self.referenceRowCount()];
         }
 
         pub fn focused(self: View) ?*const directory.Entry {
             return self.entryAt(self.cursor);
         }
 
-        /// A viewport-relative row, with parent mapping and cursor state resolved.
+        /// A viewport-relative row, with reference-row mapping and cursor state resolved.
         pub fn row(self: View, offset: usize) ?Row {
             if (offset >= self.visible_rows) return null;
             const index = self.first_visible +| offset;
-            const count = self.entries.len + @intFromBool(self.has_parent);
+            const count = self.entries.len + self.referenceRowCount();
             if (index >= count) return null;
-            return .{ .entry = self.entryAt(index), .focused = index == self.cursor, .marked = if (self.entryAt(index) != null) self.marks[index - @intFromBool(self.has_parent)] else false };
+            return .{ .kind = if (index == 0) .current else if (index < self.referenceRowCount()) .parent else .entry, .entry = self.entryAt(index), .focused = index == self.cursor, .marked = if (self.entryAt(index) != null) self.marks[index - self.referenceRowCount()] else false };
         }
     };
-    /// Short-lived, read-only iteration in displayed order. The parent is never
-    /// a source; marks take precedence over the cursor. Consume before mutation.
+    /// Short-lived, read-only iteration in displayed order. Reference rows are never
+    /// sources; marks take precedence over the cursor. Consume before mutation.
     pub const Sources = struct {
         entries: []const directory.Entry,
         marked_only: bool,
@@ -140,18 +146,32 @@ pub const Pane = opaque {
         };
     }
 
+    /// Owned Provider representation of the Cursor row, independent of Marks.
+    pub fn cursorReference(pane: *const Pane, allocator: std.mem.Allocator) ![]const u8 {
+        const self = pane.read();
+        if (self.focused()) |entry| {
+            const reference = self.provider.reference orelse return error.UnsupportedReference;
+            return reference(self.provider.context, allocator, self.path(), entry.*);
+        }
+        const reference = self.provider.location_reference orelse return error.UnsupportedReference;
+        if (self.cursor == 0) return reference(self.provider.context, allocator, self.path());
+        const parent_path = try self.provider.resolve(self.provider.context, allocator, self.path(), .parent);
+        defer allocator.free(parent_path);
+        return reference(self.provider.context, allocator, parent_path);
+    }
+
     pub fn sources(pane: *const Pane) Sources {
         const self = pane.read();
         if (self.marked_count > 0) return .{ .entries = self.entries(), .marked_only = true, .marks = self.marks, .count = self.marked_count };
         if (self.focused() != null) {
-            const index = self.cursor - @intFromBool(self.hasParent());
+            const index = self.cursor - self.referenceRowCount();
             return .{ .entries = self.entries()[index..][0..1], .marked_only = false, .count = 1 };
         }
         return .{ .entries = &.{}, .marked_only = false, .count = 0 };
     }
 
     /// Relative movement with marking toggles the departing row; first/last
-    /// movement with marking toggles the inclusive range. Both skip the parent.
+    /// movement with marking toggles the inclusive range. Both skip reference rows.
     pub fn move(pane: *Pane, movement: Movement, mark: bool) void {
         const self = pane.implementation();
         switch (movement) {
@@ -250,7 +270,7 @@ const Implementation = struct {
     job: ?*Job = null,
     pending: ?*Job = null,
     options: directory.Options = .{},
-    cursor: usize = 0, // Includes a synthetic parent entry, if not at root.
+    cursor: usize = 0, // Includes the synthetic current and parent rows.
     scroll: usize = 0,
     viewport_rows: usize = 0,
     marked_count: usize = 0,
@@ -277,30 +297,33 @@ const Implementation = struct {
         return self.job != null or self.pending != null;
     }
     fn hasParent(self: *const Implementation) bool {
-        return self.provider.has_parent(self.provider.context, self.path());
+        return self.provider.show_root_parent or self.provider.has_parent(self.provider.context, self.path());
+    }
+    fn referenceRowCount(self: *const Implementation) usize {
+        return 1 + @as(usize, @intFromBool(self.hasParent()));
     }
     fn entries(self: *const Implementation) []directory.Entry {
         return if (self.snapshot) |snapshot| snapshot.entries else &.{};
     }
     fn count(self: *const Implementation) usize {
-        return self.entries().len + @intFromBool(self.hasParent());
+        return self.entries().len + self.referenceRowCount();
     }
     fn focused(self: *const Implementation) ?*directory.Entry {
-        const parent_offset: usize = @intFromBool(self.hasParent());
-        if (self.cursor < parent_offset or self.cursor - parent_offset >= self.entries().len) return null;
-        return &self.entries()[self.cursor - parent_offset];
+        const reference_offset: usize = self.referenceRowCount();
+        if (self.cursor < reference_offset or self.cursor - reference_offset >= self.entries().len) return null;
+        return &self.entries()[self.cursor - reference_offset];
     }
     fn move(self: *Implementation, delta: isize) void {
         const position = @as(isize, @intCast(self.cursor)) +| delta;
         self.cursor = @intCast(std.math.clamp(position, 0, @as(isize, @intCast(self.count() -| 1))));
         self.ensureVisible();
     }
-    /// Toggle the inclusive cursor-to-target range, skipping the parent row.
+    /// Toggle the inclusive cursor-to-target range, skipping reference rows.
     fn markTo(self: *Implementation, target: usize) void {
         defer self.ensureVisible();
         const old = @min(self.cursor, self.count() -| 1);
         self.cursor = @min(target, self.count() -| 1);
-        const offset: usize = @intFromBool(self.hasParent());
+        const offset: usize = self.referenceRowCount();
         const first = @max(@min(old, self.cursor), offset);
         const end = @min(@max(old, self.cursor) + 1, self.count());
         if (first >= end) return;
@@ -326,7 +349,7 @@ const Implementation = struct {
     }
     fn toggleSelection(self: *Implementation) void {
         if (self.focused() != null) {
-            const marked = &self.marks[self.cursor - @intFromBool(self.hasParent())];
+            const marked = &self.marks[self.cursor - self.referenceRowCount()];
             if (marked.*) self.marked_count -= 1 else self.marked_count += 1;
             marked.* = !marked.*;
         }
@@ -383,22 +406,22 @@ const Implementation = struct {
             self.clearError();
             if (job.result) |snapshot| {
                 const same_path = directory.Location.eql(self.provider.location(self.path()), self.provider.location(snapshot.locator));
-                const old_name = if (self.focused()) |entry| entry.name else "..";
-                const wanted = job.hint orelse if (same_path) old_name else "..";
+                const old_name = if (self.focused()) |entry| entry.name else if (self.cursor == 0) "." else "..";
+                const wanted = job.hint orelse if (same_path) old_name else ".";
                 // Preserve marked entries by exact name, independent of sorting.
                 var selected: std.StringHashMap(void) = .init(self.allocator);
                 defer selected.deinit();
                 if (same_path) for (self.entries(), self.marks) |entry, marked| {
                     if (marked) try selected.put(entry.name, {});
                 };
-                const parent_offset: usize = @intFromBool(self.provider.has_parent(self.provider.context, snapshot.locator));
+                const reference_offset: usize = 1 + @as(usize, @intFromBool(self.provider.show_root_parent or self.provider.has_parent(self.provider.context, snapshot.locator)));
                 const next_marks = try self.allocator.alloc(bool, snapshot.entries.len);
-                var next_cursor: usize = if (same_path) @min(self.cursor, (snapshot.entries.len + parent_offset) -| 1) else 0;
+                var next_cursor: usize = if (same_path) @min(self.cursor, (snapshot.entries.len + reference_offset) -| 1) else 0;
                 self.marked_count = 0;
                 for (snapshot.entries, 0..) |entry, i| {
                     next_marks[i] = selected.contains(entry.name);
                     if (next_marks[i]) self.marked_count += 1;
-                    if (std.mem.eql(u8, entry.name, wanted)) next_cursor = i + parent_offset;
+                    if (std.mem.eql(u8, entry.name, wanted)) next_cursor = i + reference_offset;
                 }
                 if (self.snapshot) |*old| old.deinit();
                 self.allocator.free(self.marks);
@@ -420,14 +443,15 @@ const Implementation = struct {
         try self.request(self.path(), null);
     }
     fn parent(self: *Implementation) !void {
-        if (!self.hasParent()) return;
+        if (!self.provider.has_parent(self.provider.context, self.path())) return;
         const parent_path = try self.provider.resolve(self.provider.context, self.allocator, self.path(), .parent);
         defer self.allocator.free(parent_path);
         try self.request(parent_path, self.provider.parent_hint(self.provider.context, self.path()));
     }
     fn enter(self: *Implementation) !void {
         if (self.busy()) return;
-        if (self.hasParent() and self.cursor == 0) return self.parent();
+        if (self.cursor == 0) return;
+        if (self.hasParent() and self.cursor == 1) return self.parent();
         if (self.focused()) |entry| {
             if (entry.directory or entry.kind == .sym_link) {
                 const child = try self.provider.resolve(self.provider.context, self.allocator, self.path(), .{ .child = entry.name });
@@ -462,7 +486,7 @@ test "navigation preserves names across sorting and keeps the old listing after 
     defer pane.destroy();
     try pane.refresh();
     try waitForScan(pane);
-    pane.move(.{ .by = 2 }, false);
+    pane.move(.{ .by = 3 }, false);
     pane.toggleSelection();
     try std.testing.expectEqualStrings("a", pane.view().focused().?.name);
     try pane.changeListing(.reverse);
@@ -541,7 +565,7 @@ test "shift marking toggles traversed entries and preserves counts across refres
     try pane.refresh();
     try waitForScan(pane);
     pane.move(.{ .by = -1 }, true);
-    pane.move(.{ .by = 1 }, true); // Parent -> a does not mark the synthetic parent.
+    pane.move(.{ .by = 2 }, true); // Current -> a skips both reference rows.
     try std.testing.expectEqual(@as(usize, 0), pane.view().marked_count);
     pane.move(.{ .by = 1 }, true); // Mark a, move to b.
     pane.move(.{ .by = 1 }, true); // Mark b, move to c; a stays marked.
@@ -558,7 +582,7 @@ test "shift marking toggles traversed entries and preserves counts across refres
     try std.testing.expectEqual(@as(usize, 4), pane.view().marked_count);
     pane.move(.{ .by = 1 }, true); // At the bottom, toggle d off without moving.
     try std.testing.expectEqual(@as(usize, 3), pane.view().marked_count);
-    pane.move(.first, true); // Mixed range: a/b/c off, d on; parent stays excluded.
+    pane.move(.first, true); // Mixed range: a/b/c off, d on; reference rows stay excluded.
     try std.testing.expectEqual(@as(usize, 1), pane.view().marked_count);
     try std.testing.expect(pane.view().marks[3]);
     pane.move(.last, true); // Mixed range: a/b/c on, d off.
@@ -570,7 +594,7 @@ test "shift marking toggles traversed entries and preserves counts across refres
     try std.testing.expectEqual(@as(usize, 3), pane.view().marked_count);
 }
 
-test "shift marking empty panes cannot select a synthetic parent" {
+test "shift marking empty panes cannot mark synthetic reference rows" {
     for ([_][]const u8{ "/", "/empty" }) |path| {
         const pane = try Pane.create(std.testing.io, std.testing.allocator, path, .{});
         defer pane.destroy();
@@ -628,7 +652,7 @@ test "requested options survive cancellation and failure while displayed options
     defer scan.unblock();
     try pane.refresh();
     try waitForScan(pane);
-    pane.move(.{ .by = 1 }, false);
+    pane.move(.{ .by = 2 }, false);
     pane.toggleSelection();
 
     scan.block();
@@ -757,7 +781,7 @@ fn expectSources(pane: *const Pane, expected: []const []const u8) !void {
     try std.testing.expect(sources.next() == null);
 }
 
-test "file-action sources prefer marks exclude the parent and follow refreshed visible entries" {
+test "file-action sources prefer marks exclude reference rows and follow refreshed visible entries" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -776,7 +800,7 @@ test "file-action sources prefer marks exclude the parent and follow refreshed v
     try pane.changeListing(.toggle_hidden);
     try waitForScan(pane);
     pane.move(.first, false);
-    pane.move(.{ .by = 2 }, false); // Skip parent and child directory.
+    pane.move(.{ .by = 3 }, false); // Skip reference rows and child directory.
     try std.testing.expectEqualStrings(".hidden", pane.view().focused().?.name);
     pane.toggleSelection();
     pane.move(.first, false);
@@ -791,7 +815,7 @@ test "file-action sources prefer marks exclude the parent and follow refreshed v
     try tmp.dir.deleteFile(io, "b");
     try pane.refresh();
     try waitForScan(pane);
-    try expectSources(pane, &.{}); // Cursor still on parent; the mark disappeared.
+    try expectSources(pane, &.{}); // Cursor still on Current row; the mark disappeared.
     try std.testing.expectEqual(@as(usize, 0), pane.view().marked_count);
     pane.move(.last, false);
     pane.toggleSelection();
@@ -821,6 +845,7 @@ test "opaque provider owns navigation and display never determines root or locat
     try waitForScan(pane);
     pane.setViewportRows(5);
     try std.testing.expect(!pane.view().has_parent);
+    pane.move(.{ .by = 1 }, false);
     try std.testing.expectEqualStrings("folder", pane.view().focused().?.name);
     try pane.parent(); // Root's parent is a no-op, despite its non-filesystem locator.
     try std.testing.expect(pane.view().status == .ready);
@@ -860,7 +885,7 @@ test "opaque scans preserve visible pane marks by exact name and discard stale o
     defer fixture.release.store(true, .release);
     try pane.refresh();
     try waitForScan(pane);
-    pane.move(.{ .by = 1 }, false);
+    pane.move(.{ .by = 2 }, false);
     pane.toggleSelection();
     try pane.changeListing(.reverse);
     try waitForScan(pane);
@@ -892,4 +917,86 @@ test "opaque scans preserve visible pane marks by exact name and discard stale o
     fixture.release.store(true, .release);
     try waitForScan(pane);
     try std.testing.expectEqualStrings(Fixture.root, pane.location().locator);
+}
+
+test "current and parent reference rows stay first and resolve local root" {
+    const allocator = std.testing.allocator;
+    const pane = try Pane.create(std.testing.io, allocator, "/", .{});
+    defer pane.destroy();
+    pane.setViewportRows(3);
+    try std.testing.expect(pane.view().row(0) != null);
+    try std.testing.expect(pane.view().row(1) != null);
+    try std.testing.expect(pane.view().row(2) == null);
+    try pane.enter();
+    try std.testing.expect(pane.view().status == .ready);
+    pane.move(.{ .by = 1 }, true);
+    try pane.enter();
+    try std.testing.expect(pane.view().status == .ready);
+    try std.testing.expectEqual(@as(usize, 0), pane.sources().count);
+}
+
+test "reference rows insert resolved Provider locations and never become file-action sources" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "/", "/home/user/a 'link" }, [_][]const u8{ "/", "/home/user" }) |path, parent_path| {
+        const pane = try Pane.create(std.testing.io, allocator, path, .{});
+        defer pane.destroy();
+        const current = try pane.cursorReference(allocator);
+        defer allocator.free(current);
+        try std.testing.expectEqualStrings(path, current);
+        pane.toggleSelection();
+        pane.move(.{ .by = 1 }, true);
+        const parent_reference = try pane.cursorReference(allocator);
+        defer allocator.free(parent_reference);
+        try std.testing.expectEqualStrings(parent_path, parent_reference);
+        pane.toggleSelection();
+        try std.testing.expectEqual(@as(usize, 0), pane.view().marked_count);
+        try expectSources(pane, &.{});
+    }
+    var fixture: @import("testing_provider.zig").Opaque = .{};
+    const remote = try Pane.create(std.testing.io, allocator, @import("testing_provider.zig").Opaque.root, .{ .provider = fixture.provider() });
+    defer remote.destroy();
+    try std.testing.expectError(error.UnsupportedReference, remote.cursorReference(allocator));
+}
+
+test "reference rows retain Cursor identity across listing changes and scroll with entries" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "file", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".hidden", .data = "" });
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buffer);
+    const pane = try Pane.create(io, allocator, buffer[0..len], .{});
+    defer pane.destroy();
+    pane.setViewportRows(3);
+    try pane.refresh();
+    try waitForScan(pane);
+    for ([_]Pane.ListingChange{ .reverse, .cycle_sort, .toggle_hidden }) |change| {
+        try pane.changeListing(change);
+        try waitForScan(pane);
+        try std.testing.expectEqual(@as(usize, 0), pane.view().cursor);
+        try std.testing.expectEqual(Pane.RowKind.current, pane.view().row(0).?.kind);
+        try std.testing.expectEqual(Pane.RowKind.parent, pane.view().row(1).?.kind);
+    }
+    pane.move(.last, false);
+    pane.toggleSelection();
+    pane.move(.first, false);
+    try expectSources(pane, &.{".hidden"});
+    const current = try pane.cursorReference(allocator);
+    defer allocator.free(current);
+    try std.testing.expectEqualStrings(buffer[0..len], current);
+    pane.move(.{ .by = 1 }, false);
+    try pane.refresh();
+    try waitForScan(pane);
+    try std.testing.expectEqual(@as(usize, 1), pane.view().cursor);
+    try expectSources(pane, &.{".hidden"});
+    pane.setViewportRows(1);
+    try std.testing.expectEqual(Pane.RowKind.parent, pane.view().row(0).?.kind);
+    pane.move(.{ .by = 1 }, false);
+    try std.testing.expectEqual(Pane.RowKind.entry, pane.view().row(0).?.kind);
+    pane.move(.first, false);
+    try std.testing.expectEqual(Pane.RowKind.current, pane.view().row(0).?.kind);
+    try pane.enter();
+    try std.testing.expect(pane.view().status == .ready);
 }

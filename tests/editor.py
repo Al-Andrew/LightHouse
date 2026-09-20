@@ -41,7 +41,7 @@ def external_editor():
         try:
             app.start()
             in_pane(app, 0, "1 items")
-            app.send("\x07EDITOR_KEEP=survived\r\x07\x1b[B" + F4)
+            app.send("\x07EDITOR_KEEP=survived\r\x07\x1b[B\x1b[B" + F4)
             app.expect("EDITOR_READY")
             data = read_report(report)
             assert data["argv"] == ["fixed spaces", "$(touch BAD)", str(target)]
@@ -124,7 +124,7 @@ def editor_configuration():
             try:
                 app.start()
                 in_pane(app, 0, "1 items")
-                app.send("\x1b[B" + F4)
+                app.send("\x1b[B\x1b[B" + F4)
                 app.expect(error)
                 app.send("\rq")
                 app.finished()
@@ -148,7 +148,7 @@ def editor_configuration():
         try:
             app.start()
             in_pane(app, 0, "1 items")
-            app.send("\x1b[B" + F4)
+            app.send("\x1b[B\x1b[B" + F4)
             app.expect("EDITOR_READY")
             assert read_report(report)["argv"] == [
                 "quoted ' argument",
@@ -191,11 +191,12 @@ def editor_eligibility_and_shutdown():
         try:
             app.start()
             in_pane(app, 0, "5 items")
+            app.send("\x1b[B")
             for _ in range(2):
                 app.send("\x1b[B" + F4)
                 app.expect("Choose a local regular file")
                 app.send("\r")
-            app.send("\x1b[F\x1b[2~\x1b[H\x1b[B\x1b[B\x1b[B" + F4)
+            app.send("\x1b[F\x1b[2~\x1b[H\x1b[B\x1b[B\x1b[B\x1b[B" + F4)
             app.expect("EDITOR_READY")
             assert read_report(report)["argv"] == [str(work / "b-link")]
             app.send("\x18")
