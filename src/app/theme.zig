@@ -17,3 +17,7 @@ pub const disabled_action: ui.Style = .{ .fg = .{ .r = 133, .g = 153, .b = 164 }
 
 /// Readable keyboard controls on both ordinary and problem dialogs.
 pub const dialog_control: ui.Style = .{ .fg = .{ .r = 240, .g = 244, .b = 250 }, .bg = .{ .r = 73, .g = 91, .b = 116 }, .bold = true };
+
+pub const problem_dialog: ui.Style = .{ .bg = .{ .r = 66, .g = 35, .b = 43 } };
+pub const problem_heading: ui.Style = .{ .fg = .{ .r = 255, .g = 215, .b = 215 }, .bg = .{ .r = 104, .g = 37, .b = 48 }, .bold = true };
+pub const problem_path: ui.Style = .{ .fg = .{ .r = 247, .g = 222, .b = 193 }, .bg = problem_dialog.bg };

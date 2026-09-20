@@ -332,6 +332,14 @@ controller owns an initially unchecked policy checkbox per prompt ID. `o`, `s`,
 `c` choose overwrite/skip/cancel; errors use `r`, `s`, `c`. Space toggles Apply to
 all or Skip all errors of this kind. Retry and Cancel are never remembered.
 
+Waiting dialogs use a red background and a textual problem heading, with labeled
+read-only Source path and Destination path details. The policy checkbox and Space
+toggle sit above a bottom action footer; available action names underline their
+mnemonic letters. Esc and F10 remain visible, as does the terminal-input block.
+Controls wrap and paths keep their final components visible in narrow windows;
+short layouts put each path beside its label and omit optional progress spacing.
+Ordinary progress and retained results keep their compact dialog size.
+
 Prompts identify source, destination and failed stage. Regular conflicts, symlink
 conflicts and directory mismatches use separate policies; mismatches cannot
 replace directories. The worker rechecks observed entries after consent and
