@@ -12,8 +12,11 @@ const Modal = @import("widgets/modal.zig").Modal;
 
 pub const View = struct {
     allocator: std.mem.Allocator,
-    tree: ui.Tree,
+    tree: *ui.Tree,
+    pane_area: *ui.Widget,
+    key_bar: *ui.Widget,
     state: *State,
+    emulator: *Emulator,
     panes: [2]*ui.Widget,
     terminal: *ui.Widget,
     modal: *ui.Widget,
@@ -21,19 +24,19 @@ pub const View = struct {
     pub fn create(allocator: std.mem.Allocator, state: *State, emulator: *Emulator) !*View {
         const self = try allocator.create(View);
         errdefer allocator.destroy(self);
-        self.* = .{ .allocator = allocator, .tree = .init(allocator), .state = state, .panes = undefined, .terminal = undefined, .modal = undefined };
+        self.* = .{ .allocator = allocator, .tree = try ui.Tree.init(allocator), .pane_area = undefined, .key_bar = undefined, .state = state, .emulator = emulator, .panes = undefined, .terminal = undefined, .modal = undefined };
         errdefer self.tree.deinit();
-        const root = try self.tree.create(null, Root, .{ .state = state, .emulator = emulator });
-        const panes = try self.tree.create(root, ui.layout.Box, .{ .axis = .horizontal });
+        const root = try self.tree.create(null, Root, .{ .view = self });
+        self.pane_area = try self.tree.create(root, ui.layout.Box, .{ .axis = .horizontal });
         for (state.panes.?, 0..) |pane, i| {
-            self.panes[i] = try self.tree.create(panes, FilePane, .{ .pane = pane });
-            self.panes[i].focusable = true;
+            self.panes[i] = try self.tree.create(self.pane_area, FilePane, .{ .pane = pane });
+            self.panes[i].setFocusable(true);
         }
         self.terminal = try self.tree.create(root, Terminal, .{ .emulator = emulator, .input = &state.terminal_input });
-        self.terminal.focusable = true;
-        _ = try self.tree.create(root, KeyBar, .{ .state = state });
+        self.terminal.setFocusable(true);
+        self.key_bar = try self.tree.create(root, KeyBar, .{ .state = state });
         self.modal = try self.tree.create(root, Modal, .{ .state = state, .emulator = emulator });
-        self.modal.focusable = true;
+        self.modal.setFocusable(true);
         try self.sync();
         return self;
     }
@@ -74,22 +77,21 @@ pub const View = struct {
 };
 
 const Root = struct {
-    state: *State,
-    emulator: *Emulator,
+    // View retains each role until tree destruction; its stable address outlives us.
+    view: *View,
 
-    pub fn layout(self: *Root, node: *ui.Widget, size: ui.Size) void {
-        const geometry = Layout.calculate(.{ .cols = @intCast(size.width), .rows = @intCast(size.height) }, self.state.adjustment, self.state.zoom);
-        const children = node.children.items;
-        children[0].setVisible(!geometry.compact);
-        children[0].setRect(.{ .x = 0, .y = 0, .width = size.width, .height = geometry.panes_height });
-        children[1].setRect(geometry.terminal);
-        children[2].setVisible(size.height > 1);
-        children[2].setRect(.{ .x = 0, .y = size.height -| 1, .width = size.width, .height = 1 });
-        children[3].setRect(ui.layout.centered(size, children[3].measure(size)));
+    pub fn layout(self: *Root, _: *ui.Widget, size: ui.Size) void {
+        const geometry = Layout.calculate(.{ .cols = @intCast(size.width), .rows = @intCast(size.height) }, self.view.state.adjustment, self.view.state.zoom);
+        self.view.pane_area.setVisible(!geometry.compact);
+        self.view.pane_area.setRect(.{ .x = 0, .y = 0, .width = size.width, .height = geometry.panes_height });
+        self.view.terminal.setRect(geometry.terminal);
+        self.view.key_bar.setVisible(size.height > 1);
+        self.view.key_bar.setRect(.{ .x = 0, .y = size.height -| 1, .width = size.width, .height = 1 });
+        self.view.modal.setRect(ui.layout.centered(size, self.view.modal.measure(size)));
     }
 
     pub fn event(self: *Root, _: *ui.Widget, ev: *const ui.Event) !bool {
-        try self.state.event(self.emulator, ev);
+        try self.view.state.event(self.view.emulator, ev);
         return true;
     }
 };
@@ -108,7 +110,18 @@ test "retained app view traps editor paste and restores the active pane after di
     defer state.modal.deinit();
     const view = try View.create(allocator, &state, emulator);
     defer view.destroy();
+    // Put an unrelated child before a replacement role: layout must follow the
+    // retained modal handle, not the old child index.
+    const extra = try view.tree.create(view.tree.root(), struct {}, .{});
+    const extra_rect: ui.Rect = .{ .x = 3, .y = 2, .width = 1, .height = 1 };
+    extra.setRect(extra_rect);
+    view.modal.destroy();
+    view.modal = try view.tree.create(view.tree.root(), Modal, .{ .state = &state, .emulator = emulator });
+    view.modal.setFocusable(true);
     try view.resize(.{ .cols = 80, .rows = 24 });
+    try std.testing.expectEqual(extra_rect, extra.rect());
+    try std.testing.expectEqual(@as(usize, 80), view.pane_area.rect().width);
+    try std.testing.expectEqual(@as(usize, 23), view.key_bar.rect().y);
     try view.event(&.{ .key = .tab });
     try std.testing.expect(view.panes[1].focused());
     var decoder: ui.input.Decoder = .{};
@@ -126,6 +139,7 @@ test "retained app view traps editor paste and restores the active pane after di
     try view.event(&.{ .key = .escape });
     try std.testing.expect(state.modal == .none);
     try std.testing.expect(view.panes[1].focused());
+    try std.testing.expect(!view.pane_area.visible());
     for ("\x07q\x07") |byte| if (decoder.feed(byte)) |ev| try view.event(&ev);
     try std.testing.expect(view.panes[1].focused());
     try std.testing.expectEqualStrings("q", emulator.queued());

@@ -26,7 +26,12 @@ App root                       application layout and global bindings
 ```
 
 `src/app/view.zig` builds this tree once and projects application focus and modal
-state into it. `src/app/controller.zig` owns application commands and file-action
+state into it. The view retains named handles for the pane area, terminal, key
+bar, and modal; root layout uses those roles rather than child indices. These
+handles borrow nodes owned by the tree and live until view destruction. The root
+model borrows the heap-allocated view, which stays at a stable address until after
+the tree is released. Adding another child does not change a role's geometry.
+`src/app/controller.zig` owns application commands and file-action
 workflows. `src/app/layout.zig` chooses the two-pane/terminal geometry.
 `src/app.zig` defines `App`, which owns startup, background polling, terminal I/O,
 and frame output through an explicit lifecycle:
@@ -50,7 +55,13 @@ The palette belongs to `src/app/theme.zig`.
 
 ## Defining a widget
 
-A model is an ordinary Zig struct. `Tree.create(parent, Model, value)` allocates
+`Tree` and `Widget` are opaque handles: ownership links, callback tables, focus,
+modal scope, and traversal/retirement bookkeeping are private to the toolkit.
+Create a tree with `const tree = try ui.Tree.init(allocator)` and release it with
+`defer tree.deinit()`. Initialization allocates stable storage; the pointer may be
+copied or held in a movable owner, but exactly one owner must call `deinit`.
+
+A model is an ordinary Zig struct. `tree.create(parent, Model, value)` allocates
 stable storage for its value and mounts it under the parent. Passing `null`
 creates the single root. The library generates an internal callback table;
 application models do not perform opaque pointer casts.
@@ -75,17 +86,28 @@ responsibility for cleaning up that value if creation fails. Parents own their
 children; `Tree.deinit()` releases every child before its parent. A model's
 `deinit` releases its own resources and must not mutate the tree.
 
-Keep `Tree` at a stable address until `deinit`. Widgets borrow their tree and
-parent pointers. Widget handles are valid until destruction, including the end
-of a traversal that schedules destruction. Models can borrow other state, but
-that state must outlive them. A model can keep its own mutable state or borrow
-application state; call `node.invalidate()` when an external update needs paint.
+The toolkit keeps tree, node, and model allocations at stable addresses until
+release. `node.tree()`, `node.parent()`, and `tree.root()` return borrowed handles;
+none transfers ownership. A widget handle expires when it or an ancestor is
+destroyed. During a callback traversal, retired handles remain allocated until
+the outer traversal returns; `node.isAlive()` reports whether the node and its
+ancestors remain live during that interval. It cannot validate an expired handle.
+
+`node.children()` returns a borrowed `[]const *Widget`: callers can operate on
+children through their methods, but cannot replace or reorder ownership slots.
+Do not retain the slice across creation, destruction, or the end of a traversal.
+Do not destroy children while iterating this slice outside a callback traversal;
+reacquire the slice after each immediate destruction. Models can borrow other
+state, but that state must stay at a stable address and outlive them. Call
+`node.invalidate()` when an external update needs paint.
 
 ## Layout and painting
 
 `Tree.layout(size)` is a separate pass. A layout assigns parent-local child
-rectangles with `setRect`; a parent may use `child.measure(available)` to obtain
-a clamped preferred size. The library provides horizontal/vertical equal-share
+rectangles with `setRect`; `node.rect()` returns geometry by value. A parent
+iterates `node.children()` and may use `child.measure(available)` to obtain a
+clamped preferred size. `setVisible` and `visible()` control/observe a node's own
+visibility, separately from its ancestors. The library provides horizontal/vertical equal-share
 boxes and centered geometry. Applications can supply custom layouts using the
 same interface. The file-pane widget updates its viewport during layout, even
 when a compact window gives it no visible rows.
@@ -94,7 +116,9 @@ when a compact window gives it no visible rows.
 painters. The active modal subtree paints last and suppresses the underlying
 cursor. Composite widgets can paint their internal content directly into their
 painter. Geometry and visibility changes invalidate the tree; successful paint
-clears that flag. The caller begins the frame and uses `screen.encode` for ANSI
+clears that flag; `tree.needsPaint()` observes it without allowing callers to
+clear it. Invalidation during painting and paint errors leave the flag set.
+The caller begins the frame and uses `screen.encode` for ANSI
 output, keeping the library independent of terminal ownership and OS I/O.
 
 Painting currently recomposes the complete visible tree when invalidated.
@@ -103,15 +127,18 @@ widget repaint caching is not part of this interface yet.
 
 ## Focus, input, and lifetime
 
-Set `node.focusable = true` and call `Tree.setFocus(node)` to make it the input
-target. Events first visit that widget and bubble through its parents until a
+Call `node.setFocusable(true)` and `tree.setFocus(node)` to make it the input
+target. `node.focusable()` observes eligibility, `node.focused()` observes active
+focus, and `tree.focus()` returns the borrowed current target. Disabling
+focusability clears both current and saved focus for that node. Events first visit that widget and bubble through its parents until a
 handler returns `true`. `false` allows a parent to interpret an unhandled command.
 Terminal input is handled by the terminal widget; Ctrl+G bubbles to the app.
 
 `Tree.setModal(node)` establishes one modal scope. Input cannot escape that
 subtree, including ignored events and the event that opens or closes the modal.
 Closing the scope restores the prior focus if it is still alive. Replacing the
-scope retains the original saved focus. The app uses its own policy to allow a
+scope retains the original saved focus. `tree.modal()` observes the borrowed
+modal handle without exposing its storage. The app uses its own policy to allow a
 running or finished job dialog to yield to the shell.
 
 Visibility controls painting, separately from input eligibility. This preserves
@@ -123,6 +150,13 @@ current widget or an ancestor. It retires the subtree immediately, clears affect
 focus references, and defers memory reclamation until traversal returns. Adding
 widgets and recursive dispatch/layout/paint during a traversal return `TreeBusy`.
 Create new widgets between passes, as the application does when composing its view.
+Layout and paint callbacks may also retire nodes; reclamation waits until their
+pass returns. Callbacks may update geometry, visibility, focus, modal scope, and
+invalidation through the supported methods. They must not destroy the tree.
+`measure` can run outside a traversal and must only compute a preferred size;
+it must not mutate or traverse the tree through borrowed application state.
+Model `deinit` must only release model-owned resources; it must not access child
+handles (already released), mutate the tree, or start another traversal.
 
 ## Scope and verification
 

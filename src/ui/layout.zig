@@ -10,7 +10,7 @@ pub const Box = struct {
 
     pub fn layout(self: *Box, node: *widget.Widget, size: widget.Size) void {
         var count: usize = 0;
-        for (node.children.items) |child| if (child.visible and !child.retired) {
+        for (node.children()) |child| if (child.visible() and child.isAlive()) {
             count += 1;
         };
         if (count == 0) return;
@@ -18,8 +18,8 @@ pub const Box = struct {
         const gap = if (count > 1) @min(self.gap, extent / (count - 1)) else 0;
         const usable = extent - gap * (count - 1);
         var index: usize = 0;
-        for (node.children.items) |child| {
-            if (!child.visible or child.retired) continue;
+        for (node.children()) |child| {
+            if (!child.visible() or !child.isAlive()) continue;
             const begin = usable / count * index + @min(index, usable % count);
             const length = usable / count + @intFromBool(index < usable % count);
             child.setRect(if (self.axis == .horizontal)
