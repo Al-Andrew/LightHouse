@@ -927,3 +927,35 @@ test "Path insertion validates quotes and admits a complete reference before tak
     try std.testing.expect(try state.invoke(.help, emulator));
     try std.testing.expect(!try state.invoke(.insert_reference, emulator));
 }
+
+test "Path insertion workflow preserves queue and Pane focus on allocation and backpressure errors" {
+    const Fixture = @import("../core/testing_provider.zig").Opaque;
+    var fixture: Fixture = .{};
+    const left = try Pane.create(std.testing.io, std.testing.allocator, Fixture.root, .{ .provider = fixture.provider() });
+    defer left.destroy();
+    const right = try Pane.create(std.testing.io, std.testing.allocator, "/", .{});
+    defer right.destroy();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const state = try State.create(std.testing.io, failing.allocator(), .{ left, right });
+    defer state.destroy();
+    const emulator = try Emulator.create(std.testing.io, std.testing.allocator, 80, 8);
+    defer emulator.destroy();
+    try left.refresh();
+    try settle(state);
+    try emulator.insert("existing");
+    failing.fail_index = failing.alloc_index;
+    _ = try state.invoke(.insert_reference, emulator);
+    try std.testing.expectEqualStrings("OutOfMemory", state.view().modal.notice);
+    try std.testing.expectEqualStrings("existing", emulator.queued());
+    try std.testing.expectEqual(.left, state.view().focus);
+    state.dismiss();
+    failing.fail_index = std.math.maxInt(usize);
+    const raw = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(raw);
+    @memset(raw, 'x');
+    fixture.entry_reference = raw;
+    _ = try state.invoke(.insert_reference, emulator);
+    try std.testing.expectEqualStrings("TerminalInputBackpressure", state.view().modal.notice);
+    try std.testing.expectEqualStrings("existing", emulator.queued());
+    try std.testing.expectEqual(.left, state.view().focus);
+}

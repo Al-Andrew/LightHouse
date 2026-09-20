@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Cursor references arrive literally and never submit input by themselves."""
 import os
+import shlex
 import tempfile
 from pathlib import Path
 from support import App, in_pane, wait
@@ -11,7 +12,9 @@ def path_insertion():
         root = Path(directory)
         name = "a '$(touch BAD); file"
         entry = root / name
-        entry.write_text("contents")
+        ran = root / "ran"
+        entry.write_text("#!/bin/sh\nprintf executed > " + str(ran) + "\n")
+        entry.chmod(0o755)
         report = root / "report"
         app = App(cwd=root)
         try:
@@ -36,15 +39,25 @@ def path_insertion():
             app.send(f"> {report}\r")
             app.pump(0.2)
             assert report.read_text() == str(entry)
+            # An explicit reference goes to the current foreground program too.
+            capture = root / "capture"
+            program = "import os,tty,termios; saved=termios.tcgetattr(0); tty.setraw(0); print('CAPTURE_READY',flush=True); data=b'';\nwhile True:\n b=os.read(0,1)\n if b==b'\\r': break\n data+=b\ntermios.tcsetattr(0,termios.TCSANOW,saved)\nopen(" + repr(str(capture)) + ", 'wb').write(data)"
+            app.send("\x1b[200~python3 -c " + shlex.quote(program) + "\x1b[201~\r")
+            app.expect("CAPTURE_READY")
+            app.send("\x06\x07\x06\r")
+            wait(app, capture.exists, "foreground input capture")
+            expected = "'" + str(entry).replace("'", "'\\''") + "' "
+            assert capture.read_bytes() == b"\x06" + os.fsencode(expected)
             # Absent session accepts insertion during startup without Enter.
             app.send("exit\r")
             wait(app, lambda: not Path(f"/proc/{app.shell_pid}").exists(), "shell EOF")
             app.send("\x06")
             app.expect("LH_PROMPT>")
             assert app.proc.poll() is None
-            # Clear the inserted filename before submitting a command.
-            app.send("\x15printf '<%s>\\n' STARTED\r")
-            app.expect("<STARTED>")
+            assert not ran.exists(), "startup insertion submitted a command"
+            app.send("\r")
+            wait(app, ran.exists, "startup insertion was lost")
+            assert ran.read_text() == "executed"
             app.send("\x07q")
             app.finished()
         finally:
