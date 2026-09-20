@@ -73,14 +73,19 @@ The palette belongs to `src/app/theme.zig`.
 
 `src/app/commands.zig` holds the static built-in command identities, labels,
 help descriptions, and default bindings/aliases. Binding lookup, grouped help,
-and the ten-slot function-key bar share these descriptions. The unassigned
+and the ten-slot function-key bar share these descriptions. Help documents the
+static defaults without advertising enabled state; the key bar reflects current
+availability. The unassigned
 function-key slots remain empty. Descriptions and binding slices have process
 lifetime and retain no workflow context. Pane navigation/marking and editor
 handling stay local to their widgets; their help is documented separately.
 
 `State.available(id)` is the controller's observational command policy. It
 checks modal scope, terminal focus, the retained job, file-action sources, and
-provider support without I/O, polling, allocation, or mutation. The key bar
+provider support without I/O, polling, allocation, or mutation. File actions
+consume the same controller `actionAvailable` helper as workflow entry points;
+that helper uses the provider capabilities and supported operation combinations
+from the [provider interface](PROVIDERS.md). The key bar
 uses that exact policy, including disabling source-dependent actions on an
 empty pane while keeping Mkdir available. Job-context Quit remains enabled.
 `State.invoke(id, emulator)` rechecks current observations and returns `false`
@@ -243,3 +248,11 @@ successful, failed, canceled, and launch-failed jobs. Allocation-failure and
 blocked-work tests verify cleanup; routing tests use `View.event` for compact
 pane input, editor/help/delete paste isolation, terminal forwarding, and result
 retention across focus changes.
+
+## Provider observations
+
+File panes render provider display text and pane-owned row marks. Navigation and
+path editors delegate location semantics to the provider. The function-key bar
+uses `State.actionAvailable` for file actions, and workflow submission rechecks
+support before constructing a local job. Provider identity, snapshot ownership,
+refresh rules and executor boundaries are documented in [PROVIDERS.md](PROVIDERS.md).

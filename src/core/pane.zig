@@ -45,9 +45,12 @@ pub const Pane = opaque {
         // Null denotes the parent row, never a filesystem entry.
         entry: ?*const directory.Entry,
         focused: bool,
+        marked: bool,
     };
     pub const View = struct {
         path: []const u8,
+        has_parent: bool,
+        marks: []const bool,
         entries: []const directory.Entry,
         cursor: usize,
         first_visible: usize,
@@ -58,9 +61,13 @@ pub const Pane = opaque {
         status: Status,
 
         fn entryAt(self: View, index: usize) ?*const directory.Entry {
-            const parent_offset: usize = @intFromBool(!std.mem.eql(u8, self.path, "/"));
+            const parent_offset: usize = @intFromBool(self.has_parent);
             if (index < parent_offset or index - parent_offset >= self.entries.len) return null;
             return &self.entries[index - parent_offset];
+        }
+
+        pub fn focusedMarked(self: View) bool {
+            return self.focused() != null and self.marks[self.cursor - @intFromBool(self.has_parent)];
         }
 
         pub fn focused(self: View) ?*const directory.Entry {
@@ -71,9 +78,9 @@ pub const Pane = opaque {
         pub fn row(self: View, offset: usize) ?Row {
             if (offset >= self.visible_rows) return null;
             const index = self.first_visible +| offset;
-            const count = self.entries.len + @intFromBool(!std.mem.eql(u8, self.path, "/"));
+            const count = self.entries.len + @intFromBool(self.has_parent);
             if (index >= count) return null;
-            return .{ .entry = self.entryAt(index), .focused = index == self.cursor };
+            return .{ .entry = self.entryAt(index), .focused = index == self.cursor, .marked = if (self.entryAt(index) != null) self.marks[index - @intFromBool(self.has_parent)] else false };
         }
     };
     /// Short-lived, read-only iteration in displayed order. The parent is never
@@ -81,6 +88,7 @@ pub const Pane = opaque {
     pub const Sources = struct {
         entries: []const directory.Entry,
         marked_only: bool,
+        marks: []const bool = &.{},
         count: usize,
         offset: usize = 0,
 
@@ -88,7 +96,7 @@ pub const Pane = opaque {
             while (self.offset < self.entries.len) {
                 const entry = &self.entries[self.offset];
                 self.offset += 1;
-                if (!self.marked_only or entry.selected) return entry.name;
+                if (!self.marked_only or self.marks[self.offset - 1]) return entry.name;
             }
             return null;
         }
@@ -116,7 +124,9 @@ pub const Pane = opaque {
     pub fn view(pane: *const Pane) View {
         const self = pane.read();
         return .{
-            .path = self.path(),
+            .path = self.provider.display(self.provider.context, self.path()),
+            .has_parent = self.hasParent(),
+            .marks = self.marks,
             .entries = self.entries(),
             .cursor = self.cursor,
             .first_visible = self.scroll,
@@ -132,7 +142,7 @@ pub const Pane = opaque {
 
     pub fn sources(pane: *const Pane) Sources {
         const self = pane.read();
-        if (self.marked_count > 0) return .{ .entries = self.entries(), .marked_only = true, .count = self.marked_count };
+        if (self.marked_count > 0) return .{ .entries = self.entries(), .marked_only = true, .marks = self.marks, .count = self.marked_count };
         if (self.focused() != null) {
             const index = self.cursor - @intFromBool(self.hasParent());
             return .{ .entries = self.entries()[index..][0..1], .marked_only = false, .count = 1 };
@@ -192,7 +202,20 @@ pub const Pane = opaque {
     }
 
     pub fn request(pane: *Pane, target: []const u8) !void {
-        try pane.implementation().request(target, null);
+        const self = pane.implementation();
+        const resolved = try self.provider.resolve(self.provider.context, self.allocator, self.path(), .{ .user_input = target });
+        defer self.allocator.free(resolved);
+        try self.request(resolved, null);
+    }
+    pub fn provider(pane: *const Pane) directory.Provider {
+        return pane.read().provider;
+    }
+    pub fn location(pane: *const Pane) directory.Location {
+        return pane.read().provider.location(pane.read().path());
+    }
+    pub fn rootInput(pane: *const Pane, allocator: std.mem.Allocator) ![]const u8 {
+        const self = pane.read();
+        return self.provider.resolve(self.provider.context, allocator, self.path(), .root);
     }
     pub fn refresh(pane: *Pane) !void {
         try pane.implementation().refresh();
@@ -231,6 +254,7 @@ const Implementation = struct {
     scroll: usize = 0,
     viewport_rows: usize = 0,
     marked_count: usize = 0,
+    marks: []bool = &.{},
     failure: ?anyerror = null,
     failed_path: ?[]const u8 = null,
 
@@ -244,15 +268,16 @@ const Implementation = struct {
         if (self.snapshot) |*snapshot| snapshot.deinit();
         if (self.failed_path) |failed| self.allocator.free(failed);
         self.allocator.free(self.initial_path);
+        self.allocator.free(self.marks);
     }
     fn path(self: *const Implementation) []const u8 {
-        return if (self.snapshot) |snapshot| snapshot.path else self.initial_path;
+        return if (self.snapshot) |snapshot| snapshot.locator else self.initial_path;
     }
     fn busy(self: *const Implementation) bool {
         return self.job != null or self.pending != null;
     }
     fn hasParent(self: *const Implementation) bool {
-        return !std.mem.eql(u8, self.path(), "/");
+        return self.provider.has_parent(self.provider.context, self.path());
     }
     fn entries(self: *const Implementation) []directory.Entry {
         return if (self.snapshot) |snapshot| snapshot.entries else &.{};
@@ -279,9 +304,9 @@ const Implementation = struct {
         const first = @max(@min(old, self.cursor), offset);
         const end = @min(@max(old, self.cursor) + 1, self.count());
         if (first >= end) return;
-        for (self.entries()[first - offset .. end - offset]) |*entry| {
-            if (entry.selected) self.marked_count -= 1 else self.marked_count += 1;
-            entry.selected = !entry.selected;
+        for (self.marks[first - offset .. end - offset]) |*marked| {
+            if (marked.*) self.marked_count -= 1 else self.marked_count += 1;
+            marked.* = !marked.*;
         }
     }
     fn moveMarked(self: *Implementation, delta: isize) void {
@@ -300,9 +325,10 @@ const Implementation = struct {
         self.scroll = @min(self.scroll, self.count() -| rows);
     }
     fn toggleSelection(self: *Implementation) void {
-        if (self.focused()) |entry| {
-            if (entry.selected) self.marked_count -= 1 else self.marked_count += 1;
-            entry.selected = !entry.selected;
+        if (self.focused() != null) {
+            const marked = &self.marks[self.cursor - @intFromBool(self.hasParent())];
+            if (marked.*) self.marked_count -= 1 else self.marked_count += 1;
+            marked.* = !marked.*;
         }
     }
     fn clearError(self: *Implementation) void {
@@ -320,7 +346,7 @@ const Implementation = struct {
     fn request(self: *Implementation, target: []const u8, hint: ?[]const u8) !void {
         const job = try self.allocator.create(Job);
         errdefer self.allocator.destroy(job);
-        const normalized = try std.fs.path.resolve(self.allocator, &.{ self.path(), target });
+        const normalized = try self.allocator.dupe(u8, target);
         errdefer self.allocator.free(normalized);
         job.* = .{
             .path = normalized,
@@ -340,7 +366,7 @@ const Implementation = struct {
         self.pending = null;
         job.future = self.io.concurrent(Job.work, .{ job, self.io }) catch |err| {
             self.failure = err;
-            self.failed_path = self.allocator.dupe(u8, job.path) catch null;
+            self.failed_path = self.allocator.dupe(u8, self.provider.display(self.provider.context, job.path)) catch null;
             job.destroy(self.allocator);
             return;
         };
@@ -351,28 +377,32 @@ const Implementation = struct {
         if (!job.done.load(.acquire)) return false;
         job.future.?.await(self.io);
         self.job = null;
+        defer self.launch();
         defer job.destroy(self.allocator);
         if (!job.canceled.load(.acquire)) {
             self.clearError();
             if (job.result) |snapshot| {
-                const same_path = std.mem.eql(u8, self.path(), snapshot.path);
+                const same_path = directory.Location.eql(self.provider.location(self.path()), self.provider.location(snapshot.locator));
                 const old_name = if (self.focused()) |entry| entry.name else "..";
                 const wanted = job.hint orelse if (same_path) old_name else "..";
                 // Preserve marked entries by exact name, independent of sorting.
                 var selected: std.StringHashMap(void) = .init(self.allocator);
                 defer selected.deinit();
-                if (same_path) for (self.entries()) |entry| {
-                    if (entry.selected) try selected.put(entry.name, {});
+                if (same_path) for (self.entries(), self.marks) |entry, marked| {
+                    if (marked) try selected.put(entry.name, {});
                 };
-                const parent_offset: usize = @intFromBool(!std.mem.eql(u8, snapshot.path, "/"));
+                const parent_offset: usize = @intFromBool(self.provider.has_parent(self.provider.context, snapshot.locator));
+                const next_marks = try self.allocator.alloc(bool, snapshot.entries.len);
                 var next_cursor: usize = if (same_path) @min(self.cursor, (snapshot.entries.len + parent_offset) -| 1) else 0;
                 self.marked_count = 0;
-                for (snapshot.entries, 0..) |*entry, i| {
-                    entry.selected = selected.contains(entry.name);
-                    if (entry.selected) self.marked_count += 1;
+                for (snapshot.entries, 0..) |entry, i| {
+                    next_marks[i] = selected.contains(entry.name);
+                    if (next_marks[i]) self.marked_count += 1;
                     if (std.mem.eql(u8, entry.name, wanted)) next_cursor = i + parent_offset;
                 }
                 if (self.snapshot) |*old| old.deinit();
+                self.allocator.free(self.marks);
+                self.marks = next_marks;
                 self.snapshot = snapshot;
                 job.result = null;
                 self.cursor = next_cursor;
@@ -380,11 +410,10 @@ const Implementation = struct {
                 self.ensureVisible();
             } else {
                 self.failure = job.failure orelse error.ReadFailed;
-                self.failed_path = try self.allocator.dupe(u8, job.path);
+                self.failed_path = try self.allocator.dupe(u8, self.provider.display(self.provider.context, job.path));
                 // Retain the last good listing and location on failure.
             }
         }
-        self.launch();
         return true;
     }
     fn refresh(self: *Implementation) !void {
@@ -392,13 +421,19 @@ const Implementation = struct {
     }
     fn parent(self: *Implementation) !void {
         if (!self.hasParent()) return;
-        try self.request(std.fs.path.dirname(self.path()) orelse "/", std.fs.path.basename(self.path()));
+        const parent_path = try self.provider.resolve(self.provider.context, self.allocator, self.path(), .parent);
+        defer self.allocator.free(parent_path);
+        try self.request(parent_path, self.provider.parent_hint(self.provider.context, self.path()));
     }
     fn enter(self: *Implementation) !void {
         if (self.busy()) return;
         if (self.hasParent() and self.cursor == 0) return self.parent();
         if (self.focused()) |entry| {
-            if (entry.directory or entry.kind == .sym_link) try self.request(entry.name, null);
+            if (entry.directory or entry.kind == .sym_link) {
+                const child = try self.provider.resolve(self.provider.context, self.allocator, self.path(), .{ .child = entry.name });
+                defer self.allocator.free(child);
+                try self.request(child, null);
+            }
         }
     }
 };
@@ -433,7 +468,7 @@ test "navigation preserves names across sorting and keeps the old listing after 
     try pane.changeListing(.reverse);
     try waitForScan(pane);
     try std.testing.expectEqualStrings("a", pane.view().focused().?.name);
-    try std.testing.expect(pane.view().focused().?.selected);
+    try std.testing.expect(pane.view().focusedMarked());
     try pane.request("missing");
     try waitForScan(pane);
     try std.testing.expectEqual(error.FileNotFound, pane.view().status.failed.err);
@@ -459,11 +494,11 @@ test "superseded scans cannot replace the most recent location" {
             }
             var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
             errdefer arena.deinit();
-            return .{ .arena = arena, .path = try arena.allocator().dupe(u8, target), .entries = &.{}, .options = options };
+            return .{ .arena = arena, .locator = try arena.allocator().dupe(u8, target), .entries = &.{}, .options = options };
         }
     };
     var controlled: Controlled = .{};
-    const pane = try Pane.create(std.testing.io, std.testing.allocator, "/", .{ .provider = .{ .context = &controlled, .scan = Controlled.scan } });
+    const pane = try Pane.create(std.testing.io, std.testing.allocator, "/", .{ .provider = testLocalProvider(&controlled, Controlled.scan) });
     defer pane.destroy();
     defer controlled.release.store(true, .release);
     try pane.request("/slow");
@@ -512,10 +547,10 @@ test "shift marking toggles traversed entries and preserves counts across refres
     pane.move(.{ .by = 1 }, true); // Mark b, move to c; a stays marked.
     try std.testing.expectEqualStrings("c", pane.view().focused().?.name);
     try std.testing.expectEqual(@as(usize, 2), pane.view().marked_count);
-    try std.testing.expect(pane.view().entries[0].selected and pane.view().entries[1].selected);
+    try std.testing.expect(pane.view().marks[0] and pane.view().marks[1]);
     pane.move(.{ .by = -2 }, false); // Return to a without changing marks.
     pane.move(.{ .by = 1 }, true);
-    try std.testing.expect(!pane.view().entries[0].selected);
+    try std.testing.expect(!pane.view().marks[0]);
     try std.testing.expectEqual(@as(usize, 1), pane.view().marked_count);
     pane.move(.{ .by = -1 }, true); // Unmark b and move back to a.
     try std.testing.expectEqual(@as(usize, 0), pane.view().marked_count);
@@ -525,13 +560,13 @@ test "shift marking toggles traversed entries and preserves counts across refres
     try std.testing.expectEqual(@as(usize, 3), pane.view().marked_count);
     pane.move(.first, true); // Mixed range: a/b/c off, d on; parent stays excluded.
     try std.testing.expectEqual(@as(usize, 1), pane.view().marked_count);
-    try std.testing.expect(pane.view().entries[3].selected);
+    try std.testing.expect(pane.view().marks[3]);
     pane.move(.last, true); // Mixed range: a/b/c on, d off.
     try std.testing.expectEqual(@as(usize, 3), pane.view().marked_count);
     try pane.changeListing(.reverse);
     try waitForScan(pane);
     try std.testing.expectEqualStrings("d", pane.view().focused().?.name);
-    try std.testing.expect(!pane.view().focused().?.selected);
+    try std.testing.expect(!pane.view().focusedMarked());
     try std.testing.expectEqual(@as(usize, 3), pane.view().marked_count);
 }
 
@@ -554,7 +589,7 @@ const TestScan = struct {
     fail: bool = false,
 
     fn provider(self: *TestScan) directory.Provider {
-        return .{ .context = self, .scan = scan };
+        return testLocalProvider(self, scan);
     }
     fn block(self: *TestScan) void {
         self.entered.store(false, .release);
@@ -765,4 +800,96 @@ test "file-action sources prefer marks exclude the parent and follow refreshed v
     try waitForScan(pane);
     try std.testing.expectEqual(@as(usize, 0), pane.view().marked_count);
     try expectSources(pane, &.{});
+}
+
+fn testLocalProvider(context: ?*anyopaque, scan: @TypeOf(directory.local.scan)) directory.Provider {
+    var result = directory.local;
+    result.context = context;
+    result.scan = scan;
+    return result;
+}
+
+test "opaque provider owns navigation and display never determines root or location identity" {
+    const Fixture = @import("testing_provider.zig").Opaque;
+    var fixture: Fixture = .{};
+    var other: Fixture = .{};
+    const pane = try Pane.create(std.testing.io, std.testing.allocator, Fixture.root, .{ .provider = fixture.provider() });
+    defer pane.destroy();
+    try std.testing.expect(!directory.Location.eql(pane.location(), other.provider().location(Fixture.root)));
+    try std.testing.expect(directory.Location.eql(pane.location(), fixture.provider().location(Fixture.root)));
+    try pane.refresh();
+    try waitForScan(pane);
+    pane.setViewportRows(5);
+    try std.testing.expect(!pane.view().has_parent);
+    try std.testing.expectEqualStrings("folder", pane.view().focused().?.name);
+    try pane.parent(); // Root's parent is a no-op, despite its non-filesystem locator.
+    try std.testing.expect(pane.view().status == .ready);
+    try pane.enter();
+    try waitForScan(pane);
+    try std.testing.expectEqualStrings(Fixture.child, pane.location().locator);
+    try std.testing.expectEqualStrings("/", pane.view().path);
+    try std.testing.expect(pane.view().has_parent);
+    try std.testing.expect(pane.view().row(0).?.entry == null);
+    pane.toggleSelection();
+    try expectSources(pane, &.{});
+    try pane.parent();
+    try waitForScan(pane);
+    try std.testing.expectEqualStrings("folder", pane.view().focused().?.name);
+    try pane.request("folder"); // Provider relative syntax, not a path join.
+    try waitForScan(pane);
+    try pane.request("up");
+    try waitForScan(pane);
+    try std.testing.expectEqualStrings(Fixture.root, pane.location().locator);
+    const root_input = try pane.rootInput(std.testing.allocator);
+    defer std.testing.allocator.free(root_input);
+    try pane.request(root_input);
+    try waitForScan(pane);
+    try std.testing.expectError(error.UnknownLocation, pane.request("../folder"));
+    try pane.request("bad-scan");
+    try waitForScan(pane);
+    try std.testing.expectEqual(error.AccessDenied, pane.view().status.failed.err);
+    try std.testing.expectEqualStrings("/", pane.view().status.failed.path.?);
+    try std.testing.expectEqualStrings(Fixture.root, pane.location().locator);
+}
+
+test "opaque scans preserve visible pane marks by exact name and discard stale or canceled results" {
+    const Fixture = @import("testing_provider.zig").Opaque;
+    var fixture: Fixture = .{};
+    const pane = try Pane.create(std.testing.io, std.testing.allocator, Fixture.root, .{ .provider = fixture.provider() });
+    defer pane.destroy();
+    defer fixture.release.store(true, .release);
+    try pane.refresh();
+    try waitForScan(pane);
+    pane.move(.{ .by = 1 }, false);
+    pane.toggleSelection();
+    try pane.changeListing(.reverse);
+    try waitForScan(pane);
+    try std.testing.expectEqualStrings("a", pane.view().focused().?.name);
+    try std.testing.expect(pane.view().focusedMarked());
+    try pane.request(Fixture.slow);
+    try fixture.waitStarted();
+    try pane.request(Fixture.child);
+    try pane.request(Fixture.latest);
+    fixture.release.store(true, .release);
+    try waitForScan(pane);
+    try std.testing.expect(fixture.canceled_seen.load(.acquire));
+    try std.testing.expectEqualStrings(Fixture.latest, pane.location().locator);
+    try std.testing.expectEqual(@as(usize, 0), pane.view().marked_count); // Same display, different identity.
+    try pane.request(Fixture.root);
+    try waitForScan(pane);
+    pane.move(.last, false);
+    pane.toggleSelection();
+    fixture.missing_a = true;
+    try pane.refresh();
+    try waitForScan(pane);
+    try std.testing.expectEqual(@as(usize, 0), pane.view().marked_count);
+    fixture.started.store(false, .release);
+    fixture.release.store(false, .release);
+    try pane.request(Fixture.slow);
+    try fixture.waitStarted();
+    try pane.request(Fixture.child);
+    pane.cancelNavigation();
+    fixture.release.store(true, .release);
+    try waitForScan(pane);
+    try std.testing.expectEqualStrings(Fixture.root, pane.location().locator);
 }

@@ -399,3 +399,91 @@ test "View retains path aliases terminal geometry and job quit text binding" {
     try feed(view, &decoder, "q");
     try std.testing.expect(state.view().quit);
 }
+
+test "View and direct commands share current provider support without starting work" {
+    const directory = @import("../core/directory.zig");
+    const Pane = @import("../core/pane.zig").Pane;
+    const theme = @import("theme.zig");
+    const Fixture = struct {
+        writable: bool = true,
+        scans: std.atomic.Value(usize) = .init(0),
+        fn capabilities(context: ?*anyopaque, _: []const u8) directory.Capabilities {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            return .{ .source_read = true, .destination_write = self.writable };
+        }
+        fn scan(context: ?*anyopaque, io: std.Io, path: []const u8, options: directory.Options, canceled: *const std.atomic.Value(bool)) !directory.Snapshot {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            _ = self.scans.fetchAdd(1, .monotonic);
+            return directory.local.scan(null, io, path, options, canceled);
+        }
+    };
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "source", .data = "" });
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buffer);
+    const foreign_identity: u8 = 0;
+    for ([_]bool{ false, true }) |foreign| {
+        var fixture: Fixture = .{};
+        var provider = directory.local;
+        provider.context = &fixture;
+        provider.capabilities = Fixture.capabilities;
+        provider.scan = Fixture.scan;
+        if (foreign) provider.identity = &foreign_identity;
+        const left = try Pane.create(io, allocator, buffer[0..len], .{});
+        defer left.destroy();
+        const right = try Pane.create(io, allocator, buffer[0..len], .{ .provider = provider });
+        defer right.destroy();
+        const emulator = try Emulator.create(io, allocator, 80, 8);
+        defer emulator.destroy();
+        const state = try State.create(io, allocator, .{ left, right });
+        defer state.destroy();
+        const view = try View.create(allocator, state, emulator);
+        defer view.destroy();
+        for (state.panes()) |pane| try pane.refresh();
+        for (0..5000) |_| {
+            _ = try state.poll();
+            if (left.view().status != .loading and right.view().status != .loading) break;
+            try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+        }
+        try view.event(&.{ .key = .down });
+        try std.testing.expectEqual(!foreign, state.available(.copy));
+        try std.testing.expectEqual(!foreign, state.available(.move));
+        try std.testing.expect(state.available(.delete));
+        // Capabilities can change after an observation, without a scan or focus change.
+        fixture.writable = false;
+        var frame = ui.Frame.init(allocator);
+        defer frame.deinit();
+        for (0..3) |_| {
+            try view.paint(&frame, .{ .width = 80, .height = 24 });
+            try std.testing.expect(!state.available(.copy));
+            try std.testing.expect(!state.available(.move));
+            try std.testing.expect(!try state.invoke(.copy, emulator));
+            try std.testing.expect(!try state.invoke(.move, emulator));
+            try std.testing.expectEqualDeep(theme.disabled_action, frame.cells[23 * 80 + 33].style);
+        }
+        try view.event(&.{ .key = .f5 });
+        try view.event(&.{ .key = .f6 });
+        try std.testing.expect(state.view().modal == .none);
+        try std.testing.expect(state.view().operation == null);
+        try view.event(&.{ .key = .tab });
+        try view.event(&.{ .key = .down });
+        try std.testing.expect(!try state.invoke(.mkdir, emulator));
+        try std.testing.expect(!try state.invoke(.delete, emulator));
+        try view.event(&.{ .key = .f7 });
+        try view.event(&.{ .key = .f8 });
+        try std.testing.expect(state.view().modal == .none);
+        try std.testing.expect(state.view().operation == null);
+        try std.testing.expectEqual(@as(usize, 1), fixture.scans.load(.acquire));
+        fixture.writable = true;
+        // Capability bits alone never authorize an unsupported provider executor.
+        try std.testing.expectEqual(!foreign, state.available(.mkdir));
+        try std.testing.expectEqual(!foreign, state.available(.delete));
+        try std.testing.expectEqual(!foreign, try state.invoke(.mkdir, emulator));
+        if (!foreign) state.dismiss();
+        try std.testing.expectEqual(@as(usize, 1), fixture.scans.load(.acquire));
+        _ = try tmp.dir.statFile(io, "source", .{});
+    }
+}

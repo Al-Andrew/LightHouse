@@ -23,6 +23,25 @@ pub const Kind = enum {
     }
 };
 
+/// Structural capability checks are cheap observations, never permission probes.
+/// Read/write capability does not imply an executor exists for that combination.
+pub fn available(kind: Kind, source_provider: listing.Provider, source: listing.Location, destination_provider: listing.Provider, destination: listing.Location, source_count: usize) bool {
+    if (source.provider != source_provider.identity or destination.provider != destination_provider.identity) return false;
+    if (kind != .mkdir and source_count == 0) return false;
+    const from = source_provider.capabilities(source_provider.context, source.locator);
+    const to = destination_provider.capabilities(destination_provider.context, destination.locator);
+    switch (kind) {
+        .copy => if (!from.source_read or !to.destination_write) return false,
+        .move => if (!from.source_read or !from.destination_write or !to.destination_write) return false,
+        .delete => if (!from.destination_write) return false,
+        .mkdir => if (!to.destination_write) return false,
+    }
+    _ = source_provider.localPath(source.locator) catch return false;
+    if (kind != .delete) _ = destination_provider.localPath(destination.locator) catch return false;
+    return true;
+}
+const listing = @import("directory.zig");
+
 /// Owned request metadata. All slices are borrowed until Job.destroy.
 pub const Request = struct {
     kind: Kind,
@@ -781,4 +800,26 @@ test "destroy joins an active copy and removes its unpublished destination" {
     var iterator = dir.iterate();
     try std.testing.expectEqualStrings("source", (try iterator.next(io)).?.name);
     try std.testing.expect(try iterator.next(io) == null);
+}
+
+test "capabilities distinguish source reading destination writing and executor combinations" {
+    const Fixture = @import("testing_provider.zig").Opaque;
+    var readonly: Fixture = .{};
+    var writable: Fixture = .{ .writable = true };
+    const ro = readonly.provider();
+    const rw = writable.provider();
+    const local_provider = listing.local;
+    const here = local_provider.location("/tmp");
+    try std.testing.expect(ro.capabilities(ro.context, Fixture.root).source_read);
+    try std.testing.expect(!ro.capabilities(ro.context, Fixture.root).destination_write);
+    try std.testing.expect(!available(.copy, ro, ro.location(Fixture.root), local_provider, here, 1));
+    try std.testing.expect(!available(.copy, local_provider, here, ro, ro.location(Fixture.root), 1));
+    try std.testing.expect(!available(.copy, rw, rw.location(Fixture.root), rw, rw.location(Fixture.root), 1));
+    try std.testing.expect(!available(.copy, local_provider, here, rw, rw.location(Fixture.root), 1));
+    for ([_]Kind{ .copy, .move, .delete }) |kind| {
+        try std.testing.expect(!available(kind, local_provider, here, local_provider, here, 0));
+        try std.testing.expect(available(kind, local_provider, here, local_provider, here, 1));
+    }
+    try std.testing.expect(available(.mkdir, local_provider, here, local_provider, here, 0));
+    try std.testing.expectError(error.UnsupportedOperation, rw.localPath("/tmp"));
 }
