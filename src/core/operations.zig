@@ -1,7 +1,10 @@
-//! Local file jobs. Requests own their paths; only atomic counters cross threads.
+//! Provider-aware file-action preparation and local execution.
+//! Requests own their paths; only atomic counters cross threads.
 //! Never replace an existing destination. Completed items remain after failure.
 const std = @import("std");
 const Dir = std.Io.Dir;
+const Pane = @import("pane.zig").Pane;
+const listing = @import("directory.zig");
 
 // Bound recursive stack/handle use, and check cancellation between copy chunks.
 const max_recursion_depth = 128;
@@ -23,9 +26,51 @@ pub const Kind = enum {
     }
 };
 
+/// Borrows the active and other pane for synchronous observation/preparation.
+/// No pane or provider storage escapes prepare: the caller owns the returned,
+/// unstarted Job, including all request paths, until Job.destroy.
+/// The other pane supplies transfer destination identity/context; relative input
+/// always uses the source location. Mkdir and delete use the source provider.
+pub const Context = struct {
+    source: *const Pane,
+    other: *const Pane,
+
+    /// Cheap, fresh observation shared by presentation and workflow entry points.
+    pub fn available(self: Context, kind: Kind) bool {
+        const destination_pane = self.destination(kind);
+        return supported(kind, self.source.provider(), self.source.location(), destination_pane.provider(), destination_pane.location(), self.source.sources().count);
+    }
+
+    /// Rechecks default and edited destinations before constructing local work.
+    /// Unsupported combinations return UnsupportedOperation without creating a
+    /// Job; preparation never starts work or changes either pane.
+    pub fn prepare(self: Context, io: std.Io, allocator: std.mem.Allocator, kind: Kind, target: []const u8) !*Job {
+        if (!self.available(kind)) return error.UnsupportedOperation;
+        if (kind != .delete and target.len == 0) return error.EmptyDestination;
+        const provider = self.source.provider();
+        const base = try provider.localPath(self.source.location().locator);
+        const destination_provider = self.destination(kind).provider();
+        const local_target = if (kind == .delete) try allocator.dupe(u8, base) else try destination_provider.localTarget(allocator, base, target);
+        defer allocator.free(local_target);
+        if (!supported(kind, provider, self.source.location(), destination_provider, destination_provider.location(local_target), self.source.sources().count)) return error.UnsupportedOperation;
+        _ = try destination_provider.localPath(local_target);
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(allocator);
+        if (kind != .mkdir) {
+            var sources = self.source.sources();
+            while (sources.next()) |name| try names.append(allocator, name);
+        }
+        return Job.create(io, allocator, kind, base, names.items, local_target);
+    }
+
+    fn destination(self: Context, kind: Kind) *const Pane {
+        return if (kind == .copy or kind == .move) self.other else self.source;
+    }
+};
+
 /// Structural capability checks are cheap observations, never permission probes.
 /// Read/write capability does not imply an executor exists for that combination.
-pub fn available(kind: Kind, source_provider: listing.Provider, source: listing.Location, destination_provider: listing.Provider, destination: listing.Location, source_count: usize) bool {
+fn supported(kind: Kind, source_provider: listing.Provider, source: listing.Location, destination_provider: listing.Provider, destination: listing.Location, source_count: usize) bool {
     if (source.provider != source_provider.identity or destination.provider != destination_provider.identity) return false;
     if (kind != .mkdir and source_count == 0) return false;
     const from = source_provider.capabilities(source_provider.context, source.locator);
@@ -40,7 +85,6 @@ pub fn available(kind: Kind, source_provider: listing.Provider, source: listing.
     if (kind != .delete) _ = destination_provider.localPath(destination.locator) catch return false;
     return true;
 }
-const listing = @import("directory.zig");
 
 /// Owned request metadata. All slices are borrowed until Job.destroy.
 pub const Request = struct {
@@ -802,24 +846,235 @@ test "destroy joins an active copy and removes its unpublished destination" {
     try std.testing.expect(try iterator.next(io) == null);
 }
 
-test "capabilities distinguish source reading destination writing and executor combinations" {
-    const Fixture = @import("testing_provider.zig").Opaque;
-    var readonly: Fixture = .{};
-    var writable: Fixture = .{ .writable = true };
-    const ro = readonly.provider();
-    const rw = writable.provider();
-    const local_provider = listing.local;
-    const here = local_provider.location("/tmp");
-    try std.testing.expect(ro.capabilities(ro.context, Fixture.root).source_read);
-    try std.testing.expect(!ro.capabilities(ro.context, Fixture.root).destination_write);
-    try std.testing.expect(!available(.copy, ro, ro.location(Fixture.root), local_provider, here, 1));
-    try std.testing.expect(!available(.copy, local_provider, here, ro, ro.location(Fixture.root), 1));
-    try std.testing.expect(!available(.copy, rw, rw.location(Fixture.root), rw, rw.location(Fixture.root), 1));
-    try std.testing.expect(!available(.copy, local_provider, here, rw, rw.location(Fixture.root), 1));
-    for ([_]Kind{ .copy, .move, .delete }) |kind| {
-        try std.testing.expect(!available(kind, local_provider, here, local_provider, here, 0));
-        try std.testing.expect(available(kind, local_provider, here, local_provider, here, 1));
+// Local identity with independently mutable capability contexts models support
+// changes without adding another production executor.
+const PreparationCapabilities = struct {
+    readable: bool = true,
+    writable: bool = true,
+    blocked: ?[]const u8 = null,
+
+    fn provider(self: *PreparationCapabilities, local_identity: bool) listing.Provider {
+        var result = listing.local;
+        result.context = self;
+        result.capabilities = capabilities;
+        if (!local_identity) result.identity = self;
+        return result;
     }
-    try std.testing.expect(available(.mkdir, local_provider, here, local_provider, here, 0));
-    try std.testing.expectError(error.UnsupportedOperation, rw.localPath("/tmp"));
+
+    fn capabilities(context: ?*anyopaque, locator: []const u8) listing.Capabilities {
+        const self: *PreparationCapabilities = @ptrCast(@alignCast(context.?));
+        return .{
+            .source_read = self.readable,
+            .destination_write = self.writable and !(if (self.blocked) |blocked| std.mem.startsWith(u8, locator, blocked) else false),
+        };
+    }
+};
+
+const PreparationPanes = struct {
+    source: *Pane,
+    other: *Pane,
+
+    fn init(base: []const u8, destination: []const u8, source_provider: listing.Provider, destination_provider: listing.Provider) !PreparationPanes {
+        const source = try Pane.create(std.testing.io, std.testing.allocator, base, .{ .provider = source_provider });
+        errdefer source.destroy();
+        const other = try Pane.create(std.testing.io, std.testing.allocator, destination, .{ .provider = destination_provider });
+        errdefer other.destroy();
+        try source.refresh();
+        for (0..5000) |_| {
+            if (try source.poll()) break;
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+        } else return error.ScanTimeout;
+        source.move(.last, false);
+        return .{ .source = source, .other = other };
+    }
+
+    fn deinit(self: PreparationPanes) void {
+        self.source.destroy();
+        self.other.destroy();
+    }
+
+    fn context(self: PreparationPanes) Context {
+        return .{ .source = self.source, .other = self.other };
+    }
+};
+
+test "preparation uses destination context for edited absolute and source-relative input" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "source", .data = "safe" });
+    try tmp.dir.createDir(io, "destination", .default_dir);
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base = try testBase(&tmp, &buffer);
+    const blocked = try std.fs.path.join(std.testing.allocator, &.{ base, "blocked" });
+    defer std.testing.allocator.free(blocked);
+    const destination = try std.fs.path.join(std.testing.allocator, &.{ base, "destination" });
+    defer std.testing.allocator.free(destination);
+    var source_capabilities: PreparationCapabilities = .{};
+    var destination_capabilities: PreparationCapabilities = .{ .blocked = blocked };
+    const panes = try PreparationPanes.init(base, destination, source_capabilities.provider(true), destination_capabilities.provider(true));
+    defer panes.deinit();
+    const context = panes.context();
+    for ([_]Kind{ .copy, .move }) |kind| {
+        for ([_][]const u8{ blocked, "blocked" }) |target| {
+            try std.testing.expect(context.available(kind));
+            try std.testing.expectError(error.UnsupportedOperation, context.prepare(io, std.testing.allocator, kind, target));
+        }
+    }
+    // Source context must not veto destination writing for copy.
+    source_capabilities.blocked = blocked;
+    destination_capabilities.blocked = null;
+    const job = try context.prepare(io, std.testing.allocator, .copy, "blocked");
+    defer job.destroy();
+    try std.testing.expectEqualStrings(blocked, job.request().destination);
+    try job.start();
+    try waitForJob(job);
+    try std.testing.expectEqual(null, job.status().finished.failure);
+    _ = try tmp.dir.statFile(io, "blocked", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "destination/blocked", .{}));
+}
+
+test "preparation freshly checks default context and source capabilities" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source", .data = "" });
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base = try testBase(&tmp, &buffer);
+    var source: PreparationCapabilities = .{};
+    var destination: PreparationCapabilities = .{};
+    const panes = try PreparationPanes.init(base, "/default-destination", source.provider(true), destination.provider(true));
+    defer panes.deinit();
+    const context = panes.context();
+    for ([_]Kind{ .copy, .move }) |kind| {
+        try std.testing.expect(context.available(kind));
+        destination.blocked = "/default-destination";
+        // An edited target cannot bypass support lost at the default location.
+        try std.testing.expectError(error.UnsupportedOperation, context.prepare(std.testing.io, std.testing.allocator, kind, "edited"));
+        destination.blocked = null;
+        source.readable = false;
+        try std.testing.expectError(error.UnsupportedOperation, context.prepare(std.testing.io, std.testing.allocator, kind, "edited"));
+        source.readable = true;
+    }
+    source.writable = false;
+    for ([_]Kind{ .move, .mkdir, .delete }) |kind| {
+        try std.testing.expectError(error.UnsupportedOperation, context.prepare(std.testing.io, std.testing.allocator, kind, "edited"));
+    }
+    try std.testing.expect(context.available(.copy));
+    source.writable = true;
+    panes.source.move(.first, false); // Parent row is never a file-action source.
+    for ([_]Kind{ .copy, .move, .delete }) |kind| {
+        try std.testing.expectError(error.UnsupportedOperation, context.prepare(std.testing.io, std.testing.allocator, kind, "edited"));
+    }
+    const mkdir = try context.prepare(std.testing.io, std.testing.allocator, .mkdir, "edited");
+    defer mkdir.destroy();
+    try std.testing.expectEqual(@as(usize, 0), mkdir.request().sources.len);
+    try std.testing.expectError(error.EmptyDestination, context.prepare(std.testing.io, std.testing.allocator, .mkdir, ""));
+}
+
+test "preparation rejects unsupported provider identities despite local-looking locators" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "keep", .data = "safe" });
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base = try testBase(&tmp, &buffer);
+    var foreign: PreparationCapabilities = .{};
+    const panes = try PreparationPanes.init(base, base, foreign.provider(false), listing.local);
+    defer panes.deinit();
+    for ([_]Kind{ .copy, .move, .mkdir, .delete }) |kind| {
+        try std.testing.expect(!panes.context().available(kind));
+        try std.testing.expectError(error.UnsupportedOperation, panes.context().prepare(std.testing.io, std.testing.allocator, kind, "target"));
+    }
+    const outbound = try PreparationPanes.init(base, base, listing.local, foreign.provider(false));
+    defer outbound.deinit();
+    for ([_]Kind{ .copy, .move }) |kind| {
+        try std.testing.expectError(error.UnsupportedOperation, outbound.context().prepare(std.testing.io, std.testing.allocator, kind, "target"));
+    }
+    try std.testing.expect(outbound.context().available(.mkdir));
+    try std.testing.expect(outbound.context().available(.delete));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "target", .{}));
+    _ = try tmp.dir.statFile(std.testing.io, "keep", .{});
+}
+
+test "preparation preserves execution spelling for symlink parent traversal and trailing slashes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "target/child");
+    try tmp.dir.symLink(io, "target/child", "link", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "source", .data = "safe" });
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base = try testBase(&tmp, &buffer);
+    const panes = try PreparationPanes.init(base, base, listing.local, listing.local);
+    defer panes.deinit();
+    const job = try panes.context().prepare(io, std.testing.allocator, .mkdir, "link/../created");
+    defer job.destroy();
+    try std.testing.expect(std.mem.endsWith(u8, job.request().destination, "/link/../created"));
+    try job.start();
+    try waitForJob(job);
+    try std.testing.expectEqual(null, job.status().finished.failure);
+    _ = try tmp.dir.statFile(io, "target/created", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "created", .{}));
+    for ([_]Kind{ .copy, .move }) |kind| {
+        const slash = try panes.context().prepare(io, std.testing.allocator, kind, "missing-directory/");
+        defer slash.destroy();
+        try std.testing.expect(std.mem.endsWith(u8, slash.request().destination, "/missing-directory/"));
+        try slash.start();
+        try waitForJob(slash);
+        try std.testing.expectEqual(error.DestinationMustBeDirectory, slash.status().finished.failure.?.err);
+        try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "missing-directory", .{}));
+    }
+}
+
+test "preparation expands home and retains absolute execution spelling" {
+    const source = try Pane.create(std.testing.io, std.testing.allocator, "/source", .{});
+    defer source.destroy();
+    const context: Context = .{ .source = source, .other = source };
+    const absolute = try context.prepare(std.testing.io, std.testing.allocator, .mkdir, "/link/../created/");
+    defer absolute.destroy();
+    try std.testing.expectEqualStrings("/link/../created/", absolute.request().destination);
+    const c = @import("../platform/linux.zig").c;
+    const home = std.mem.span(c.getenv("HOME") orelse return error.SkipZigTest);
+    const expected = try std.fs.path.join(std.testing.allocator, &.{ home, "created/" });
+    defer std.testing.allocator.free(expected);
+    const expanded = try context.prepare(std.testing.io, std.testing.allocator, .mkdir, "~/created/");
+    defer expanded.destroy();
+    try std.testing.expectEqualStrings(expected, expanded.request().destination);
+}
+
+test "prepared requests own marked sources and target after pane destruction" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a", .data = "a" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b", .data = "b" });
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base = try testBase(&tmp, &buffer);
+    const jobs: [2]*Job = blk: {
+        const panes = try PreparationPanes.init(base, base, listing.local, listing.local);
+        defer panes.deinit();
+        panes.source.toggleSelection();
+        panes.source.move(.first, false); // Marked b wins over parent cursor.
+        var target = "copied".*;
+        const copied = try panes.context().prepare(io, std.testing.allocator, .copy, &target);
+        errdefer copied.destroy();
+        const deleted = try panes.context().prepare(io, std.testing.allocator, .delete, "");
+        @memset(&target, 'X');
+        @memset(buffer[0..base.len], 'X');
+        break :blk .{ copied, deleted };
+    };
+    defer jobs[0].destroy();
+    defer jobs[1].destroy();
+    for (jobs) |job| {
+        try std.testing.expect(job.status() == .prepared);
+        try std.testing.expectEqual(@as(usize, 1), job.request().sources.len);
+        try std.testing.expect(std.mem.endsWith(u8, job.request().sources[0], "/b"));
+    }
+    try std.testing.expect(std.mem.endsWith(u8, jobs[0].request().destination, "/copied"));
+    try jobs[0].start();
+    try waitForJob(jobs[0]);
+    try std.testing.expectEqual(null, jobs[0].status().finished.failure);
+    var data: [4]u8 = undefined;
+    try std.testing.expectEqualStrings("b", try tmp.dir.readFile(io, "copied", &data));
+    // The prepared delete remains safe to dismiss, with no work launched.
+    _ = try tmp.dir.statFile(io, "b", .{});
 }

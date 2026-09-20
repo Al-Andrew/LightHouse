@@ -88,25 +88,38 @@ source-write, and mkdir requires destination-write. Copy, move and delete also
 require at least one file-action source. These observations describe structural
 support, not OS permissions; real I/O errors remain execution results.
 
-`operations.available` separately checks that a supported executor exists. Today
-only the local adapter identity can enter the local executor. A readable
+`operations.Context.available` separately checks that a supported executor
+exists. Today only the local adapter identity can enter the local executor. A readable
 non-local provider may support future copy-out, but read/write flags alone do
 not authorize it or any cross-provider transfer. A non-local locator resembling
 a local path cannot become a local request. `Provider.localPath` is the explicit
-identity-checked bridge to `Job.create`.
+identity-checked bridge used inside preparation before `Job.create`.
 
-`State.actionAvailable` supplies the same file-action policy to presentation and
-workflow entry points. Presentation uses the other pane as the default copy/move
-destination; mkdir uses the active location. Submission converts typed input through the explicit local adapter target path,
-preserving local relative destinations, home expansion, trailing slashes and OS
+`operations.Context` borrows the active and other pane for synchronous
+`available(kind)` and `prepare(io, allocator, kind, target)` calls. It chooses the
+other pane as the default copy/move destination, and the active pane for mkdir
+and delete. The controller and presentation share this availability policy via
+`State.actionAvailable`; callers do not collect names or convert provider
+locations into local execution paths.
+
+Preparation rechecks current default-context availability and the actual edited
+destination. Copy/move retain the other pane's provider identity and context for
+the edited destination; mkdir and delete use the active provider. Relative local
+input still uses the source pane's base. Preparation uses the explicit local
+adapter target conversion, preserving home expansion, trailing slashes and OS
 symlink/parent traversal. File-job destinations keep their absolute execution
 spelling instead of the lexical normalization used for navigation; capability
-callbacks must accept these absolute destination locators too. Submission rechecks
-the actual destination as well as current default-context availability. Copy/move
-retain the other pane's provider and context for the edited destination; mkdir
-and delete use the active provider. Relative local input still uses the source
-pane's base. Both
-source and destination cross the local adapter bridge before job construction. Delete confirmation rechecks
-availability before starting its prepared job. Unsupported entry points do not
-open an editor/confirmation; support lost during an open workflow returns
-`UnsupportedOperation` and keeps its payload for dismissal or correction.
+callbacks must accept these absolute destination locators too. Both source and
+destination cross the local adapter bridge before job construction. Unsupported
+provider combinations cannot construct a local job, even with path-like locators.
+
+Successful preparation returns an unstarted `Job` owning all File-action sources
+and destination bytes; it retains no pane or provider borrows and changes neither
+pane. The controller owns the job through confirmation, launch, completion and
+result dismissal, and refreshes both panes when it collects completion. Delete
+confirmation rechecks availability before starting its prepared job. Unsupported
+entry points do not open an editor/confirmation; support lost during an open
+workflow returns `UnsupportedOperation` and keeps its payload for dismissal or
+correction. Preparation-interface tests cover provider contexts, capability
+changes, destination spelling and request ownership; controller and View tests
+cover the workflow lifetime and routing.

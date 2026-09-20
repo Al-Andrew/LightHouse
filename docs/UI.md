@@ -253,6 +253,10 @@ retention across focus changes.
 
 File panes render provider display text and pane-owned row marks. Navigation and
 path editors delegate location semantics to the provider. The function-key bar
-uses `State.actionAvailable` for file actions, and workflow submission rechecks
-support before constructing a local job. Provider identity, snapshot ownership,
-refresh rules and executor boundaries are documented in [PROVIDERS.md](PROVIDERS.md).
+uses `State.actionAvailable` for file actions. The controller supplies active and
+other panes to `operations.Context`, whose preparation interface owns provider
+checks, destination conversion and copying File-action sources into an unstarted
+job. The controller owns editor/confirmation payloads, launches prepared jobs,
+collects completion, refreshes both panes and retains results until dismissal.
+Provider identity, snapshot ownership, refresh rules and the local execution seam
+are documented in [PROVIDERS.md](PROVIDERS.md).
