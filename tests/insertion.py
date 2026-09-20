@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Cursor references arrive literally and never submit input by themselves."""
+
 import os
 import shlex
 import tempfile
@@ -41,7 +42,11 @@ def path_insertion():
             assert report.read_text() == str(entry)
             # An explicit reference goes to the current foreground program too.
             capture = root / "capture"
-            program = "import os,tty,termios; saved=termios.tcgetattr(0); tty.setraw(0); print('CAPTURE_READY',flush=True); data=b'';\nwhile True:\n b=os.read(0,1)\n if b==b'\\r': break\n data+=b\ntermios.tcsetattr(0,termios.TCSANOW,saved)\nopen(" + repr(str(capture)) + ", 'wb').write(data)"
+            program = (
+                "import os,tty,termios; saved=termios.tcgetattr(0); tty.setraw(0); print('CAPTURE_READY',flush=True); data=b'';\nwhile True:\n b=os.read(0,1)\n if b==b'\\r': break\n data+=b\ntermios.tcsetattr(0,termios.TCSANOW,saved)\nopen("
+                + repr(str(capture))
+                + ", 'wb').write(data)"
+            )
             app.send("\x1b[200~python3 -c " + shlex.quote(program) + "\x1b[201~\r")
             app.expect("CAPTURE_READY")
             app.send("\x06\x07\x06\r")
