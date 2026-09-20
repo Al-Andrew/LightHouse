@@ -8,7 +8,8 @@ pub const KeyBar = struct {
     state: *const State,
 
     pub fn paint(self: *KeyBar, _: *toolkit.Widget, painter: ui.Painter) !void {
-        paintActions(painter, self.state.focus != .terminal and self.state.modal == .none and self.state.operation == null);
+        const state = self.state.view();
+        paintActions(painter, state.focus != .terminal and state.modal == .none and state.operation == null);
     }
 };
 

@@ -18,8 +18,9 @@ build script, and Python integration suites before further feature work.
   remain caller-supplied, with the application palette in `ui/theme.zig`.
 - **File-job lifecycle:** an opaque `Job` owns preparation, launch failure,
   cancellation, worker collection, and result lifetime. Only polling publishes
-  completion, once; status reads are observational. Application code owns
-  confirmation, presentation, and pane refresh without accessing worker atomics.
+  completion, once; status reads are observational. The opaque controller owns
+  confirmation, collection, both-pane refresh, result dismissal, and shutdown
+  cleanup. Widgets borrow read-only payload views; App only schedules polling.
   Cancellation requests do not overwrite an operation's actual outcome.
 - **Pane ownership:** an opaque `Pane` owns cursor movement, marking, viewport
   maintenance, listing-option changes, and source selection. Painting consumes

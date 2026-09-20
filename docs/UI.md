@@ -9,7 +9,8 @@ support still comes from the pinned Ghostty dependency.
 The application imports this module and implements its widgets in
 `src/app/widgets/`. File panes borrow domain `Pane` values; the terminal widget
 borrows the emulator; dialogs borrow the application's workflow state. These
-resources outlive the widget tree and are released by the application.
+resources outlive the widget tree. The controller releases workflow payloads;
+`App` releases the borrowed panes and emulator after destroying the controller.
 
 ## Composition
 
@@ -26,8 +27,9 @@ App root                       application layout and global bindings
 ```
 
 `src/app/view.zig` builds this tree once and projects application focus and modal
-state into it. `src/app/controller.zig` owns application commands and file-action
-workflows. `src/app/layout.zig` chooses the two-pane/terminal geometry.
+state into it. The opaque `State` in `src/app/controller.zig` owns application
+commands and complete file-action workflows, including completion collection,
+refreshing both panes, result retention, and modal/job cleanup. `src/app/layout.zig` chooses the two-pane/terminal geometry.
 `src/app.zig` defines `App`, which owns startup, background polling, terminal I/O,
 and frame output through an explicit lifecycle:
 
@@ -40,11 +42,24 @@ try app.run();
 Initialization rolls back acquired resources on failure. Controller state has a
 stable heap address because widgets borrow it; the `App` value can be returned
 from initialization without invalidating those pointers. `run` coordinates
-worker polling, input timeout, resize, rendering, and terminal I/O through private
-methods. `deinit` releases the view, joins background work, ends the embedded
+controller polling, input timeout, resize, rendering, and terminal I/O through
+private methods. `State.create` borrows panes and I/O and owns its heap storage,
+editors, prepared confirmations, and running/finished job. `State.destroy`
+releases those payloads and cancels/joins outstanding file work before the
+application destroys either borrowed pane. `deinit` releases the view, joins background work, ends the embedded
 session, and restores the outer terminal. The executable performs this cleanup
 before reporting runtime errors. Each successful initialization owns one session
 and requires exactly one `deinit`.
+
+Workflow callers use `openPath`, `openAction`, `openDelete`, `submit`,
+`confirmDelete`, and `dismiss`. A second workflow is rejected until the current
+modal/job is dismissed. `State.view()` provides borrowed, read-only observations;
+painting and status reads never collect completion. Only `State.poll()` collects
+jobs and requests one refresh of each pane for every completion, including
+failure, cancellation, and launch failure. Both refreshes are attempted even if
+one fails. The finished result remains owned until dismissal, including while
+focus visits the persistent terminal. `App` schedules polling without accessing
+or destroying workflow payloads.
 
 The palette belongs to `src/app/theme.zig`.
 
@@ -106,7 +121,13 @@ widget repaint caching is not part of this interface yet.
 Set `node.focusable = true` and call `Tree.setFocus(node)` to make it the input
 target. Events first visit that widget and bubble through its parents until a
 handler returns `true`. `false` allows a parent to interpret an unhandled command.
-Terminal input is handled by the terminal widget; Ctrl+G bubbles to the app.
+`View.event` is the sole application input entry point. File-pane widgets handle
+local navigation and marking; unhandled global bindings bubble to the root's
+`State.globalEvent`. The root never retries pane bindings. Terminal input is
+handled by the terminal widget; only Ctrl+G bubbles to the root. Modal widgets
+call `State.modalEvent` and consume every event, including ignored paste events.
+The controller owns focus policy; the view only projects its observed focus and
+modal visibility into the tree.
 
 `Tree.setModal(node)` establishes one modal scope. Input cannot escape that
 subtree, including ignored events and the event that opens or closes the modal.
@@ -136,3 +157,8 @@ both toolkit and application tests. The toolkit tests cover ownership, input
 bubbling, modal trapping/restoration, removal during callbacks, reentrancy,
 clipping, composition order, and tiny layouts. App tests and `zig build
 test-integration` exercise the retained tree with real panes and shell sessions.
+Workflow tests use the controller interface and count real provider scans for
+successful, failed, canceled, and launch-failed jobs. Allocation-failure and
+blocked-work tests verify cleanup; routing tests use `View.event` for compact
+pane input, editor/help/delete paste isolation, terminal forwarding, and result
+retention across focus changes.

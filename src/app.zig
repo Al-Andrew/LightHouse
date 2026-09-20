@@ -40,11 +40,8 @@ pub const App = struct {
     pub fn init(io: std.Io, allocator: std.mem.Allocator, shell: [:0]const u8) !App {
         var console = try platform.Console.init();
         errdefer console.deinit();
-        const state = try allocator.create(State);
-        errdefer allocator.destroy(state);
-        state.* = .{ .io = io, .allocator = allocator };
         const size = platform.Console.size();
-        const layout = Layout.calculate(size, state.adjustment, state.zoom);
+        const layout = Layout.calculate(size, 0, false);
         var pty = try platform.Pty.spawn(shell, terminalSize(layout), &console.saved);
         errdefer pty.deinit();
         const emulator = try Emulator.create(io, allocator, @intCast(layout.terminal.width), @intCast(layout.terminal.height));
@@ -57,7 +54,8 @@ pub const App = struct {
         const right = try Pane.create(io, allocator, cwd, .{});
         errdefer right.destroy();
         const panes: [2]*Pane = .{ left, right };
-        state.panes = panes;
+        const state = try State.create(io, allocator, panes);
+        errdefer state.destroy();
         const view = try View.create(allocator, state, emulator);
         errdefer view.destroy();
         try view.resize(size);
@@ -87,20 +85,18 @@ pub const App = struct {
         self.current.deinit();
         // Release borrowers first, then cancel/join workers before their owners.
         self.view.destroy();
-        if (self.state.operation) |job| job.destroy();
-        self.state.modal.deinit();
+        self.state.destroy();
         self.panes[1].destroy();
         self.panes[0].destroy();
         self.emulator.destroy();
         self.pty.deinit();
-        self.allocator.destroy(self.state);
         // Restore the outer terminal only after the embedded session has ended.
         self.console.deinit();
         self.* = undefined;
     }
 
     pub fn run(self: *App) !void {
-        while (!self.state.quit and !platform.shouldStop()) {
+        while (!self.state.view().quit and !platform.shouldStop()) {
             try self.pollWorkers();
             try self.expireInput();
             try self.resize();
@@ -115,15 +111,7 @@ pub const App = struct {
     }
 
     fn pollWorkers(self: *App) !void {
-        if (self.state.operation) |job| {
-            if (job.poll()) {
-                for (self.panes) |pane| try pane.refresh();
-                self.dirty = true;
-            } else if (job.status() != .finished and self.state.focus != .terminal) self.dirty = true;
-        }
-        for (self.panes) |pane| if (try pane.poll()) {
-            self.dirty = true;
-        };
+        if (try self.state.poll()) self.dirty = true;
     }
 
     fn expireInput(self: *App) !void {
@@ -138,7 +126,7 @@ pub const App = struct {
 
     fn resize(self: *App) !void {
         const size = platform.Console.size();
-        const layout = Layout.calculate(size, self.state.adjustment, self.state.zoom);
+        const layout = Layout.calculate(size, self.state.view().adjustment, self.state.view().zoom);
         if (std.meta.eql(self.size, size) and std.meta.eql(self.layout, layout)) return;
         self.size = size;
         self.layout = layout;
@@ -146,7 +134,7 @@ pub const App = struct {
         const dimensions = terminalSize(layout);
         try self.emulator.resize(dimensions.cols, dimensions.rows);
         try self.pty.resize(dimensions);
-        self.state.force_redraw = true;
+        self.state.requestRedraw();
         self.dirty = true;
     }
 
@@ -154,10 +142,10 @@ pub const App = struct {
         if (!self.dirty and !self.view.tree.dirty) return;
         try self.view.paint(&self.current, self.size);
         self.output.clearRetainingCapacity();
-        try ui.encode(&self.output.writer, &self.current, if (self.state.force_redraw) null else &self.previous);
+        try ui.encode(&self.output.writer, &self.current, if (self.state.view().force_redraw) null else &self.previous);
         try platform.writeAll(1, self.output.written());
         std.mem.swap(ui.Frame, &self.current, &self.previous);
-        self.state.force_redraw = false;
+        self.state.rendered();
         self.dirty = false;
     }
 
