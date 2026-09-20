@@ -355,8 +355,8 @@ const Implementation = struct {
                 self.last_pane = self.focus;
             },
             .f10 => self.quit = true,
-            .page_up => if (ev.shift) emulator.scroll(-@as(isize, emulator.terminal.rows)),
-            .page_down => if (ev.shift) emulator.scroll(emulator.terminal.rows),
+            .page_up => if (ev.shift) emulator.scrollPage(.up),
+            .page_down => if (ev.shift) emulator.scrollPage(.down),
             .text => if (ev.len == 1) {
                 switch (ev.bytes[0]) {
                     'q' => self.quit = true,

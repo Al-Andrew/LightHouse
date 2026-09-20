@@ -32,9 +32,10 @@ bar, and modal; root layout uses those roles rather than child indices. These
 handles borrow nodes owned by the tree and live until view destruction. The root
 model borrows the heap-allocated view, which stays at a stable address until after
 the tree is released. Adding another child does not change a role's geometry.
-The opaque `State` in `src/app/controller.zig` owns application
-commands and complete file-action workflows, including completion collection,
-refreshing both panes, result retention, and modal/job cleanup. `src/app/layout.zig` chooses the two-pane/terminal geometry.
+The opaque `State` in `src/app/controller.zig` owns application commands and
+complete file-action workflows, including completion collection, refreshing both
+panes, result retention, and modal/job cleanup. `src/app/layout.zig` chooses the
+two-pane/terminal geometry.
 `src/app.zig` defines `App`, which owns startup, background polling, terminal I/O,
 and frame output through an explicit lifecycle:
 
@@ -51,8 +52,8 @@ controller polling, input timeout, resize, rendering, and terminal I/O through
 private methods. `State.create` borrows panes and I/O and owns its heap storage,
 editors, prepared confirmations, and running/finished job. `State.destroy`
 releases those payloads and cancels/joins outstanding file work before the
-application destroys either borrowed pane. `deinit` releases the view, joins background work, ends the embedded
-session, and restores the outer terminal. The executable performs this cleanup
+application destroys either borrowed pane. `deinit` releases the view, joins
+background work, ends the embedded session, and restores the outer terminal. The executable performs this cleanup
 before reporting runtime errors. Each successful initialization owns one session
 and requires exactly one `deinit`.
 
@@ -122,10 +123,17 @@ state, but that state must stay at a stable address and outlive them. Call
 rectangles with `setRect`; `node.rect()` returns geometry by value. A parent
 iterates `node.children()` and may use `child.measure(available)` to obtain a
 clamped preferred size. `setVisible` and `visible()` control/observe a node's own
-visibility, separately from its ancestors. The library provides horizontal/vertical equal-share
-boxes and centered geometry. Applications can supply custom layouts using the
-same interface. The file-pane widget updates its viewport during layout, even
-when a compact window gives it no visible rows.
+visibility, separately from its ancestors. The library provides horizontal and
+vertical equal-share boxes and centered geometry. Applications can supply custom layouts using the
+same interface. Application layout and view accept toolkit `Size` values.
+`Layout.boundedSize` limits presentation geometry to nonzero dimensions and a
+bounded allocation size. `App` converts host dimensions at the event-loop seam
+and derives both emulator and PTY sizes from the same layout, including zoom,
+compact, and one-cell windows. Linux continues to own the outer console and PTY
+lifecycle; `App` retains nonblocking transport scheduling.
+
+The file-pane widget updates its viewport during layout, even when a compact
+window gives it no visible rows.
 
 `Tree.paint(frame)` walks the tree in child order, creating nested clipped
 painters. The active modal subtree paints last and suppresses the underlying
@@ -145,15 +153,24 @@ widget repaint caching is not part of this interface yet.
 Call `node.setFocusable(true)` and `tree.setFocus(node)` to make it the input
 target. `node.focusable()` observes eligibility, `node.focused()` observes active
 focus, and `tree.focus()` returns the borrowed current target. Disabling
-focusability clears both current and saved focus for that node. Events first visit that widget and bubble through its parents until a
-handler returns `true`. `false` allows a parent to interpret an unhandled command.
+focusability clears both current and saved focus for that node. Events first
+visit that widget and bubble through its parents until a handler returns `true`. `false` allows a parent to interpret an unhandled command.
 `View.event` is the sole application input entry point. File-pane widgets handle
 local navigation and marking; unhandled global bindings bubble to the root's
 `State.globalEvent`. The root never retries pane bindings. Terminal input is
-handled by the terminal widget; only Ctrl+G bubbles to the root. Modal widgets
-call `State.modalEvent` and consume every event, including ignored paste events.
+handled by the terminal widget; only Ctrl+G key events bubble to the root. Modal
+widgets call `State.modalEvent` and consume every event, including ignored paste
+events.
 The controller owns focus policy; the view only projects its observed focus and
 modal visibility into the tree.
+
+Paste bytes, including Ctrl+G, stay terminal data. The widget forwards keys
+and paste events through `Emulator.event`; the emulator owns paste state, captures
+bracketed-paste mode at paste start, and frames the entire paste using that mode
+even if child output changes it before paste end. Key encoding and VT replies
+share its bounded output queue. `Emulator.scrollPage(.up/.down)` keeps page size
+and Ghostty viewport state behind the terminal interface. Keys and paste start
+return the viewport to the bottom.
 
 `Tree.setModal(node)` establishes one modal scope. Input cannot escape that
 subtree, including ignored events and the event that opens or closes the modal.

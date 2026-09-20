@@ -1,7 +1,6 @@
 //! Compose app widgets using the independent retained UI library.
 const std = @import("std");
 const ui = @import("lighthouse-ui");
-const platform = @import("../platform/linux.zig");
 const State = @import("controller.zig").State;
 const Layout = @import("layout.zig").Layout;
 const Emulator = @import("../terminal/emulator.zig").Emulator;
@@ -64,14 +63,15 @@ pub const View = struct {
         try self.sync();
     }
 
-    pub fn resize(self: *View, size: platform.Size) !void {
-        try self.tree.layout(.{ .width = size.cols, .height = size.rows });
+    pub fn resize(self: *View, size: ui.Size) !void {
+        try self.tree.layout(Layout.boundedSize(size));
     }
 
-    pub fn paint(self: *View, frame: *ui.Frame, size: platform.Size) !void {
+    pub fn paint(self: *View, frame: *ui.Frame, available: ui.Size) !void {
+        const size = Layout.boundedSize(available);
         try self.sync();
         try self.resize(size);
-        try frame.begin(size.cols, size.rows);
+        try frame.begin(size.width, size.height);
         try self.tree.paint(frame);
     }
 };
@@ -81,7 +81,7 @@ const Root = struct {
     view: *View,
 
     pub fn layout(self: *Root, _: *ui.Widget, size: ui.Size) void {
-        const geometry = Layout.calculate(.{ .cols = @intCast(size.width), .rows = @intCast(size.height) }, self.view.state.view().adjustment, self.view.state.view().zoom);
+        const geometry = Layout.calculate(size, self.view.state.view().adjustment, self.view.state.view().zoom);
         self.view.pane_area.setVisible(!geometry.compact);
         self.view.pane_area.setRect(.{ .x = 0, .y = 0, .width = size.width, .height = geometry.panes_height });
         self.view.terminal.setRect(geometry.terminal);
@@ -118,7 +118,7 @@ test "retained app view traps editor paste and restores the active pane after di
     view.modal.destroy();
     view.modal = try view.tree.create(view.tree.root(), Modal, .{ .state = state });
     view.modal.setFocusable(true);
-    try view.resize(.{ .cols = 80, .rows = 24 });
+    try view.resize(.{ .width = 80, .height = 24 });
     try std.testing.expectEqual(extra_rect, extra.rect());
     try std.testing.expectEqual(@as(usize, 80), view.pane_area.rect().width);
     try std.testing.expectEqual(@as(usize, 23), view.key_bar.rect().y);
@@ -132,9 +132,9 @@ test "retained app view traps editor paste and restores the active pane after di
     try std.testing.expectEqual(@as(usize, 0), emulator.queued().len);
     var frame = ui.Frame.init(allocator);
     defer frame.deinit();
-    for ([_]platform.Size{ .{ .cols = 80, .rows = 24 }, .{ .cols = 7, .rows = 4 }, .{ .cols = 1, .rows = 1 } }) |size| {
+    for ([_]ui.Size{ .{ .width = 80, .height = 24 }, .{ .width = 7, .height = 4 }, .{ .width = 1, .height = 1 } }) |size| {
         try view.paint(&frame, size);
-        if (frame.cursor) |cursor| try std.testing.expect(cursor.x < size.cols and cursor.y < size.rows);
+        if (frame.cursor) |cursor| try std.testing.expect(cursor.x < size.width and cursor.y < size.height);
     }
     try view.event(&.{ .key = .escape });
     try std.testing.expect(state.view().modal == .none);
@@ -173,7 +173,7 @@ test "View routes compact pane input terminal controls and workflow modals once"
         try std.Io.sleep(io, .fromMilliseconds(1), .awake);
     }
     try std.testing.expect(left.view().status == .ready);
-    try view.resize(.{ .cols = 7, .rows = 4 });
+    try view.resize(.{ .width = 7, .height = 4 });
     try view.event(&.{ .key = .down });
     try std.testing.expectEqualStrings("file", left.view().focused().?.name);
     var decoder: ui.input.Decoder = .{};
@@ -199,7 +199,7 @@ test "View routes compact pane input terminal controls and workflow modals once"
     try std.testing.expect(state.view().operation == null);
     var frame = ui.Frame.init(allocator);
     defer frame.deinit();
-    for ([_]platform.Size{ .{ .cols = 80, .rows = 24 }, .{ .cols = 7, .rows = 4 }, .{ .cols = 1, .rows = 1 } }) |size| {
+    for ([_]ui.Size{ .{ .width = 80, .height = 24 }, .{ .width = 7, .height = 4 }, .{ .width = 1, .height = 1 } }) |size| {
         try view.paint(&frame, size);
         try std.testing.expect(frame.cursor == null);
     }
@@ -209,7 +209,7 @@ test "View routes compact pane input terminal controls and workflow modals once"
     try view.event(&.{ .key = .enter });
     try view.event(&.{ .key = .enter });
     try std.testing.expect(state.view().operation.?.status() == .running);
-    try view.paint(&frame, .{ .cols = 80, .rows = 24 });
+    try view.paint(&frame, .{ .width = 80, .height = 24 });
     try std.testing.expect(state.view().operation.?.status() == .running);
     _ = try state.poll();
     try std.testing.expectEqual(error.ConcurrencyUnavailable, state.view().operation.?.status().finished.failure.?.err);
@@ -227,4 +227,32 @@ test "View routes compact pane input terminal controls and workflow modals once"
 
 fn feed(view: *View, decoder: *ui.input.Decoder, bytes: []const u8) !void {
     for (bytes) |byte| if (decoder.feed(byte)) |ev| try view.event(&ev);
+}
+
+test "view routes Ctrl+G keys to focus policy and preserves Ctrl+G inside terminal paste" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Pane = @import("../core/pane.zig").Pane;
+    const left = try Pane.create(io, allocator, "/", .{});
+    defer left.destroy();
+    const right = try Pane.create(io, allocator, "/", .{});
+    defer right.destroy();
+    const emulator = try Emulator.create(io, allocator, 80, 8);
+    defer emulator.destroy();
+    const state = try State.create(io, allocator, .{ left, right });
+    defer state.destroy();
+    const view = try View.create(allocator, state, emulator);
+    defer view.destroy();
+    try view.resize(.{ .width = 80, .height = 24 });
+    var decoder: ui.input.Decoder = .{};
+    for ("\x07\x1b[200~q\x07") |byte| if (decoder.feed(byte)) |ev| try view.event(&ev);
+    try std.testing.expect(view.terminal.focused());
+    try emulator.feed("\x1b[?2004h");
+    for ("\n\x1b[201~\x03") |byte| if (decoder.feed(byte)) |ev| try view.event(&ev);
+    try std.testing.expectEqualStrings("q\x07\n\x03", emulator.queued());
+    try std.testing.expect(view.terminal.focused());
+    for ("\x07\x1b[200~q\x07\x1b[201~") |byte| if (decoder.feed(byte)) |ev| try view.event(&ev);
+    try std.testing.expect(view.panes[0].focused());
+    try std.testing.expect(!state.view().quit);
+    try std.testing.expectEqualStrings("q\x07\n\x03", emulator.queued());
 }

@@ -9,7 +9,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from support import App
+from support import App, wait
 
 
 def shell_and_resize():
@@ -45,6 +45,65 @@ def shell_and_resize():
         app.finished()
     finally:
         app.close()
+
+
+def geometry_and_fragmented_paste():
+    """PTY geometry follows compact/tiny/zoom layout; paste stays shell input."""
+    with tempfile.TemporaryDirectory(prefix="lighthouse-terminal-") as directory:
+        report = Path(directory) / "size"
+        pasted = Path(directory) / "paste"
+        app = App()
+        try:
+            app.start()
+            app.send("\x07")
+            for cols, rows, terminal_rows in [
+                (1, 1, 1),
+                (12, 4, 3),
+                (32, 10, 3),
+                (80, 24, 8),
+            ]:
+                app.resize(cols, rows)
+                app.pump(0.15)
+                report.unlink(missing_ok=True)
+                app.send(f"stty size > {report}\r")
+                wait(
+                    app,
+                    lambda: (
+                        report.exists()
+                        and report.read_text().strip() == f"{terminal_rows} {cols}"
+                    ),
+                    f"child geometry did not become {terminal_rows} {cols}",
+                )
+            app.send("\x07z")
+            app.pump(0.15)
+            report.unlink()
+            app.send(f"stty size > {report}\r")
+            wait(
+                app,
+                lambda: report.exists() and report.read_text().strip() == "23 80",
+                "zoom geometry",
+            )
+            # Split framing and payload across independent input batches.
+            for fragment in (
+                "\x1b[20",
+                "0~printf '%s' ",
+                f"PASTED > {pasted}",
+                "\x1b[20",
+                "1~",
+            ):
+                app.send(fragment)
+                app.pump(0.05)
+            assert not pasted.exists(), "paste unexpectedly submitted the command"
+            app.send("\r")
+            wait(
+                app,
+                lambda: pasted.exists() and pasted.read_text() == "PASTED",
+                "fragmented paste",
+            )
+            app.send("\x07q")
+            app.finished()
+        finally:
+            app.close()
 
 
 def shell_exit():
@@ -218,6 +277,7 @@ if __name__ == "__main__":
         shell_context_signals,
         redirected_diagnostics,
         shell_and_resize,
+        geometry_and_fragmented_paste,
         shell_exit,
         signal_under_load,
         failed_start,
