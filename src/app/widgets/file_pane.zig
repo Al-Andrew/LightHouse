@@ -4,6 +4,7 @@ const ui = @import("lighthouse-ui").screen;
 const theme = @import("../theme.zig");
 const Pane = @import("../../core/pane.zig").Pane;
 const toolkit = @import("lighthouse-ui");
+const commands = @import("../commands.zig");
 
 /// The widget borrows its domain pane. The application owns the pane's lifetime.
 pub const FilePane = struct {
@@ -43,9 +44,10 @@ pub const FilePane = struct {
     }
     pub fn event(self: *FilePane, _: *toolkit.Widget, ev: *const toolkit.Event) !bool {
         try self.syncInput();
+        const command = commands.resolve(ev);
         if (self.input) |*input| {
             if (self.editing) {
-                if (ev.kind == .key and (ev.key == .tab or (ev.key == .text and ev.len == 1 and ev.bytes[0] == toolkit.input.control('l')))) return false;
+                if (command == .switch_pane or command == .path) return false;
                 switch (try input.event(ev)) {
                     .cancel => {
                         try self.pane.closeFilter();
@@ -62,7 +64,7 @@ pub const FilePane = struct {
                 return true;
             }
         }
-        if (ev.kind == .key and ev.key == .text and ev.len == 1 and ev.bytes[0] == '/') {
+        if (command == .filter) {
             try self.pane.setFilter(self.pane.view().filter.query);
             try self.syncInput();
             self.editing = true;
@@ -149,7 +151,7 @@ pub const help_lines = blk: {
 pub fn handleEvent(pane: *Pane, ev: *const toolkit.Event) !bool {
     if (ev.kind != .key) return false;
     // Let Ctrl+J bubble only after the focused filter input declines it.
-    if (@import("../commands.zig").resolve(ev) == .visibility_terminal) return false;
+    if (commands.resolve(ev) == .visibility_terminal) return false;
     for (descriptions) |description| for (description.bindings) |binding| {
         if (!binding.matches(ev)) continue;
         switch (binding.action) {
