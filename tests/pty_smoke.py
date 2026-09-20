@@ -152,16 +152,30 @@ def terminal_lifetime():
             app.send("\x07")
             go(app, work)
             app.send("\x07")
-            for cycle in range(3):
+
+            def exit_current_shell():
+                children = (
+                    Path(f"/proc/{app.proc.pid}/task/{app.proc.pid}/children")
+                    .read_text()
+                    .split()
+                )
+                assert len(children) == 1, "expected one current shell child"
+                shell_pid = int(children[0])
                 app.send("exit\r")
-                app.pump(0.3)
+                wait(
+                    app,
+                    lambda: not Path(f"/proc/{shell_pid}").exists(),
+                    "current shell not reaped",
+                )
+
+            for cycle in range(3):
+                exit_current_shell()
                 assert app.proc.poll() is None
                 app.send("\n")
                 app.expect("LH_PROMPT>")
                 app.send("printf 'cwd:'; pwd\r")
                 app.expect("cwd:" + str(work))
-            app.send("exit\r")
-            app.pump(0.3)
+            exit_current_shell()
             work.rmdir()
             app.send("\n")
             app.expect("WorkingDirectoryUnavailable")
