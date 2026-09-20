@@ -44,6 +44,9 @@ pub const Provider = struct {
     display: *const fn (?*anyopaque, []const u8) []const u8,
     parent_hint: *const fn (?*anyopaque, []const u8) ?[]const u8,
     capabilities: *const fn (?*anyopaque, []const u8) Capabilities,
+    /// Returns one owned, unquoted Cursor entry reference; no local executor
+    /// capability is implied. Called on the UI thread with original name bytes.
+    reference: ?*const fn (?*anyopaque, std.mem.Allocator, []const u8, Entry) anyerror![]const u8 = null,
     scan: *const fn (?*anyopaque, std.Io, []const u8, Options, *const std.atomic.Value(bool)) anyerror!Snapshot,
 
     pub fn location(self: Provider, locator: []const u8) Location {
@@ -72,7 +75,11 @@ pub const local: Provider = .{
     .parent_hint = localParentHint,
     .capabilities = localCapabilities,
     .scan = scanLocal,
+    .reference = localReference,
 };
+fn localReference(_: ?*anyopaque, allocator: std.mem.Allocator, base: []const u8, entry: Entry) ![]const u8 {
+    return std.fs.path.join(allocator, &.{ base, entry.name });
+}
 fn localHasParent(_: ?*anyopaque, path: []const u8) bool {
     return !std.mem.eql(u8, path, "/");
 }
@@ -225,5 +232,14 @@ test "local resolution owns absolute relative home child parent and root semanti
         const expected = try std.fs.path.resolve(allocator, &.{ std.mem.span(home), "folder" });
         defer allocator.free(expected);
         try std.testing.expectEqualStrings(expected, resolved);
+    }
+}
+
+test "local Provider references preserve file directory and symlink name bytes" {
+    const allocator = std.testing.allocator;
+    for ([_]std.Io.File.Kind{ .file, .directory, .sym_link }) |kind| {
+        const raw = try local.reference.?(null, allocator, "/somewhere", .{ .name = "raw\xff' link", .kind = kind, .directory = kind == .directory, .size = null, .modified = null });
+        defer allocator.free(raw);
+        try std.testing.expectEqualStrings("/somewhere/raw\xff' link", raw);
     }
 }

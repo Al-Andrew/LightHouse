@@ -288,3 +288,13 @@ polling/resize descriptors, reaps the child and discards queued input. Restart
 replaces all emulator/paste state. Host input remains available after EOF even
 when the old terminal queue was full. Shell EOF never cancels a file job or closes
 a modal. Explicit quit and host shutdown still release all sessions and workers.
+
+## Path insertion
+
+Ctrl+F is a Pane command. It resolves the Cursor through `Provider.reference`,
+validates and quotes before session creation, then calls `Emulator.insert` for
+all-or-nothing admission including any bracketed-paste framing. Successful
+admission shows/focuses the persistent terminal; failures retain Pane focus and
+show an explanation. No Enter is appended and existing terminal input remains.
+Terminal-focused Ctrl+F stays child input. Modal and retained-job policy applies
+to direct invocation as well as View routing.

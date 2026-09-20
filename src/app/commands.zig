@@ -4,6 +4,7 @@ const input = @import("lighthouse-ui").input;
 
 pub const Id = enum {
     help,
+    insert_reference,
     copy,
     move,
     mkdir,
@@ -45,6 +46,7 @@ pub const Description = struct {
 };
 
 pub const descriptions = [_]Description{
+    .{ .id = .insert_reference, .label = "Insert path", .help = "Insert Cursor reference", .bindings = &.{.{ .byte = input.control('f'), .text = "Ctrl+F" }} },
     .{ .id = .help, .label = "Help", .help = "Help", .bindings = &.{.{ .key = .f1, .text = "F1" }} },
     .{ .id = .copy, .label = "Copy", .help = "Copy", .bindings = &.{.{ .key = .f5, .text = "F5" }} },
     .{ .id = .move, .label = "RenMov", .help = "Move/rename", .bindings = &.{.{ .key = .f6, .text = "F6" }} },
@@ -97,7 +99,7 @@ pub const help_groups = [_][]const Id{
     &.{ .copy, .move, .mkdir },
     &.{.delete},
     &.{ .path, .absolute_path },
-    &.{.refresh},
+    &.{ .refresh, .insert_reference },
     &.{ .toggle_terminal, .focus_terminal, .zoom_terminal },
     &.{.visibility_terminal},
     &.{ .grow_terminal, .shrink_terminal },

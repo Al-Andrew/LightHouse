@@ -152,3 +152,18 @@ through `View.event`, including `OutOfMemory`, `Canceled`, lifecycle failures,
 and transport failures; they are not presented as correctable input. Asynchronous
 scan failures remain Pane status, and started-job failures remain job results.
 New Provider error names require an explicit recovery-policy decision.
+
+## Cursor reference capability
+
+`Provider.reference` is an optional UI-thread callback receiving the opaque
+location and the original `Entry`. It returns one owned, unquoted reference
+allocated using the supplied allocator, or an error. It is independent of local
+file-job eligibility. The local Provider joins its absolute location with the
+entry name, without resolving symlink targets. The opaque test Provider uses
+its own reference syntax through the same command workflow.
+
+The controller releases the reference after validating and quoting it. Providers
+do not add shell syntax, spacing, or paste framing. Empty/control-character
+references are refused. LightHouse quotes for POSIX shell syntax, appends one
+space, and admits the entire insertion before taking terminal focus. Original
+filename bytes are retained; escaped display labels never become input.

@@ -404,21 +404,44 @@ const Implementation = struct {
         }
     }
 
+    fn ensureTerminal(self: *Implementation) !void {
+        if (self.terminal_exists) return;
+        const pane = self.activePane();
+        const cwd = pane.provider().localPath(pane.location().locator) catch null;
+        const host = self.terminal_host orelse return error.TerminalLaunchUnavailable;
+        try host.start(host.context, cwd);
+        self.terminal_exists = true;
+    }
+
     fn showTerminal(self: *Implementation) void {
         if (self.modal != .none or self.operation != null) return;
-        if (!self.terminal_exists) {
-            const pane = self.activePane();
-            const cwd = pane.provider().localPath(pane.location().locator) catch null;
-            const host = self.terminal_host orelse {
-                self.modal = .{ .notice = "Terminal launch unavailable" };
-                return;
-            };
-            host.start(host.context, cwd) catch |err| {
-                self.modal = .{ .notice = @errorName(err) };
-                return;
-            };
-            self.terminal_exists = true;
+        self.ensureTerminal() catch |err| {
+            self.modal = .{ .notice = @errorName(err) };
+            return;
+        };
+        self.terminal_visible = true;
+        self.focus = .terminal;
+    }
+
+    fn insertReference(self: *Implementation, emulator: *Emulator) !void {
+        const pane = self.activePane();
+        const entry = pane.view().focused() orelse return error.NoCursorEntry;
+        const provider = pane.provider();
+        const reference = provider.reference orelse return error.UnsupportedReference;
+        const raw = try reference(provider.context, self.allocator, pane.location().locator, entry.*);
+        defer self.allocator.free(raw);
+        if (raw.len == 0) return error.EmptyReference;
+        for (raw) |byte| if (byte < 32 or byte == 127) return error.ControlCharacterReference;
+        var quoted: std.ArrayList(u8) = .empty;
+        defer quoted.deinit(self.allocator);
+        try quoted.append(self.allocator, '\'');
+        for (raw) |byte| {
+            if (byte == '\'') try quoted.appendSlice(self.allocator, "'\\''") else try quoted.append(self.allocator, byte);
         }
+        try quoted.appendSlice(self.allocator, "' ");
+        // Resolve, validate and quote before creating a missing session.
+        try self.ensureTerminal();
+        try emulator.insert(quoted.items);
         self.terminal_visible = true;
         self.focus = .terminal;
     }
@@ -441,6 +464,9 @@ const Implementation = struct {
     fn invoke(self: *Implementation, id: commands.Id, emulator: *Emulator) !bool {
         if (!self.available(id)) return false;
         switch (id) {
+            .insert_reference => self.insertReference(emulator) catch |err| {
+                self.modal = .{ .notice = @errorName(err) };
+            },
             .help => self.modal = .help,
             .copy => try self.openAction(.copy),
             .move => try self.openAction(.move),
@@ -812,4 +838,89 @@ test "path editors round trip opaque current and provider root locators" {
     try state.submit(state.view().modal.editor.input.text());
     try settle(state);
     try std.testing.expectEqualStrings(Fixture.root, left.location().locator);
+}
+
+test "Path insertion uses Provider Cursor reference independently of Marks" {
+    var fixture: @import("../core/testing_provider.zig").Opaque = .{};
+    const left = try Pane.create(std.testing.io, std.testing.allocator, @import("../core/testing_provider.zig").Opaque.root, .{ .provider = fixture.provider() });
+    defer left.destroy();
+    const right = try Pane.create(std.testing.io, std.testing.allocator, "/", .{});
+    defer right.destroy();
+    const state = try State.create(std.testing.io, std.testing.allocator, .{ left, right });
+    defer state.destroy();
+    const emulator = try Emulator.create(std.testing.io, std.testing.allocator, 80, 8);
+    defer emulator.destroy();
+    try left.refresh();
+    try settle(state);
+    left.move(.{ .by = 1 }, true); // Mark folder, advance Cursor to a.
+    try std.testing.expect(try state.invoke(.insert_reference, emulator));
+    try std.testing.expectEqualStrings("'vault:a' ", emulator.queued());
+    try std.testing.expectEqual(.terminal, state.view().focus);
+    try std.testing.expect(!state.actionAvailable(.copy));
+}
+
+test "Path insertion validates quotes and admits a complete reference before taking focus" {
+    const Fixture = @import("../core/testing_provider.zig").Opaque;
+    var fixture: Fixture = .{};
+    const left = try Pane.create(std.testing.io, std.testing.allocator, Fixture.root, .{ .provider = fixture.provider() });
+    defer left.destroy();
+    const right = try Pane.create(std.testing.io, std.testing.allocator, "/", .{});
+    defer right.destroy();
+    const state = try State.create(std.testing.io, std.testing.allocator, .{ left, right });
+    defer state.destroy();
+    const emulator = try Emulator.create(std.testing.io, std.testing.allocator, 80, 8);
+    defer emulator.destroy();
+    try left.refresh();
+    try settle(state);
+    const Host = struct {
+        calls: usize = 0,
+        fail: bool = false,
+        fn start(context: *anyopaque, cwd: ?[]const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            try std.testing.expect(cwd == null);
+            self.calls += 1;
+            if (self.fail) return error.SpawnFailed;
+        }
+    };
+    var host: Host = .{};
+    state.attachTerminal(.{ .context = &host, .start = Host.start });
+    for ([_][]const u8{ "bad\nname", "bad\x00name", "bad\x7fname", "" }) |raw| {
+        state.terminalEnded();
+        fixture.entry_reference = raw;
+        try std.testing.expect(try state.invoke(.insert_reference, emulator));
+        try std.testing.expectEqual(@as(usize, 0), host.calls);
+        try std.testing.expectEqual(@as(usize, 0), emulator.queued().len);
+        try std.testing.expectEqual(.left, state.view().focus);
+        try std.testing.expect(state.view().modal == .notice);
+        state.dismiss();
+    }
+    fixture.insertion_supported = false;
+    _ = try state.invoke(.insert_reference, emulator);
+    try std.testing.expectEqual(@as(usize, 0), host.calls);
+    state.dismiss();
+    fixture.insertion_supported = true;
+    fixture.entry_reference = "a b'$(touch BAD);\xff";
+    host.fail = true;
+    _ = try state.invoke(.insert_reference, emulator);
+    try std.testing.expectEqual(.left, state.view().focus);
+    try std.testing.expectEqual(@as(usize, 0), emulator.queued().len);
+    state.dismiss();
+    host.fail = false;
+    try emulator.insert("prefix ");
+    _ = try state.invoke(.insert_reference, emulator);
+    try std.testing.expectEqualStrings("prefix 'a b'\\''$(touch BAD);\xff' ", emulator.queued());
+    try std.testing.expectEqual(@as(usize, 2), host.calls);
+    state.toggleTerminal();
+    _ = try state.invoke(.visibility_terminal, emulator); // hide existing session
+    emulator.consumed(emulator.queued().len);
+    _ = try state.invoke(.insert_reference, emulator);
+    try std.testing.expect(state.view().terminal_visible);
+    try std.testing.expectEqual(@as(usize, 2), host.calls);
+    state.toggleTerminal();
+    try state.openPath(false);
+    try std.testing.expect(!try state.invoke(.insert_reference, emulator));
+    state.dismiss();
+    try state.openAction(.mkdir); // unavailable Provider leaves no workflow
+    try std.testing.expect(try state.invoke(.help, emulator));
+    try std.testing.expect(!try state.invoke(.insert_reference, emulator));
 }

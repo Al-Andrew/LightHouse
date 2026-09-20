@@ -348,6 +348,7 @@ test "command presentation and direct invocation recheck sources modal focus and
     try feed(view, &decoder, "\x07");
     try std.testing.expect(view.modal.focused());
     try std.testing.expect(!try state.invoke(.visibility_terminal, emulator));
+    try std.testing.expect(!try state.invoke(.insert_reference, emulator));
     state.toggleTerminal();
     try std.testing.expect(state.view().focus != .terminal);
     try feed(view, &decoder, "\x07");
@@ -856,4 +857,27 @@ test "terminal visibility distinguishes raw LF from Return synthetic Enter and p
     try std.testing.expect(try state.invoke(.visibility_terminal, emulator));
     try std.testing.expect(state.view().modal == .notice);
     try std.testing.expectEqual(.left, state.view().focus);
+}
+
+test "View keeps Ctrl+F as child input when the persistent terminal has focus" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Pane = @import("../core/pane.zig").Pane;
+    const left = try Pane.create(io, allocator, "/", .{});
+    defer left.destroy();
+    const right = try Pane.create(io, allocator, "/", .{});
+    defer right.destroy();
+    const emulator = try Emulator.create(io, allocator, 80, 8);
+    defer emulator.destroy();
+    const state = try State.create(io, allocator, .{ left, right });
+    defer state.destroy();
+    const view = try View.create(allocator, state, emulator);
+    defer view.destroy();
+    var decoder: ui.input.Decoder = .{};
+    try feed(view, &decoder, "\x07\x06");
+    try std.testing.expectEqualStrings("\x06", emulator.queued());
+    try std.testing.expect(!try state.invoke(.insert_reference, emulator));
+    try feed(view, &decoder, "\x07\x06");
+    try std.testing.expect(state.view().modal == .notice);
+    try std.testing.expectEqualStrings("\x06", emulator.queued());
 }
