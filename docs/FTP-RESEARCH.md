@@ -12,7 +12,9 @@ for choosing a server and Location. See the
 Credentials use the store on the machine running LightHouse, including over SSH.
 Current scope is design and ticket preparation; protocol test suites, test-server
 fixtures and live-server validation are deferred.
-The implementation recommendations below remain proposals, not an ADR.
+The product decisions below were confirmed in the triage interview; see
+[the approved decision record](FTP-TICKETS.md#approved-triage-decisions).
+Transport implementation recommendations remain engineering guidance, not an ADR.
 Recommendation: use libcurl behind an FTP Provider; prove cancellation and
 connection switching with browsing first, then complete the file-action executors
 before releasing the first version. Browsing alone does not meet this scope.
@@ -85,15 +87,17 @@ types should remain unknown rather than becoming guessed navigable directories.
 LIST is system-dependent information intended for humans; NLST returns names
 without metadata. Therefore neither is a general replacement for typed MLSD
 entries. See [RFC 959 §4.1.3](https://www.rfc-editor.org/rfc/rfc959.html).
-Proposed first scope: require MLSD and report unsupported servers clearly.
-Add a tested LIST compatibility layer only if target servers require it.
+Agreed v1 scope: prefer MLSD and support common older LIST formats as a fallback.
+Bound the compatibility parser to recognized formats; unknown or ambiguous
+listings must produce an explicit error rather than guessed names or file types.
+Parser implementation and protocol verification are outside this design phase.
 
 curl's `ftp://host/` starts from the login directory. Server-absolute paths use
 `//` or `/%2f`; curl also normalizes dot segments by default.
 See [curl URL syntax](https://curl.se/docs/url-syntax.html#FTP).
 Recommendation: keep endpoint/authentication in an owned connection context,
-and Locator bytes separate from transport URLs. Decide whether `/` means the
-connection's browsing root or server root. Discover any server-dependent login
+and Locator bytes separate from transport URLs. Record the chosen login-relative
+or server-absolute path base explicitly in saved Locations. Discover the login
 directory during connection work; UI callbacks then perform only lexical work.
 Document a slash-path server scope rather than claiming arbitrary FTP filesystems.
 Encode filename bytes exactly once when constructing transport URLs; test `%`,
@@ -103,15 +107,17 @@ and supports restricting allowed protocols; keep this adapter limited to FTP/FTP
 
 ## TLS and connection behavior
 
-Recommendation: offer explicit FTPS as the default connection mode, with plain
-FTP an explicit choice. For explicit FTPS use an FTP URL and `CURLUSESSL_ALL`,
+Offer plain FTP, explicit FTPS and implicit FTPS, with explicit FTPS the default.
+For explicit FTPS use an FTP URL and `CURLUSESSL_ALL`,
 which requires protection of both control and data channels and fails if it
 cannot obtain it. Do not use opportunistic `TRY` or control-only protection.
 See [CURLOPT_USE_SSL](https://curl.se/libcurl/c/CURLOPT_USE_SSL.html).
-Whether to ship implicit FTPS in the first increment is an open decision.
+Implicit FTPS is included in v1.
 
 Keep certificate-chain and hostname verification enabled, using system CA
 configuration or an explicitly configured CA file. These are separate checks.
+An invalid/untrusted certificate blocks connection. Provide trusted-CA
+configuration for private servers, without a verification-bypass switch in v1.
 See [VERIFYPEER](https://curl.se/libcurl/c/CURLOPT_SSL_VERIFYPEER.html) and
 [VERIFYHOST](https://curl.se/libcurl/c/CURLOPT_SSL_VERIFYHOST.html).
 Keep passwords outside Locators, labels, references and diagnostics; supply
@@ -170,7 +176,7 @@ and move available across every supported Provider pair:
 This includes plain FTP and FTPS combinations. Operation availability still
 depends on valid sources and structural capabilities; server permissions and
 network failures are execution results, not reasons to omit a Provider pair.
-Proposed behavior and remaining execution design decisions:
+Agreed execution behavior:
 
 - Copy transfers files and directory trees across all pairs above,
   retaining the existing destination-conflict and Directory merge workflows.
@@ -181,9 +187,23 @@ Proposed behavior and remaining execution design decisions:
 - Directory creation and deletion operate on the active FTP Pane. Recursive
   deletion retains explicit confirmation and reports partial completion.
 - All actions use foreground Jobs with progress, cancellation and failure
-  decisions. Define partial-file handling, overwrite behavior, link traversal,
-  and recovery when a connection drops after a mutation but before its result is
-  known. These are first-version design requirements, not later polish.
+  decisions. Preserve links as links when supported. If a transfer cannot
+  preserve a link, offer Skip / Cancel; never silently follow it. Recursive
+  deletion never follows links.
+- Copy contents and preserve modification times when supported; use the
+  destination's normal permissions for transfers involving FTP. Report metadata
+  limitations without failing an otherwise successful transfer. Exact remote
+  permissions/ownership preservation is outside v1; local-only behavior remains.
+- Prefer completing a replacement before publishing it. If the server requires
+  deleting the old destination first, explain that it cannot be restored after
+  failure and offer Overwrite anyway / Apply to all / Skip / Cancel. Ordinary
+  overwrite consent is not consent to this risk. Apply to all covers subsequent
+  unsafe overwrites in this Job only; no permission survives into another Job.
+- If an overridden transfer fails or is canceled, retain its source, attempt
+  removal of the incomplete replacement, and report that the old destination
+  cannot be restored. Identify partial files when cleanup fails. Never repeat
+  the destructive overwrite automatically or blindly replay a mutation whose
+  result is unknown after a disconnect.
 
 Execution may stream through the client, stage data in local temporary storage,
 or use an applicable server operation. The user does not need to select a
@@ -197,11 +217,13 @@ separate workflow from these file actions.
 These are implementation steps toward the full first version, not separate
 release scopes.
 
-1. Integrate transport linkage, MLSD parsing, FTPS validation and cancellation,
-   including shutdown behavior.
+1. Integrate transport linkage, MLSD and legacy listing parsing, FTPS validation
+   and cancellation, including shutdown behavior.
 2. Add Connect/Disconnect and transactional Provider switching, then browsing,
    refresh, sorting, hidden entries and navigation. File actions remain unavailable
-   until an executor supports them. Decide Path insertion syntax separately.
+   until an executor supports them. Path insertion remains an optional Provider
+   capability and must never expose credentials; no remote terminal workflow is
+   introduced by this feature.
 3. Add copy across every Provider pair through explicit executor dispatch, owned requests and
    foreground Job decisions, including partial-file handling, destination
    conflicts, recursion and reconnect behavior.

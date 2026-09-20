@@ -1,7 +1,8 @@
 # FTP connections, credentials and Location picker
 
-Investigated 2026-09-20 against official documentation. This is comparative
-research and a proposed design, not user testing or an accepted ADR.
+Investigated 2026-09-20 against official documentation. The product workflow was
+confirmed in the triage interview; see [the decision record](FTP-TICKETS.md#approved-triage-decisions).
+This is comparative research and an agreed design, not user testing or an ADR.
 The first version requires saved server credentials, a server-and-Location
 window, FTP/FTPS, and full file actions across every Provider pair.
 The user chose the credential store on the machine running LightHouse, including
@@ -36,13 +37,13 @@ These are proposed additions to the domain vocabulary, not new definitions in
 
 Editing or deleting a saved server must not retarget an existing Pane or Job.
 Jobs retain owned endpoint/authentication state until completion. Renaming a
-server preserves bookmark/credential links; changing host/account must explicitly
-replace or reconfirm credentials rather than silently sending an old password
-to a new endpoint. Duplicate-server behavior must state whether secrets are copied.
+server preserves bookmark/credential links; changing host/account requires fresh
+password entry rather than silently sending an old password to a new endpoint.
+Changing the profile's display name or starting directory keeps its credential.
 
-## Proposed keyboard-first workflow
+## Agreed keyboard-first workflow
 
-F2 **Locations** opens for the active Pane (binding subject to final key review).
+F2 **Locations** opens for the active Pane.
 Start on the saved-server list, offer type-to-filter, Up/Down and Tab/Shift+Tab;
 Enter activates the focused action and Esc returns without switching the Pane.
 Selecting a server only previews its settings. Connect performs network work.
@@ -59,12 +60,15 @@ Selecting a server only previews its settings. Connect performs network work.
 +-----------------------------------------------------------------+
 ```
 
-Offer **This computer** with that Pane's previous local Location. A remote
-default starts at the server login directory; expose **Login directory** versus
+Offer **This computer** with that Pane's previous local Location. Reopening a
+server uses its configured starting directory, or the login directory when no
+starting directory is configured. A chosen bookmark/path overrides it for that
+connection; do not silently replace the configured default with the last-browsed
+directory. Expose **Login directory** versus
 **Server root** explicitly where supported, rather than requiring curl URL
 syntax. Bookmarks retain that choice. On initial connection a user can enter a
 path or choose a bookmark; ordinary directory discovery occurs in the Pane
-after successful login. A nested remote browser is optional, not essential.
+after successful login. A browser inside the picker is outside v1.
 
 ```text
 + New server -----------------------------------------------------+
@@ -79,8 +83,11 @@ after successful login. A nested remote browser is optional, not essential.
 +-----------------------------------------------------------------+
 ```
 
-The displayed storage name reflects the chosen backend; it is not always the
-system store. Password fields are masked from their first render. Editing an
+The displayed storage name identifies the host machine's credential store.
+Save password is checked by default for saved servers; unchecking it means ask
+each time. If the store is unavailable or cannot be unlocked, offer explicit
+Connect without saving, retaining the password only for the live connection.
+Password fields are masked from their first render. Editing an
 existing server shows **Password saved / Change / Forget**, without loading the
 secret into a normal text field. Save-only works offline; successful save is
 reported only after required persistence succeeds. A failed secret write keeps
@@ -133,17 +140,18 @@ available; store unavailability must be visible to the user.
 
 ## Failure and lifecycle behavior
 
-| State | Proposed behavior |
+| State | Agreed behavior |
 | --- | --- |
 | Vault locked | Show Unlock / Retry / Cancel and which store requires attention; preserve the server/path draft. Service prompts must not freeze redraw or cancellation. |
 | Vault absent or unlock UI unavailable | Explain the host-store prerequisite and offer Retry, Cancel or explicit one-time login. One-time login is not “password saved”; no automatic fallback to another store. |
 | Saved secret missing or login rejected | Prompt for replacement; distinguish vault failure from server rejection. Do not overwrite an existing saved credential merely because one login failed. |
-| Certificate invalid or host mismatch | Explain failure and allow correction/cancel; no silent plaintext downgrade or automatic verification bypass. |
+| Certificate invalid or host mismatch | Explain failure and allow correction/cancel; offer trusted-CA configuration for private servers, with no verification-bypass switch or plaintext downgrade. |
 | Remote path missing or denied | Keep the requested path editable; explicitly offer the login directory instead of silently landing elsewhere. |
-| Connection lost while browsing | Retain the last Snapshot with a visible stale/disconnected state; Reconnect retries the same endpoint and Location. |
+| Connection lost while browsing | Retain the last Snapshot with a visible stale/disconnected state; explicit Reconnect retries the same endpoint and Location. Do not reconnect automatically. |
 | Connection lost during a Job | Keep the foreground Job's retry/cancel/result workflow; distinguish unknown mutation outcomes from failures known to precede execution. Never blindly replay delete/rename/source cleanup. |
 | Disconnect / switch | Return to the remembered local Location or chosen new server; detach only this Pane and retain resources still owned by another Pane or Job. |
-| Remove saved server / Forget password | State what is removed; bookmarks and credential deletion need explicit consistent behavior. Report incomplete cleanup if the vault is unavailable; do not claim deletion succeeded. |
+| Remove saved server | Confirm deletion of the profile, its bookmarks and saved credential together. Existing connections continue until disconnected. Report incomplete cleanup if the vault is unavailable; do not claim deletion succeeded. |
+| Forget password | Remove the saved secret, retaining the server profile and bookmarks; existing live connections are not interrupted. |
 
 The Job behavior must follow [ADR 0002](adr/0002-file-jobs-own-foreground-interaction.md).
 Connection secrets must stay out of diagnostic messages, URLs, shell input,
@@ -172,22 +180,16 @@ in [the transport investigation](FTP-RESEARCH.md). The
 [published tickets](FTP-TICKETS.md) separate persistence, transport, connection
 lifetime, UI and file-action execution with explicit dependencies.
 
-## Remaining design work
+## Design resolution and implementation handoff
 
-1. Specify the host credential-store integration and unavailable/locked-store
-   behavior, including when LightHouse runs on a machine reached over SSH.
-2. Confirm TLS modes (explicit FTPS default; implicit FTPS inclusion is open),
-   path-base behavior and profile-removal/bookmark policy.
-3. Walk through the proposed flow: first saved server, returning after restart,
-   different remote server in each Pane, wrong password, locked store, missing
-   path, cancel and disconnect. This is a planned usability check, not completed
-   user testing. Review keyboard-only use and narrow-terminal layouts.
-4. Specify save/retrieve/change/delete across restart, cancellation of unlock/login,
-   secret handling, edits during existing sessions and failure between profile
-   writes and vault writes. Defer executable test suites and live integration
-   validation; these are not gates for the current design work.
+The user confirmed the picker, starting-directory, credential, removal,
+disconnect and reconnect policies above, plus all three FTP/FTPS modes and the
+certificate policy. [Design issue #40](https://github.com/Al-Andrew/LightHouse/issues/40)
+is resolved by this agreed specification. The implementation tickets retain
+their dependency order; concrete storage adapters, build integration and
+transport internals remain engineering choices within the agreed behavior.
 
-This study supports ticket drafting now. Implementation tickets should follow
-the agreed host-store direction and preserve credential persistence.
-No application code or live vault
-integration was implemented or tested for this note.
+The wireframes illustrate the confirmed workflow; they are not usability evidence.
+No usability tests, app code,
+live vault integration, protocol suites or server fixtures were implemented or
+run for this design. Those activities are not gates for closing design triage.
