@@ -27,7 +27,7 @@ pub const Input = struct {
 
 pub const Terminal = struct {
     emulator: *Emulator,
-    input: *Input,
+    input: Input = .{},
 
     pub fn paint(self: *Terminal, node: *toolkit.Widget, painter: toolkit.Painter) !void {
         try self.emulator.paint(painter, node.focused());

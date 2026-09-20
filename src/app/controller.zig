@@ -7,8 +7,6 @@ const PathInput = toolkit.TextInput;
 const Emulator = @import("../terminal/emulator.zig").Emulator;
 const Pane = @import("../core/pane.zig").Pane;
 const operations = @import("../core/operations.zig");
-const file_pane = @import("widgets/file_pane.zig");
-const TerminalInput = @import("widgets/terminal.zig").Input;
 const Layout = @import("layout.zig").Layout;
 const dialogs = @import("widgets/dialogs.zig");
 const paintPathInput = dialogs.paintPathInput;
@@ -18,7 +16,7 @@ const paintDeleteConfirmation = dialogs.paintDeleteConfirmation;
 pub const Focus = enum { left, right, terminal };
 // A tagged state owns exactly one modal payload. An action cannot outlive its
 // editor, and help/path/delete dialogs cannot accidentally overlap.
-pub const Modal = union(enum) {
+const Modal = union(enum) {
     none,
     help,
     editor: struct { input: PathInput, action: ?operations.Kind = null },
@@ -34,7 +32,152 @@ pub const Modal = union(enum) {
     }
 };
 
-pub const State = struct {
+/// Owns editor/confirmation payloads and the single job through result dismissal.
+/// Borrows both panes and I/O; destroy the view first, then State, then the panes.
+/// Observations borrow immutable payloads until the next controller mutation.
+pub const State = opaque {
+    pub const ModalView = union(enum) {
+        none,
+        help,
+        editor: struct { input: *const PathInput, action: ?operations.Kind },
+        confirm_delete: *const operations.Job,
+    };
+    pub const Observation = struct {
+        focus: Focus,
+        adjustment: i32,
+        zoom: bool,
+        quit: bool,
+        force_redraw: bool,
+        modal: ModalView,
+        operation: ?*const operations.Job,
+
+        pub fn modalVisible(self: Observation) bool {
+            return self.modal != .none or (self.operation != null and self.focus != .terminal);
+        }
+    };
+
+    pub fn create(io: std.Io, allocator: std.mem.Allocator, borrowed_panes: [2]*Pane) !*State {
+        const self = try allocator.create(Implementation);
+        self.* = .{ .io = io, .allocator = allocator, .panes = borrowed_panes };
+        return @ptrCast(self);
+    }
+
+    pub fn destroy(state: *State) void {
+        const self = state.implementation();
+        if (self.operation) |job| job.destroy();
+        self.modal.deinit();
+        self.allocator.destroy(self);
+    }
+
+    pub fn view(state: *const State) Observation {
+        const self: *const Implementation = @ptrCast(@alignCast(state));
+        return .{
+            .focus = self.focus,
+            .adjustment = self.adjustment,
+            .zoom = self.zoom,
+            .quit = self.quit,
+            .force_redraw = self.force_redraw,
+            .modal = switch (self.modal) {
+                .none => .none,
+                .help => .help,
+                .editor => |*editor| .{ .editor = .{ .input = &editor.input, .action = editor.action } },
+                .confirm_delete => |job| .{ .confirm_delete = job },
+            },
+            .operation = self.operation,
+        };
+    }
+
+    pub fn panes(state: *State) [2]*Pane {
+        return state.implementation().panes;
+    }
+
+    pub fn activePane(state: *State) *Pane {
+        return state.implementation().activePane();
+    }
+
+    pub fn openPath(state: *State, absolute: bool) !void {
+        try state.implementation().openPath(absolute);
+    }
+
+    pub fn openAction(state: *State, kind: operations.Kind) !void {
+        try state.implementation().openAction(kind);
+    }
+
+    pub fn openDelete(state: *State) !void {
+        try state.implementation().openDelete();
+    }
+
+    pub fn submit(state: *State, value: []const u8) !void {
+        try state.implementation().submit(value);
+    }
+
+    pub fn confirmDelete(state: *State) !void {
+        try state.implementation().confirmDelete();
+    }
+
+    /// Closes an editor/confirmation, requests job cancellation, or releases its result.
+    pub fn dismiss(state: *State) void {
+        state.implementation().dismiss();
+    }
+
+    pub fn toggleTerminal(state: *State) void {
+        state.implementation().toggleTerminal();
+    }
+
+    /// Root bindings only. Pane and terminal input stay in their widgets.
+    pub fn globalEvent(state: *State, emulator: *Emulator, ev: *const input.Event) !void {
+        try state.implementation().globalEvent(emulator, ev);
+    }
+
+    /// Called only by the modal widget, whose tree scope consumes every event.
+    pub fn modalEvent(state: *State, ev: *const input.Event) !void {
+        try state.implementation().modalEvent(ev);
+    }
+
+    pub fn requestRedraw(state: *State) void {
+        state.implementation().force_redraw = true;
+    }
+
+    pub fn rendered(state: *State) void {
+        state.implementation().force_redraw = false;
+    }
+
+    /// Collects completions and requests both pane refreshes exactly once.
+    /// A failed refresh does not skip the other pane or retry completion later.
+    /// Also publishes pane scans; true asks the host to repaint.
+    pub fn poll(state: *State) !bool {
+        const self = state.implementation();
+        var changed = false;
+        var failure: ?anyerror = null;
+        if (self.operation) |job| {
+            if (job.poll()) {
+                for (self.panes) |pane| pane.refresh() catch |err| {
+                    if (failure == null) failure = err;
+                };
+                changed = true;
+            } else if (job.status() != .finished and self.focus != .terminal) changed = true;
+        }
+        for (self.panes) |pane| {
+            const published = pane.poll() catch |err| {
+                if (failure == null) failure = err;
+                continue;
+            };
+            changed = changed or published;
+        }
+        if (failure) |err| return err;
+        return changed;
+    }
+
+    fn implementation(state: *State) *Implementation {
+        return @ptrCast(@alignCast(state));
+    }
+};
+
+fn isToggleTerminal(ev: *const input.Event) bool {
+    return ev.len == 1 and ev.bytes[0] == input.control('g');
+}
+
+const Implementation = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
     focus: Focus = .left,
@@ -43,18 +186,17 @@ pub const State = struct {
     zoom: bool = false,
     quit: bool = false,
     force_redraw: bool = true,
-    terminal_input: TerminalInput = .{},
-    panes: ?[2]*Pane = null,
+    panes: [2]*Pane,
     modal: Modal = .none,
     operation: ?*operations.Job = null,
 
-    pub fn activePane(self: *State) ?*Pane {
-        const panes = self.panes orelse return null;
-        return panes[if (self.focus == .right) @as(usize, 1) else 0];
+    fn activePane(self: *Implementation) *Pane {
+        return self.panes[if (self.last_pane == .right) @as(usize, 1) else 0];
     }
 
-    fn openPath(self: *State, absolute: bool) !void {
-        const pane = self.activePane() orelse return;
+    fn openPath(self: *Implementation, absolute: bool) !void {
+        if (self.modal != .none or self.operation != null) return error.WorkflowBusy;
+        const pane = self.activePane();
         self.modal = .{ .editor = .{ .input = try PathInput.init(self.allocator, if (absolute) "/" else pane.view().path) } };
         // Keep the base location stable while editing a relative path. A slow
         // earlier navigation must not change its meaning underneath the dialog.
@@ -62,10 +204,12 @@ pub const State = struct {
         if (absolute) self.modal.editor.input.select_all = false;
     }
 
-    fn openAction(self: *State, kind: operations.Kind) !void {
-        const pane = self.activePane() orelse return;
+    fn openAction(self: *Implementation, kind: operations.Kind) !void {
+        if (self.modal != .none or self.operation != null) return error.WorkflowBusy;
+        if (kind == .delete) return self.openDelete();
+        const pane = self.activePane();
         if (kind != .mkdir and pane.sources().count == 0) return;
-        const other = self.panes.?[if (self.focus == .left) @as(usize, 1) else 0];
+        const other = self.panes[if (self.last_pane == .left) @as(usize, 1) else 0];
         self.modal = .{ .editor = .{
             .input = try PathInput.init(self.allocator, if (kind == .mkdir) "" else other.view().path),
             .action = kind,
@@ -74,8 +218,8 @@ pub const State = struct {
         other.cancelNavigation();
     }
 
-    fn submitEditor(self: *State, value: []const u8, action: ?operations.Kind) !void {
-        const pane = self.activePane().?;
+    fn submitEditor(self: *Implementation, value: []const u8, action: ?operations.Kind) !void {
+        const pane = self.activePane();
         const target = if (value[0] == '~' and (value.len == 1 or value[1] == '/')) target: {
             const home = c.getenv("HOME") orelse break :target try self.allocator.dupe(u8, value);
             break :target try std.fs.path.join(self.allocator, &.{ std.mem.span(home), if (value.len > 1) value[2..] else "" });
@@ -86,8 +230,15 @@ pub const State = struct {
         } else try pane.request(target);
     }
 
-    fn createOperation(self: *State, kind: operations.Kind, target: []const u8) !*operations.Job {
-        const pane = self.activePane().?;
+    fn submit(self: *Implementation, value: []const u8) !void {
+        if (self.modal != .editor) return error.NoEditor;
+        if (value.len == 0) return;
+        try self.submitEditor(value, self.modal.editor.action);
+        self.modal.deinit();
+    }
+
+    fn createOperation(self: *Implementation, kind: operations.Kind, target: []const u8) !*operations.Job {
+        const pane = self.activePane();
         var names: std.ArrayList([]const u8) = .empty;
         defer names.deinit(self.allocator);
         if (kind != .mkdir) {
@@ -97,31 +248,48 @@ pub const State = struct {
         return operations.Job.create(self.io, self.allocator, kind, pane.view().path, names.items, target);
     }
 
-    fn startOperation(self: *State, job: *operations.Job) void {
+    fn startOperation(self: *Implementation, job: *operations.Job) void {
         // This ownership transfer happens once; launch failures stay in the job.
         job.start() catch unreachable;
         self.operation = job;
     }
 
-    fn openDelete(self: *State) !void {
-        const pane = self.activePane() orelse return;
+    fn openDelete(self: *Implementation) !void {
+        if (self.modal != .none or self.operation != null) return error.WorkflowBusy;
+        const pane = self.activePane();
         if (pane.sources().count == 0) return;
         // Own the exact names shown in the confirmation, independent of scans.
         self.modal = .{ .confirm_delete = try self.createOperation(.delete, "") };
         pane.cancelNavigation();
     }
 
-    pub fn event(self: *State, emulator: *Emulator, ev: *const input.Event) !void {
+    fn confirmDelete(self: *Implementation) !void {
+        if (self.modal != .confirm_delete) return error.NoConfirmation;
+        const job = self.modal.confirm_delete;
+        self.modal = .none;
+        self.startOperation(job);
+    }
+
+    fn dismiss(self: *Implementation) void {
+        if (self.modal != .none) {
+            self.modal.deinit();
+        } else if (self.operation) |job| {
+            if (job.status() == .finished) {
+                job.destroy();
+                self.operation = null;
+            } else job.cancel();
+        }
+    }
+
+    fn modalEvent(self: *Implementation, ev: *const input.Event) !void {
         switch (self.modal) {
-            .confirm_delete => |job| {
+            .confirm_delete => {
                 // Paste contents cannot confirm or dismiss a destructive action.
                 if (ev.kind != .key) return;
                 if (ev.key == .escape or (ev.key == .text and ev.len == 1 and ev.bytes[0] == 'n')) {
                     self.modal.deinit();
                 } else if (ev.key == .enter) {
-                    // Transfer ownership to the running operation before closing.
-                    self.modal = .none;
-                    self.startOperation(job);
+                    try self.confirmDelete();
                 }
                 return;
             },
@@ -130,10 +298,7 @@ pub const State = struct {
                     .editing => {},
                     .cancel => self.modal.deinit(),
                     .accept => {
-                        const value = editor.input.text();
-                        if (value.len == 0) return;
-                        try self.submitEditor(value, editor.action);
-                        self.modal.deinit();
+                        try self.submit(editor.input.text());
                     },
                 }
                 return;
@@ -144,22 +309,9 @@ pub const State = struct {
             },
             .none => {},
         }
-        if (ev.kind != .key) {
-            if (self.focus == .terminal) try self.terminal_input.event(emulator, ev);
-            return;
-        }
-        if (ev.len == 1 and ev.bytes[0] == input.control('g')) {
-            if (self.focus == .terminal) {
-                self.focus = self.last_pane;
-                self.zoom = false;
-            } else {
-                self.last_pane = self.focus;
-                self.focus = .terminal;
-            }
-            return;
-        }
-        if (self.focus == .terminal) {
-            try self.terminal_input.event(emulator, ev);
+        if (ev.kind != .key) return;
+        if (isToggleTerminal(ev)) {
+            self.toggleTerminal();
             return;
         }
         if (self.operation) |job| {
@@ -167,15 +319,31 @@ pub const State = struct {
             if (ev.key == .f10 or (ev.key == .text and ev.len == 1 and ev.bytes[0] == 'q')) {
                 self.quit = true;
             } else if (ev.key == .escape or (ev.key == .enter and finished)) {
-                if (finished) {
-                    job.destroy();
-                    self.operation = null;
-                } else job.cancel();
+                self.dismiss();
             }
             return;
         }
+    }
+
+    fn toggleTerminal(self: *Implementation) void {
+        if (self.modal != .none) return;
+        if (self.focus == .terminal) {
+            self.focus = self.last_pane;
+            self.zoom = false;
+        } else {
+            self.last_pane = self.focus;
+            self.focus = .terminal;
+        }
+    }
+
+    fn globalEvent(self: *Implementation, emulator: *Emulator, ev: *const input.Event) !void {
+        if (self.modal != .none or ev.kind != .key) return;
+        if (isToggleTerminal(ev)) {
+            self.toggleTerminal();
+            return;
+        }
+        if (self.focus == .terminal or self.operation != null) return;
         const pane = self.activePane();
-        if (pane) |p| if (try file_pane.handleEvent(p, ev)) return;
         switch (ev.key) {
             .f1 => self.modal = .help,
             .f5 => try self.openAction(.copy),
@@ -207,7 +375,7 @@ pub const State = struct {
                     '/' => try self.openPath(true),
                     input.control('r') => {
                         self.force_redraw = true;
-                        if (pane) |p| try p.refresh();
+                        try pane.refresh();
                     },
                     else => {},
                 }
@@ -217,136 +385,204 @@ pub const State = struct {
     }
 };
 
-test "terminal focus forwards quit text and Ctrl+C but intercepts Ctrl+G" {
-    const emulator = try Emulator.create(std.testing.io, std.testing.allocator, 20, 4);
-    defer emulator.destroy();
-    var state: State = .{ .io = std.testing.io, .allocator = std.testing.allocator, .focus = .terminal };
-    var decoder: input.Decoder = .{};
-    const q = decoder.feed('q').?;
-    try state.event(emulator, &q);
-    const interrupt = decoder.feed(3).?;
-    try state.event(emulator, &interrupt);
-    try std.testing.expectEqualStrings("q\x03", emulator.queued());
-    const focus = decoder.feed(7).?;
-    try state.event(emulator, &focus);
-    try std.testing.expectEqual(Focus.left, state.focus);
-    try state.event(emulator, &q);
-    try std.testing.expect(state.quit);
+const directory = @import("../core/directory.zig");
+
+// Count real directory-provider invocations, not controller implementation fields.
+const TestPanes = struct {
+    scans: [2]std.atomic.Value(usize) = .{ .init(0), .init(0) },
+    panes: [2]*Pane = undefined,
+
+    fn init(self: *TestPanes, path: []const u8) !void {
+        self.panes[0] = try Pane.create(std.testing.io, std.testing.allocator, path, .{ .provider = .{ .context = &self.scans[0], .scan = scan } });
+        errdefer self.panes[0].destroy();
+        self.panes[1] = try Pane.create(std.testing.io, std.testing.allocator, path, .{ .provider = .{ .context = &self.scans[1], .scan = scan } });
+    }
+
+    fn deinit(self: *TestPanes) void {
+        for (self.panes) |pane| pane.destroy();
+    }
+
+    fn scan(context: ?*anyopaque, io: std.Io, path: []const u8, options: directory.Options, canceled: *const std.atomic.Value(bool)) !directory.Snapshot {
+        const count: *std.atomic.Value(usize) = @ptrCast(@alignCast(context.?));
+        _ = count.fetchAdd(1, .monotonic);
+        return directory.local.scan(null, io, path, options, canceled);
+    }
+
+    fn expectScans(self: *TestPanes, expected: usize) !void {
+        for (&self.scans) |*count| try std.testing.expectEqual(expected, count.load(.acquire));
+    }
+};
+
+fn settle(state: *State) !void {
+    for (0..5000) |_| {
+        _ = try state.poll();
+        const job_finished = if (state.view().operation) |job| job.status() == .finished else true;
+        if (job_finished and state.panes()[0].view().status != .loading and state.panes()[1].view().status != .loading) return;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    return error.WorkflowTimeout;
 }
 
-test "closing an action editor releases its payload before opening help" {
-    const allocator = std.testing.allocator;
-    const emulator = try Emulator.create(std.testing.io, allocator, 20, 4);
-    defer emulator.destroy();
-    var state: State = .{ .io = std.testing.io, .allocator = std.testing.allocator, .modal = .{ .editor = .{
-        .input = try PathInput.init(allocator, "/destination"),
-        .action = .copy,
-    } } };
-    defer state.modal.deinit();
-    // Empty input keeps the dialog open; Escape frees both editor and action.
-    var decoder: input.Decoder = .{};
-    const clear = decoder.feed(input.control('u')).?;
-    try state.event(emulator, &clear);
-    try state.event(emulator, &.{ .key = .enter });
-    try std.testing.expect(state.modal == .editor);
-    try state.event(emulator, &.{ .key = .escape });
-    try std.testing.expect(state.modal == .none);
-    try state.event(emulator, &.{ .key = .f1 });
-    try std.testing.expect(state.modal == .help);
-    try state.event(emulator, &.{ .kind = .paste_byte });
-    try std.testing.expect(state.modal == .help);
-    try state.event(emulator, &.{ .key = .escape });
-    try std.testing.expect(state.modal == .none);
-    try std.testing.expectEqual(@as(usize, 0), emulator.queued().len);
-}
-
-test "file action dialogs fit tiny windows with Unicode input" {
-    const allocator = std.testing.allocator;
-    var frame = ui.Frame.init(allocator);
+fn checkCompletion(outcome: enum { success, failure, launch_failure }) !void {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buffer);
+    var panes: TestPanes = .{};
+    try panes.init(buffer[0..len]);
+    defer panes.deinit();
+    const state = try State.create(if (outcome == .launch_failure) std.Io.failing else io, std.testing.allocator, panes.panes);
+    defer state.destroy();
+    if (outcome == .failure) try tmp.dir.createDir(io, "created", .default_dir);
+    try state.openAction(.mkdir);
+    try state.submit("created");
+    try std.testing.expect(state.view().modal == .none);
+    try std.testing.expectError(error.WorkflowBusy, state.openAction(.mkdir));
+    try std.testing.expectError(error.WorkflowBusy, state.openPath(false));
+    try std.testing.expectError(error.WorkflowBusy, state.openDelete());
+    // Observation and painting cannot collect even a synchronous launch failure.
+    var frame = ui.Frame.init(std.testing.allocator);
     defer frame.deinit();
-    var editor = try PathInput.init(allocator, "/dest/界");
-    defer editor.deinit();
-    const job = try operations.Job.create(std.testing.io, allocator, .copy, "/source", &.{"file"}, "/target");
-    defer job.destroy();
-    for (1..95) |cols| for (1..10) |rows| {
-        try frame.begin(cols, rows);
-        try paintPathInput(frame.painter(.{ .x = 0, .y = 0, .width = frame.cols, .height = frame.rows }), &editor, .copy, null);
-        if (frame.cursor) |cursor| try std.testing.expect(cursor.x < cols and cursor.y < rows);
-        try paintOperation(frame.painter(.{ .x = 0, .y = 0, .width = frame.cols, .height = frame.rows }), job);
-        try std.testing.expect(frame.cursor == null);
+    try frame.begin(100, 30);
+    for (0..3) |_| {
+        try std.testing.expect(state.view().operation.?.status() == .running);
+        try paintOperation(frame.painter(.{ .x = 0, .y = 0, .width = 100, .height = 30 }), state.view().operation.?);
+    }
+    try panes.expectScans(0);
+    state.toggleTerminal();
+    try settle(state);
+    try panes.expectScans(1);
+    const result = state.view().operation.?.status().finished;
+    switch (outcome) {
+        .success => {
+            try std.testing.expect(result.failure == null);
+            try std.testing.expectEqual(@as(usize, 1), result.progress.completed);
+        },
+        .failure => try std.testing.expectEqual(error.PathAlreadyExists, result.failure.?.err),
+        .launch_failure => try std.testing.expectEqual(error.ConcurrencyUnavailable, result.failure.?.err),
+    }
+    if (outcome != .launch_failure) for (panes.panes) |pane| {
+        try std.testing.expectEqualStrings("created", pane.view().entries[0].name);
     };
+    // Polling and observing the retained result never cause another refresh.
+    for (0..3) |_| {
+        try std.testing.expect(!try state.poll());
+        try std.testing.expectEqualDeep(result, state.view().operation.?.status().finished);
+    }
+    state.toggleTerminal();
+    try std.testing.expect(state.view().modalVisible());
+    state.dismiss();
+    try std.testing.expect(state.view().operation == null);
+    try std.testing.expect(!try state.poll());
+    try panes.expectScans(1);
 }
 
-test "delete confirmation ignores paste, cancels without starting, and fits tiny windows" {
-    const allocator = std.testing.allocator;
-    const emulator = try Emulator.create(std.testing.io, allocator, 20, 4);
-    defer emulator.destroy();
-    var state: State = .{
-        .io = std.testing.io,
-        .allocator = std.testing.allocator,
-    };
-    state.modal = .{ .confirm_delete = try operations.Job.create(std.testing.io, allocator, .delete, "/unused", &.{"file"}, "") };
-    defer state.modal.deinit();
-    var decoder: input.Decoder = .{};
-    for ("\x1b[200~\r\nn\x1b[201~") |byte| if (decoder.feed(byte)) |ev| try state.event(emulator, &ev);
-    try std.testing.expect(state.modal == .confirm_delete);
-    try std.testing.expect(state.operation == null);
-    try std.testing.expectEqual(@as(usize, 0), emulator.queued().len);
-    var frame = ui.Frame.init(allocator);
-    defer frame.deinit();
-    for (1..95) |cols| for (1..12) |rows| {
-        try frame.begin(cols, rows);
-        try paintDeleteConfirmation(frame.painter(.{ .x = 0, .y = 0, .width = frame.cols, .height = frame.rows }), state.modal.confirm_delete);
-        try std.testing.expect(frame.cursor == null);
-    };
-    try state.event(emulator, &.{ .key = .escape });
-    try std.testing.expect(state.modal == .none);
-    try std.testing.expect(state.operation == null);
+test "successful failed and launch-failed workflows refresh both panes once and retain results" {
+    try checkCompletion(.success);
+    try checkCompletion(.failure);
+    try checkCompletion(.launch_failure);
 }
 
-test "delete confirmation handles multiple selections" {
-    const allocator = std.testing.allocator;
-    var frame = ui.Frame.init(allocator);
-    defer frame.deinit();
-    const names = [_][]const u8{ "a", "b", "c", "d", "e" };
-    for (2..names.len + 1) |count| {
-        const job = try operations.Job.create(std.testing.io, allocator, .delete, "/unused", names[0..count], "");
-        defer job.destroy();
-        try frame.begin(100, 30);
-        try paintDeleteConfirmation(frame.painter(.{ .x = 0, .y = 0, .width = frame.cols, .height = frame.rows }), job);
+// Gate the first deletion. Cancellation is then observed before the second item;
+// shutdown cancels the waiting I/O and joins it before releasing job storage.
+const DeleteGate = struct {
+    threaded: std.Io.Threaded,
+    vtable: std.Io.VTable = undefined,
+    entered: std.Io.Event = .unset,
+    released: std.Io.Event = .unset,
+
+    fn io(self: *DeleteGate) std.Io {
+        const base = self.threaded.io();
+        self.vtable = base.vtable.*;
+        self.vtable.dirDeleteFile = delete;
+        return .{ .userdata = base.userdata, .vtable = &self.vtable };
+    }
+
+    fn delete(userdata: ?*anyopaque, dir: std.Io.Dir, path: []const u8) std.Io.Dir.DeleteFileError!void {
+        const threaded: *std.Io.Threaded = @ptrCast(@alignCast(userdata.?));
+        const self: *DeleteGate = @fieldParentPtr("threaded", threaded);
+        const base = self.threaded.io();
+        self.entered.set(base);
+        try self.released.wait(base);
+        return base.vtable.dirDeleteFile(base.userdata, dir, path);
+    }
+
+    fn wait(self: *DeleteGate) !void {
+        for (0..5000) |_| {
+            if (self.entered.isSet()) return;
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+        }
+        return error.GateTimeout;
+    }
+};
+
+fn checkCanceledWorkflow(shutdown: bool) !void {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "a", "b" }) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "" });
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buffer);
+    var panes: TestPanes = .{};
+    try panes.init(buffer[0..len]);
+    defer panes.deinit();
+    var gate: DeleteGate = .{ .threaded = .init(std.testing.allocator, .{}) };
+    defer gate.threaded.deinit();
+    const state = try State.create(gate.io(), std.testing.allocator, panes.panes);
+    var destroyed = false;
+    defer if (!destroyed) state.destroy();
+    for (panes.panes) |pane| try pane.refresh();
+    try settle(state);
+    const pane = state.activePane();
+    pane.move(.{ .by = 1 }, false);
+    pane.move(.last, true);
+    try state.openDelete();
+    try std.testing.expectEqual(@as(usize, 2), state.view().modal.confirm_delete.request().sources.len);
+    try state.confirmDelete();
+    try gate.wait();
+    if (shutdown) {
+        state.destroy();
+        destroyed = true;
+        // The caller's panes remain usable after State releases all its workers.
+        try std.testing.expectEqual(@as(usize, 2), pane.view().entries.len);
+        _ = try tmp.dir.statFile(io, "a", .{});
+        _ = try tmp.dir.statFile(io, "b", .{});
+    } else {
+        state.dismiss();
+        try std.testing.expect(state.view().operation.?.status() == .canceling);
+        gate.released.set(gate.threaded.io());
+        try settle(state);
+        const result = state.view().operation.?.status().finished;
+        try std.testing.expectEqual(error.Canceled, result.failure.?.err);
+        try std.testing.expectEqual(@as(usize, 1), result.progress.completed);
+        try panes.expectScans(2);
+        for (panes.panes) |p| try std.testing.expectEqualStrings("b", p.view().entries[0].name);
+        try std.testing.expect(!try state.poll());
+        state.dismiss();
+        try std.testing.expect(!try state.poll());
+        try panes.expectScans(2);
     }
 }
 
-test "confirmed job retains ownership through launch failure and result dismissal" {
-    const allocator = std.testing.allocator;
-    const emulator = try Emulator.create(std.testing.io, allocator, 20, 4);
-    defer emulator.destroy();
-    const job = try operations.Job.create(std.Io.failing, allocator, .delete, "/unused", &.{"file"}, "");
-    var state: State = .{ .io = std.testing.io, .allocator = std.testing.allocator, .modal = .{ .confirm_delete = job } };
-    defer state.modal.deinit();
-    defer if (state.operation) |operation| operation.destroy();
-    try state.event(emulator, &.{ .key = .enter });
-    try std.testing.expect(state.modal == .none);
-    try std.testing.expectEqual(job, state.operation.?);
-    // Neither rendering nor Enter can collect or dismiss a pending completion.
-    var frame = ui.Frame.init(allocator);
-    defer frame.deinit();
-    try frame.begin(100, 30);
-    try paintOperation(frame.painter(.{ .x = 0, .y = 0, .width = frame.cols, .height = frame.rows }), job);
-    try state.event(emulator, &.{ .key = .enter });
-    try std.testing.expectEqual(job, state.operation.?);
-    try std.testing.expect(job.status() == .running);
-    try std.testing.expect(job.poll());
-    try std.testing.expectEqual(error.ConcurrencyUnavailable, job.status().finished.failure.?.err);
-    try paintOperation(frame.painter(.{ .x = 0, .y = 0, .width = frame.cols, .height = frame.rows }), job);
-    try std.testing.expect(!job.poll());
-    // The finished result survives a visit to the shell, where Enter is input.
-    var toggle: input.Event = .{ .key = .text, .len = 1 };
-    toggle.bytes[0] = input.control('g');
-    try state.event(emulator, &toggle);
-    try state.event(emulator, &.{ .key = .enter });
-    try std.testing.expectEqual(job, state.operation.?);
-    try state.event(emulator, &toggle);
-    try state.event(emulator, &.{ .key = .enter });
-    try std.testing.expect(state.operation == null);
+test "canceled workflow refreshes both panes once after collection" {
+    try checkCanceledWorkflow(false);
+}
+
+test "controller shutdown cancels and joins outstanding work while preserving borrowed panes" {
+    try checkCanceledWorkflow(true);
+}
+
+fn allocateWorkflow(allocator: std.mem.Allocator, panes: [2]*Pane) !void {
+    const state = try State.create(std.Io.failing, allocator, panes);
+    defer state.destroy();
+    try state.openAction(.mkdir);
+    try state.submit("created");
+}
+
+test "allocation failures release controller editor and prepared job ownership" {
+    var panes: TestPanes = .{};
+    try panes.init("/");
+    defer panes.deinit();
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocateWorkflow, .{panes.panes});
 }
