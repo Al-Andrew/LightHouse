@@ -370,14 +370,32 @@ def problem_dialogs():
                     if problem == "error":
                         source.unlink()
                     submit(app, dest)
-                    heading = {"conflict": "Destination conflict", "mismatch": "Type mismatch", "error": "Not found"}[problem]
+                    heading = {
+                        "conflict": "Destination conflict",
+                        "mismatch": "Type mismatch",
+                        "error": "Not found",
+                    }[problem]
                     app.expect(heading)
-                    policy = "Skip all errors of this kind" if problem == "error" else "Apply to all matching conflicts"
+                    policy = (
+                        "Skip all errors of this kind"
+                        if problem == "error"
+                        else "Apply to all matching conflicts"
+                    )
                     for cols, rows in ((100, 30), (40, 16), (40, 12)):
                         if (cols, rows) != (app.screen.cols, app.screen.rows):
                             app.resize(cols, rows)
                             app.pump(0.1)
-                        for text in (heading, "Source path", "Destination path", "source-界", "[ ] " + policy, "Space", "Cancel job (Esc)", "F10 Quit", "Terminal input blocked"):
+                        for text in (
+                            heading,
+                            "Source path",
+                            "Destination path",
+                            "source-界",
+                            "[ ] " + policy,
+                            "Space",
+                            "Cancel job (Esc)",
+                            "F10 Quit",
+                            "Terminal input blocked",
+                        ):
                             app.expect(text)
                         app.send(" ")
                         app.expect("[x] " + policy)
