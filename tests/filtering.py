@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Pane filter interaction, environment isolation and subprocess cancellation."""
-import os
+
 import shutil
 import tempfile
 from pathlib import Path
@@ -13,10 +13,15 @@ def live_filter():
         root = Path(directory)
         for name in ("alpha", "alphabet", "beta", "café", "name\nbreak"):
             (root / name).touch()
-        app = App(cols=160, rows=30, cwd=root, env_overrides={
-            "FZF_DEFAULT_OPTS": "--exact --no-ignore-case --print-query",
-            "FZF_DEFAULT_OPTS_FILE": "/nonexistent/ignore-me",
-        })
+        app = App(
+            cols=160,
+            rows=30,
+            cwd=root,
+            env_overrides={
+                "FZF_DEFAULT_OPTS": "--exact --no-ignore-case --print-query",
+                "FZF_DEFAULT_OPTS_FILE": "/nonexistent/ignore-me",
+            },
+        )
         try:
             app.start()
             in_pane(app, 0, "5 items")
@@ -91,7 +96,11 @@ def cancellation_and_failures():
             app.send("\x15beta")
             in_pane(app, 0, "1 items")
             in_pane(app, 0, "beta")
-            wait(app, lambda: not Path(f"/proc/{pid}").exists(), "superseded fzf was not reaped")
+            wait(
+                app,
+                lambda: not Path(f"/proc/{pid}").exists(),
+                "superseded fzf was not reaped",
+            )
             app.send("\x15fail")
             in_pane(app, 0, "fzf failed")
             in_pane(app, 0, "beta")
