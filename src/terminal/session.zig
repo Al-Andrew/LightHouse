@@ -1,0 +1,71 @@
+//! Process lifetime and emulator ownership for one terminal session.
+const std = @import("std");
+const platform = @import("../platform/linux.zig");
+const Emulator = @import("emulator.zig").Emulator;
+
+pub const Session = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    shell: [:0]const u8,
+    launch_directory: [:0]const u8,
+    termios: platform.c.termios,
+    dimensions: platform.Size,
+    pty: ?platform.Pty = null,
+    emulator: *Emulator,
+
+    pub fn create(io: std.Io, allocator: std.mem.Allocator, shell: [:0]const u8, cwd: []const u8, dimensions: platform.Size, termios: platform.c.termios) !*Session {
+        const self = try allocator.create(Session);
+        errdefer allocator.destroy(self);
+        const owned_shell = try allocator.dupeZ(u8, shell);
+        errdefer allocator.free(owned_shell);
+        const owned_cwd = try allocator.dupeZ(u8, cwd);
+        errdefer allocator.free(owned_cwd);
+        self.* = .{ .io = io, .allocator = allocator, .shell = owned_shell, .launch_directory = owned_cwd, .termios = termios, .dimensions = dimensions, .emulator = try Emulator.create(io, allocator, dimensions.cols, dimensions.rows) };
+        return self;
+    }
+
+    pub fn destroy(self: *Session) void {
+        self.end();
+        self.emulator.destroy();
+        self.allocator.free(self.shell);
+        self.allocator.free(self.launch_directory);
+        self.allocator.destroy(self);
+    }
+
+    pub fn start(self: *Session, cwd: ?[]const u8) !void {
+        if (self.pty != null) return;
+        const path = try self.allocator.dupeZ(u8, cwd orelse self.launch_directory);
+        defer self.allocator.free(path);
+        var pty = try platform.Pty.spawn(self.allocator, &.{ self.shell, "-i" }, path, self.dimensions, &self.termios);
+        errdefer pty.deinit();
+        try self.emulator.reset(self.io, self.dimensions.cols, self.dimensions.rows);
+        self.pty = pty;
+    }
+
+    pub fn end(self: *Session) void {
+        if (self.pty) |*pty| pty.deinit();
+        self.pty = null;
+        self.emulator.consumed(self.emulator.queued().len);
+        self.emulator.paste = .inactive;
+    }
+
+    pub fn resize(self: *Session, dimensions: platform.Size) !void {
+        self.dimensions = dimensions;
+        try self.emulator.resize(dimensions.cols, dimensions.rows);
+        if (self.pty) |*pty| try pty.resize(dimensions);
+    }
+
+    /// False reports child EOF, including writes after the child has closed.
+    pub fn flush(self: *Session) !bool {
+        const pty = self.pty orelse return false;
+        const pending = self.emulator.queued();
+        if (pending.len == 0) return true;
+        const count = platform.c.write(pty.fd, pending.ptr, pending.len);
+        if (count > 0) self.emulator.consumed(@intCast(count)) else if (count < 0) switch (platform.errno()) {
+            platform.c.EAGAIN, platform.c.EINTR => {},
+            platform.c.EIO, platform.c.EPIPE => return false,
+            else => return error.PtyWriteFailed,
+        };
+        return true;
+    }
+};

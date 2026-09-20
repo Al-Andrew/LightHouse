@@ -24,6 +24,12 @@ pub const Layout = struct {
         };
     }
 
+    pub fn forState(available: toolkit.Size, adjustment: i32, zoom: bool, visible: bool) Layout {
+        if (visible) return calculate(available, adjustment, zoom);
+        const size = boundedSize(available);
+        return .{ .terminal = .{ .x = 0, .y = 0, .width = 0, .height = 0 }, .panes_height = @max(1, size.height -| footer_rows), .compact = false };
+    }
+
     pub fn calculate(available: toolkit.Size, adjustment: i32, zoom: bool) Layout {
         const size = boundedSize(available);
         if (zoom or size.width < min_columns or size.height < min_rows) return .{

@@ -11,7 +11,7 @@ pub const Terminal = struct {
     }
 
     pub fn event(self: *Terminal, _: *toolkit.Widget, ev: *const toolkit.Event) !bool {
-        if (commands.resolve(ev) == .toggle_terminal) return false;
+        if (commands.resolve(ev) == .toggle_terminal or commands.resolve(ev) == .visibility_terminal) return false;
         try self.emulator.event(ev);
         return true;
     }

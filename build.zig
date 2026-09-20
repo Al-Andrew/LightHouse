@@ -43,8 +43,10 @@ pub fn build(b: *std.Build) void {
     run.step.dependOn(b.getInstallStep());
     if (b.args) |args| run.addArgs(args);
     b.step("run", "Run LightHouse in the current terminal").dependOn(&run.step);
-    const tests = b.addTest(.{ .root_module = core });
-    const ui_tests = b.addTest(.{ .root_module = toolkit });
+    const test_filter = b.option([]const u8, "test-filter", "Run unit tests whose names contain this text");
+    const filters: []const []const u8 = if (test_filter) |filter| &.{filter} else &.{};
+    const tests = b.addTest(.{ .root_module = core, .filters = filters });
+    const ui_tests = b.addTest(.{ .root_module = toolkit, .filters = filters });
     const check_ui = b.addRunArtifact(ui_tests);
     const test_step = b.step("test", "Run application and UI library unit tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);

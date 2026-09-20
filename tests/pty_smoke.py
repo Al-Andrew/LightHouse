@@ -9,7 +9,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from support import App, wait
+from support import App, wait, go
 
 
 def shell_and_resize():
@@ -111,9 +111,65 @@ def shell_exit():
     try:
         app.start()
         app.send("\x07exit\r")
+        wait(app, lambda: not Path(f"/proc/{app.shell_pid}").exists(), "shell not reaped")
+        assert app.proc.poll() is None, "shell EOF exited LightHouse"
+        app.expect("Name")
+        app.send("\n")
+        app.expect("LH_PROMPT>")
+        app.send("printf '<%s>\\n' RESTARTED\r")
+        app.expect("<RESTARTED>")
+        app.send("\x07q")
         app.finished()
     finally:
         app.close()
+
+
+def terminal_lifetime():
+    with tempfile.TemporaryDirectory(prefix="lh-lifetime-") as directory:
+        root = Path(directory)
+        work = root / "work"
+        work.mkdir()
+        report = root / "output"
+        app = App(cwd=root)
+        try:
+            app.start()
+            app.send("\x07LH_KEEP=kept; sleep 0.2; printf hidden > " + str(report) + "\r")
+            app.send("\n")
+            app.pump(0.1)
+            assert "LH_PROMPT>" not in app.screen.text()
+            wait(app, report.exists, "hidden child did not run")
+            app.resize(12, 4)
+            app.pump(0.1)
+            assert "LH_PROMPT>" not in app.screen.text()
+            app.resize(100, 30)
+            app.send("\n")
+            app.send("printf '<%s>\\n' \"$LH_KEEP\"\r")
+            app.expect("<kept>")
+            app.send("\x07")
+            go(app, work)
+            app.send("\x07")
+            for cycle in range(3):
+                app.send("exit\r")
+                app.pump(0.3)
+                assert app.proc.poll() is None
+                app.send("\n")
+                app.expect("LH_PROMPT>")
+                app.send("printf 'cwd:'; pwd\r")
+                app.expect("cwd:" + str(work))
+            app.send("exit\r")
+            app.pump(0.3)
+            work.rmdir()
+            app.send("\n")
+            app.expect("WorkingDirectoryUnavailable")
+            app.send("\r")
+            assert app.proc.poll() is None
+            go(app, root)
+            app.send("t")
+            app.expect("LH_PROMPT>")
+            app.send("\x07q")
+            app.finished()
+        finally:
+            app.close()
 
 
 def signal_under_load():
@@ -279,6 +335,7 @@ if __name__ == "__main__":
         shell_and_resize,
         geometry_and_fragmented_paste,
         shell_exit,
+        terminal_lifetime,
         signal_under_load,
         failed_start,
         stubborn_foreground,

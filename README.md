@@ -53,7 +53,8 @@ the shell is focused, where function keys pass through to the child.
 
 | Key | Action |
 | --- | --- |
-| Ctrl+G | Switch between the shell and the last focused pane; leave shell zoom |
+| Ctrl+G | Switch focus between the visible shell and last active Pane; leave zoom |
+| Ctrl+J | Hide/show the shell; start a fresh session if absent |
 | Up / Down / PageUp / PageDown / Home / End | Move the file cursor |
 | Enter / Right | Enter a directory or directory symlink |
 | Backspace / Left | Go to the parent and focus the directory just left |
@@ -77,7 +78,7 @@ the shell is focused, where function keys pass through to the child.
 | Shift+PageUp / Shift+PageDown | Scroll terminal history |
 | q / F10 | Quit and end the embedded session |
 
-Except for Ctrl+G, the pane bindings above apply while a file pane is focused.
+Except for Ctrl+G and Ctrl+J, the pane bindings above apply while a file pane is focused.
 Path entry accepts absolute paths, paths relative to the current pane, and
 `~/` paths. Enter opens the location; Escape cancels; Ctrl+U clears the field.
 Left/Right/Home/End and Backspace/Delete edit the path. Opening the path field
@@ -124,8 +125,9 @@ partway through a folder leaves any remaining entries in place; earlier removals
 are permanent. The parent entry can never be a deletion source.
 
 File jobs run outside the UI thread and show completed top-level items and bytes
-copied. Escape requests cancellation; Ctrl+G switches to the persistent shell
-and back. Enter/Escape dismisses the result, and both panes refresh after every
+copied. Escape requests cancellation. File jobs block terminal interaction until
+the result is dismissed; the shell keeps running and its output is drained.
+Enter/Escape dismisses the result, and both panes refresh after every
 job, including failures and cancellation. Only one file job runs at a time.
 Quitting cancels and joins the worker before shutdown.
 
@@ -154,11 +156,18 @@ not change either pane. Opening regular files in an editor/viewer and explicit
 pane-to-shell directory synchronization are later work.
 
 While the shell is focused, keys such as Tab, Ctrl+C, Ctrl+D, q, and function keys
-are sent to the child application. **Ctrl+G is reserved** for returning to the
-panes. Bracketed paste is routed as paste, including any shortcut bytes in its
+are sent to the child application. **Ctrl+G switches focus** and **Ctrl+J hides/shows the terminal**. Bracketed paste is routed as paste, including any shortcut bytes in its
 payload. Typing in the terminal returns its viewport to the current output.
 
-Small terminal windows temporarily display only the terminal and the function-key bar.
+Shell exit closes only its session. Ctrl+J, t, or z can start a new shell using
+the original shell choice and the active Pane’s local directory. A missing or
+inaccessible local directory is reported; non-local Panes use the launch directory.
+Hiding preserves the running program and chosen split size, and gives its space
+to the Panes. Ctrl+G does nothing while the terminal is hidden or absent.
+Conventional terminals cannot distinguish Ctrl+J from an Enter key sending LF;
+CR Return and pasted LF keep their usual behavior.
+
+Small terminal windows temporarily display only the visible terminal and the function-key bar.
 Pane controls still work after Ctrl+G. Enlarging the window restores both panes.
 
 ## Implementation

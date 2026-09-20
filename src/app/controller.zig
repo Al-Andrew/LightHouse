@@ -40,6 +40,7 @@ pub const Rejection = enum {
 const Modal = union(enum) {
     none,
     help,
+    notice: []const u8,
     editor: struct { input: PathInput, action: ?operations.Kind = null, rejection: ?Rejection = null },
     confirm_delete: struct { job: *operations.Job, rejection: ?Rejection = null },
 
@@ -47,7 +48,7 @@ const Modal = union(enum) {
         switch (self.*) {
             .editor => |*editor| editor.input.deinit(),
             .confirm_delete => |confirmation| confirmation.job.destroy(),
-            .none, .help => {},
+            .none, .help, .notice => {},
         }
         self.* = .none;
     }
@@ -60,6 +61,7 @@ pub const State = opaque {
     pub const ModalView = union(enum) {
         none,
         help,
+        notice: []const u8,
         editor: struct { input: *const PathInput, action: ?operations.Kind },
         confirm_delete: *const operations.Job,
     };
@@ -67,6 +69,8 @@ pub const State = opaque {
         focus: Focus,
         adjustment: i32,
         zoom: bool,
+        terminal_visible: bool,
+        terminal_exists: bool,
         quit: bool,
         force_redraw: bool,
         modal: ModalView,
@@ -74,7 +78,7 @@ pub const State = opaque {
         rejection: ?Rejection,
 
         pub fn modalVisible(self: Observation) bool {
-            return self.modal != .none or (self.operation != null and self.focus != .terminal);
+            return self.modal != .none or self.operation != null;
         }
     };
 
@@ -97,11 +101,14 @@ pub const State = opaque {
             .focus = self.focus,
             .adjustment = self.adjustment,
             .zoom = self.zoom,
+            .terminal_visible = self.terminal_visible,
+            .terminal_exists = self.terminal_exists,
             .quit = self.quit,
             .force_redraw = self.force_redraw,
             .modal = switch (self.modal) {
                 .none => .none,
                 .help => .help,
+                .notice => |message| .{ .notice = message },
                 .editor => |*editor| .{ .editor = .{ .input = &editor.input, .action = editor.action } },
                 .confirm_delete => |confirmation| .{ .confirm_delete = confirmation.job },
             },
@@ -150,6 +157,24 @@ pub const State = opaque {
     /// Closes an editor/confirmation, requests job cancellation, or releases its result.
     pub fn dismiss(state: *State) void {
         state.implementation().dismiss();
+    }
+
+    pub const TerminalHost = struct {
+        context: *anyopaque,
+        start: *const fn (*anyopaque, ?[]const u8) anyerror!void,
+    };
+
+    pub fn attachTerminal(state: *State, host: TerminalHost) void {
+        state.implementation().terminal_host = host;
+    }
+
+    pub fn terminalEnded(state: *State) void {
+        const self = state.implementation();
+        self.terminal_exists = false;
+        self.terminal_visible = false;
+        self.zoom = false;
+        if (self.focus == .terminal) self.focus = self.last_pane;
+        self.force_redraw = true;
     }
 
     pub fn toggleTerminal(state: *State) void {
@@ -227,6 +252,9 @@ const Implementation = struct {
     last_pane: Focus = .left,
     adjustment: i32 = 0,
     zoom: bool = false,
+    terminal_visible: bool = true,
+    terminal_exists: bool = true,
+    terminal_host: ?State.TerminalHost = null,
     quit: bool = false,
     force_redraw: bool = true,
     panes: [2]*Pane,
@@ -348,7 +376,7 @@ const Implementation = struct {
                 }
                 return;
             },
-            .help => {
+            .help, .notice => {
                 if (ev.kind == .key) self.modal.deinit();
                 return;
             },
@@ -366,7 +394,7 @@ const Implementation = struct {
     }
 
     fn toggleTerminal(self: *Implementation) void {
-        if (self.modal != .none) return;
+        if (self.modal != .none or self.operation != null or !self.terminal_visible or !self.terminal_exists) return;
         if (self.focus == .terminal) {
             self.focus = self.last_pane;
             self.zoom = false;
@@ -376,11 +404,31 @@ const Implementation = struct {
         }
     }
 
+    fn showTerminal(self: *Implementation) void {
+        if (self.modal != .none or self.operation != null) return;
+        if (!self.terminal_exists) {
+            const pane = self.activePane();
+            const cwd = pane.provider().localPath(pane.location().locator) catch null;
+            const host = self.terminal_host orelse {
+                self.modal = .{ .notice = "Terminal launch unavailable" };
+                return;
+            };
+            host.start(host.context, cwd) catch |err| {
+                self.modal = .{ .notice = @errorName(err) };
+                return;
+            };
+            self.terminal_exists = true;
+        }
+        self.terminal_visible = true;
+        self.focus = .terminal;
+    }
+
     fn available(self: *const Implementation, id: commands.Id) bool {
         if (self.modal != .none) return false;
-        if (id == .toggle_terminal) return true;
-        if (self.focus == .terminal) return false;
         if (self.operation != null) return id == .quit;
+        if (id == .toggle_terminal) return self.terminal_visible and self.terminal_exists;
+        if (id == .visibility_terminal) return true;
+        if (self.focus == .terminal) return false;
         return switch (id) {
             .copy => self.actionAvailable(.copy),
             .move => self.actionAvailable(.move),
@@ -409,10 +457,18 @@ const Implementation = struct {
                 self.force_redraw = true;
                 try self.activePane().refresh();
             },
-            .toggle_terminal, .focus_terminal => self.toggleTerminal(),
+            .toggle_terminal => self.toggleTerminal(),
+            .visibility_terminal => {
+                if (self.terminal_visible) {
+                    self.terminal_visible = false;
+                    self.focus = self.last_pane;
+                    self.zoom = false;
+                } else self.showTerminal();
+            },
+            .focus_terminal => self.showTerminal(),
             .zoom_terminal => {
-                self.zoom = true;
-                self.toggleTerminal();
+                self.showTerminal();
+                if (self.focus == .terminal) self.zoom = true;
             },
             .grow_terminal => self.adjustment = @min(self.adjustment + 1, Layout.max_adjustment),
             .shrink_terminal => self.adjustment = @max(self.adjustment - 1, -Layout.max_adjustment),

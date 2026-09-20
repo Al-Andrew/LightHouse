@@ -153,3 +153,10 @@ to avoid expensive internal integrity scans; `-Dghostty-debug=true` enables them
 - [Ghostty's libghostty status](https://github.com/ghostty-org/ghostty#cross-platform-libghostty-for-embeddable-terminals): libghostty-vt is usable from Zig and C; its API is still evolving.
 - [Ghostling integration example](https://github.com/ghostty-org/ghostling): demonstrates that the consumer supplies rendering/windowing around libghostty-vt. LightHouse will supply terminal-cell rendering instead.
 - [Ghostty build manifest](https://github.com/ghostty-org/ghostty/blob/main/build.zig.zon): compiler/dependency baseline inspected while planning.
+
+## Delivered terminal lifetime (#21)
+
+Persistent shell existence, visibility and focus now have independent lifetimes.
+Runtime sessions start through a process boundary safe after workers exist.
+Ctrl+J, shell EOF/restart and retained-job input blocking are covered by controller,
+View and real PTY checks. Path insertion and F4 can use the same session owner.
