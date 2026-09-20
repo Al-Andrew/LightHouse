@@ -4,6 +4,7 @@ const PathInput = @import("lighthouse-ui").TextInput;
 const Pane = @import("../../core/pane.zig").Pane;
 const operations = @import("../../core/operations.zig");
 const dialog = @import("lighthouse-ui").dialog;
+const help_lines = @import("file_pane.zig").help_lines;
 const commands = @import("../commands.zig");
 const theme = @import("../theme.zig");
 const path_dialog_width = 84;
@@ -114,17 +115,6 @@ fn operationError(err: anyerror) []const u8 {
         else => @errorName(err),
     };
 }
-
-const help_lines = [_][]const u8{
-    "Arrows / PgUp / PgDn / Home / End   Move cursor",
-    "Enter / Right                      Enter directory",
-    "Backspace / Left                   Parent directory",
-    "Space / Insert                     Mark / mark and advance",
-    "Shift+Up/Down/Home/End               Toggle marks while moving",
-    "Esc                                Cancel read / clear error",
-    ".                                  Toggle hidden files",
-    "s / r                              Sort field / reverse order",
-};
 
 pub fn paintHelp(painter: ui.Painter) void {
     const style = theme.dialog;

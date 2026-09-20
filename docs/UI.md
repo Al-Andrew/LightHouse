@@ -85,7 +85,12 @@ static defaults without advertising enabled state; the key bar reflects current
 availability. The unassigned
 function-key slots remain empty. Descriptions and binding slices have process
 lifetime and retain no workflow context. Pane navigation/marking and editor
-handling stay local to their widgets; their help is documented separately.
+handling stay local to their widgets. `widgets/file_pane.zig` owns Pane binding
+descriptions, aliases, modifier policy, and action mapping; dialog help consumes
+lines generated from those same descriptions. Shift movement help is derived
+from the bindings that toggle marks while moving. Insert marks and advances,
+and shifted page keys bubble to the built-in terminal-history commands. The
+FilePane adapter still translates focused-widget events into Pane actions.
 
 `State.available(id)` is the controller's observational command policy. It
 checks modal scope, terminal focus, the retained job, file-action sources, and
