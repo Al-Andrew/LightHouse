@@ -13,18 +13,40 @@ const paintOperation = dialogs.paintOperation;
 const commands = @import("commands.zig");
 
 pub const Focus = enum { left, right, terminal };
+
+/// Expected submission rejections retained by the event workflow. All other
+/// errors (including allocation, lifecycle and transport) propagate to the host.
+pub const Rejection = enum {
+    invalid_location,
+    unsupported_operation,
+
+    fn fromError(err: anyerror) ?Rejection {
+        return switch (err) {
+            error.UnknownLocation, error.UnknownChild, error.InvalidLocation => .invalid_location,
+            error.UnsupportedOperation => .unsupported_operation,
+            else => null,
+        };
+    }
+
+    pub fn message(self: Rejection) []const u8 {
+        return switch (self) {
+            .invalid_location => "Location not recognized. Edit the input or press Esc.",
+            .unsupported_operation => "Operation unavailable. Change the target or press Esc.",
+        };
+    }
+};
 // A tagged state owns exactly one modal payload. An action cannot outlive its
 // editor, and help/path/delete dialogs cannot accidentally overlap.
 const Modal = union(enum) {
     none,
     help,
-    editor: struct { input: PathInput, action: ?operations.Kind = null },
-    confirm_delete: *operations.Job,
+    editor: struct { input: PathInput, action: ?operations.Kind = null, rejection: ?Rejection = null },
+    confirm_delete: struct { job: *operations.Job, rejection: ?Rejection = null },
 
     pub fn deinit(self: *Modal) void {
         switch (self.*) {
             .editor => |*editor| editor.input.deinit(),
-            .confirm_delete => |job| job.destroy(),
+            .confirm_delete => |confirmation| confirmation.job.destroy(),
             .none, .help => {},
         }
         self.* = .none;
@@ -49,6 +71,7 @@ pub const State = opaque {
         force_redraw: bool,
         modal: ModalView,
         operation: ?*const operations.Job,
+        rejection: ?Rejection,
 
         pub fn modalVisible(self: Observation) bool {
             return self.modal != .none or (self.operation != null and self.focus != .terminal);
@@ -80,9 +103,14 @@ pub const State = opaque {
                 .none => .none,
                 .help => .help,
                 .editor => |*editor| .{ .editor = .{ .input = &editor.input, .action = editor.action } },
-                .confirm_delete => |job| .{ .confirm_delete = job },
+                .confirm_delete => |confirmation| .{ .confirm_delete = confirmation.job },
             },
             .operation = self.operation,
+            .rejection = switch (self.modal) {
+                .editor => |editor| editor.rejection,
+                .confirm_delete => |confirmation| confirmation.rejection,
+                else => null,
+            },
         };
     }
 
@@ -146,6 +174,9 @@ pub const State = opaque {
     }
 
     /// Called only by the modal widget, whose tree scope consumes every event.
+    /// Expected Provider rejection stays beside the retained editor/confirmation;
+    /// edits clear it, retry rechecks support, and dismissal releases the payload.
+    /// Direct submit/confirmDelete calls preserve their synchronous errors.
     pub fn modalEvent(state: *State, emulator: *Emulator, ev: *const input.Event) !void {
         try state.implementation().modalEvent(emulator, ev);
     }
@@ -268,14 +299,14 @@ const Implementation = struct {
         const pane = self.activePane();
         if (!self.actionAvailable(.delete)) return;
         // Own the exact names shown in the confirmation, independent of scans.
-        self.modal = .{ .confirm_delete = try self.fileActions().prepare(self.io, self.allocator, .delete, "") };
+        self.modal = .{ .confirm_delete = .{ .job = try self.fileActions().prepare(self.io, self.allocator, .delete, "") } };
         pane.cancelNavigation();
     }
 
     fn confirmDelete(self: *Implementation) !void {
         if (self.modal != .confirm_delete) return error.NoConfirmation;
         if (!self.actionAvailable(.delete)) return error.UnsupportedOperation;
-        const job = self.modal.confirm_delete;
+        const job = self.modal.confirm_delete.job;
         self.modal = .none;
         self.startOperation(job);
     }
@@ -299,16 +330,20 @@ const Implementation = struct {
                 if (ev.key == .escape or (ev.key == .text and ev.len == 1 and ev.bytes[0] == 'n')) {
                     self.modal.deinit();
                 } else if (ev.key == .enter) {
-                    try self.confirmDelete();
+                    self.confirmDelete() catch |err| {
+                        self.modal.confirm_delete.rejection = Rejection.fromError(err) orelse return err;
+                    };
                 }
                 return;
             },
             .editor => |*editor| {
                 switch (try editor.input.event(ev)) {
-                    .editing => {},
+                    .editing => editor.rejection = null,
                     .cancel => self.modal.deinit(),
                     .accept => {
-                        try self.submit(editor.input.text());
+                        self.submit(editor.input.text()) catch |err| {
+                            editor.rejection = Rejection.fromError(err) orelse return err;
+                        };
                     },
                 }
                 return;
@@ -626,22 +661,7 @@ fn testLocalProvider(context: ?*anyopaque, scan: @TypeOf(directory.local.scan)) 
     return result;
 }
 
-const CapabilityFixture = struct {
-    writable: bool = true,
-    readable: bool = true,
-    blocked: ?[]const u8 = null,
-    fn provider(self: *CapabilityFixture, local_identity: bool) directory.Provider {
-        var result = directory.local;
-        result.context = self;
-        result.capabilities = capabilities;
-        if (!local_identity) result.identity = self;
-        return result;
-    }
-    fn capabilities(context: ?*anyopaque, locator: []const u8) directory.Capabilities {
-        const self: *CapabilityFixture = @ptrCast(@alignCast(context.?));
-        return .{ .source_read = self.readable, .destination_write = self.writable and !(if (self.blocked) |blocked| std.mem.startsWith(u8, locator, blocked) else false) };
-    }
-};
+const CapabilityFixture = @import("../core/testing_provider.zig").LocalCapabilities;
 
 test "provider-looking local paths never enter local jobs without the local executor" {
     const io = std.testing.io;

@@ -9,18 +9,18 @@ pub const Modal = struct {
 
     pub fn measure(self: *Modal, _: toolkit.Size) toolkit.Size {
         return switch (self.state.view().modal) {
-            .editor => |editor| dialogs.editorSize(editor.action),
+            .editor => |editor| dialogs.editorSize(editor.action, self.state.view().rejection),
             .help => dialogs.help_size,
-            .confirm_delete => |job| dialogs.deleteSize(job),
+            .confirm_delete => |job| dialogs.deleteSize(job, self.state.view().rejection),
             .none => dialogs.operation_size,
         };
     }
 
     pub fn paint(self: *Modal, _: *toolkit.Widget, painter: toolkit.Painter) !void {
         switch (self.state.view().modal) {
-            .editor => |editor| try dialogs.paintPathInput(painter, editor.input, editor.action, self.state.activePane()),
+            .editor => |editor| try dialogs.paintPathInput(painter, editor.input, editor.action, self.state.activePane(), self.state.view().rejection),
             .help => dialogs.paintHelp(painter),
-            .confirm_delete => |job| try dialogs.paintDeleteConfirmation(painter, job),
+            .confirm_delete => |job| try dialogs.paintDeleteConfirmation(painter, job, self.state.view().rejection),
             .none => if (self.state.view().operation) |job| try dialogs.paintOperation(painter, job),
         }
     }

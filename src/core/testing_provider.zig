@@ -14,11 +14,14 @@ pub const Opaque = struct {
     writable: bool = false,
     missing_a: bool = false,
     fail: bool = false,
+    resolve_failure: ?anyerror = null,
 
     pub fn provider(self: *Opaque) directory.Provider {
         return .{ .identity = self, .context = self, .resolve = resolve, .has_parent = hasParent, .parent_hint = parentHint, .display = display, .capabilities = capabilities, .scan = scan };
     }
-    fn resolve(_: ?*anyopaque, allocator: std.mem.Allocator, base: []const u8, request: directory.Resolution) ![]const u8 {
+    fn resolve(context: ?*anyopaque, allocator: std.mem.Allocator, base: []const u8, request: directory.Resolution) ![]const u8 {
+        const self: *Opaque = @ptrCast(@alignCast(context.?));
+        if (self.resolve_failure) |err| return err;
         const target: []const u8 = switch (request) {
             .root, .parent => root,
             .child => |name| if (std.mem.eql(u8, base, root) and std.mem.eql(u8, name, "folder")) child else return error.UnknownChild,
@@ -75,5 +78,22 @@ pub const Opaque = struct {
             try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
         }
         return error.ScanTimeout;
+    }
+};
+
+pub const LocalCapabilities = struct {
+    writable: bool = true,
+    readable: bool = true,
+    blocked: ?[]const u8 = null,
+    pub fn provider(self: *LocalCapabilities, local_identity: bool) directory.Provider {
+        var result = directory.local;
+        result.context = self;
+        result.capabilities = capabilities;
+        if (!local_identity) result.identity = self;
+        return result;
+    }
+    fn capabilities(context: ?*anyopaque, locator: []const u8) directory.Capabilities {
+        const self: *LocalCapabilities = @ptrCast(@alignCast(context.?));
+        return .{ .source_read = self.readable, .destination_write = self.writable and !(if (self.blocked) |blocked| std.mem.startsWith(u8, locator, blocked) else false) };
     }
 };

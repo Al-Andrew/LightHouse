@@ -487,3 +487,179 @@ test "View and direct commands share current provider support without starting w
         _ = try tmp.dir.statFile(io, "source", .{});
     }
 }
+
+test "View retains rejected opaque Location input for correction" {
+    const Pane = @import("../core/pane.zig").Pane;
+    const Fixture = @import("../core/testing_provider.zig").Opaque;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture: Fixture = .{};
+    const left = try Pane.create(io, allocator, Fixture.root, .{ .provider = fixture.provider() });
+    defer left.destroy();
+    const right = try Pane.create(io, allocator, "/", .{});
+    defer right.destroy();
+    const emulator = try Emulator.create(io, allocator, 80, 8);
+    defer emulator.destroy();
+    const state = try State.create(io, allocator, .{ left, right });
+    defer state.destroy();
+    const view = try View.create(allocator, state, emulator);
+    defer view.destroy();
+    try left.refresh();
+    try settleWorkflow(state);
+    const previous_listing = left.view().entries.ptr;
+    var decoder: ui.input.Decoder = .{};
+    try feed(view, &decoder, "\x0cinvalid\r");
+    try std.testing.expect(state.view().modal == .editor);
+    try std.testing.expectEqualStrings("invalid", state.view().modal.editor.input.text());
+    try std.testing.expect(state.view().operation == null);
+    try std.testing.expectEqual(.invalid_location, state.view().rejection.?);
+    try std.testing.expectEqualStrings(Fixture.root, left.location().locator);
+    try std.testing.expectEqual(previous_listing, left.view().entries.ptr);
+    try std.testing.expect(left.view().status == .ready);
+    try std.testing.expect(view.modal.focused());
+    var frame = ui.Frame.init(allocator);
+    defer frame.deinit();
+    try view.paint(&frame, .{ .width = 80, .height = 24 });
+    try expectFrameText(&frame, "Location not recognized.");
+    try expectFrameText(&frame, "invalid");
+    for ([_]ui.Size{ .{ .width = 7, .height = 4 }, .{ .width = 1, .height = 1 } }) |size| {
+        try view.paint(&frame, size);
+        if (frame.cursor) |cursor| try std.testing.expect(cursor.x < size.width and cursor.y < size.height);
+    }
+    try feed(view, &decoder, "\x15folder");
+    try std.testing.expect(state.view().rejection == null);
+    try view.event(&.{ .key = .enter });
+    try settleWorkflow(state);
+    try std.testing.expect(state.view().modal == .none);
+    try std.testing.expectEqualStrings(Fixture.child, left.location().locator);
+    try std.testing.expect(view.panes[0].focused());
+    // A new rejection can be dismissed, then terminal input is routed normally.
+    try feed(view, &decoder, "\x0cwrong\r");
+    try view.event(&.{ .key = .escape });
+    try std.testing.expect(state.view().rejection == null);
+    try feed(view, &decoder, "\x07q\x07");
+    try std.testing.expectEqualStrings("q", emulator.queued());
+    try std.testing.expect(!state.view().quit);
+}
+
+fn settleWorkflow(state: *State) !void {
+    for (0..5000) |_| {
+        _ = try state.poll();
+        const finished = if (state.view().operation) |job| job.status() == .finished else true;
+        if (finished and state.panes()[0].view().status != .loading and state.panes()[1].view().status != .loading) return;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    return error.WorkflowTimeout;
+}
+
+test "View retains capability rejection and never starts unsupported file actions" {
+    const Pane = @import("../core/pane.zig").Pane;
+    const Fixture = @import("../core/testing_provider.zig").LocalCapabilities;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "keep", .data = "safe" });
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    const blocked = try std.fs.path.join(allocator, &.{ path, "blocked" });
+    defer allocator.free(blocked);
+    var fixture: Fixture = .{ .blocked = blocked };
+    const left = try Pane.create(io, allocator, path, .{ .provider = fixture.provider(true) });
+    defer left.destroy();
+    const right = try Pane.create(io, allocator, path, .{ .provider = fixture.provider(true) });
+    defer right.destroy();
+    const emulator = try Emulator.create(io, allocator, 80, 8);
+    defer emulator.destroy();
+    const state = try State.create(io, allocator, .{ left, right });
+    defer state.destroy();
+    const view = try View.create(allocator, state, emulator);
+    defer view.destroy();
+    try left.refresh();
+    try settleWorkflow(state);
+    try view.event(&.{ .key = .down });
+    var decoder: ui.input.Decoder = .{};
+    var frame = ui.Frame.init(allocator);
+    defer frame.deinit();
+    var data: [16]u8 = undefined;
+    // Changed capabilities and edited destinations are both rechecked at Enter.
+    for ([_]ui.input.Key{ .f5, .f6, .f7 }) |key| {
+        try view.event(&.{ .key = key });
+        try feed(view, &decoder, "\x15blocked/new");
+        fixture.writable = false;
+        try view.event(&.{ .key = .enter });
+        try std.testing.expectEqual(.unsupported_operation, state.view().rejection.?);
+        try std.testing.expectEqualStrings("blocked/new", state.view().modal.editor.input.text());
+        try std.testing.expect(state.view().operation == null);
+        try view.paint(&frame, .{ .width = 80, .height = 24 });
+        try expectFrameText(&frame, "Operation unavailable.");
+        fixture.writable = true;
+        try view.event(&.{ .key = .enter });
+        try std.testing.expect(state.view().operation == null);
+        try std.testing.expectEqual(.unsupported_operation, state.view().rejection.?);
+        try std.testing.expectEqualStrings("safe", try tmp.dir.readFile(io, "keep", &data));
+        try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "blocked", .{}));
+        try view.event(&.{ .key = .escape });
+        try std.testing.expect(state.view().rejection == null);
+        try std.testing.expect(view.panes[0].focused());
+    }
+    try view.event(&.{ .key = .f8 });
+    const prepared = state.view().modal.confirm_delete;
+    fixture.writable = false;
+    try view.event(&.{ .key = .enter });
+    try std.testing.expectEqual(prepared, state.view().modal.confirm_delete);
+    try std.testing.expect(prepared.status() == .prepared);
+    try std.testing.expectEqualStrings("keep", std.fs.path.basename(prepared.request().sources[0]));
+    try std.testing.expect(state.view().operation == null);
+    try std.testing.expectEqual(.unsupported_operation, state.view().rejection.?);
+    try view.paint(&frame, .{ .width = 80, .height = 24 });
+    try expectFrameText(&frame, "Delete unavailable.");
+    try expectFrameText(&frame, "keep");
+    try feed(view, &decoder, "\x1b[200~n\r\x1b[201~");
+    try std.testing.expectEqual(prepared, state.view().modal.confirm_delete);
+    try view.event(&.{ .key = .escape });
+    try std.testing.expectEqualStrings("safe", try tmp.dir.readFile(io, "keep", &data));
+    fixture.writable = true;
+    // Correcting a rejected copy starts exactly the supported request.
+    try view.event(&.{ .key = .f5 });
+    try feed(view, &decoder, "blocked/new\r");
+    try std.testing.expect(state.view().operation == null);
+    try feed(view, &decoder, "\x15copied\r");
+    try std.testing.expect(state.view().modal == .none);
+    try std.testing.expect(state.view().rejection == null);
+    try settleWorkflow(state);
+    try std.testing.expect(state.view().operation.?.status().finished.failure == null);
+    try std.testing.expectEqualStrings("safe", try tmp.dir.readFile(io, "copied", &data));
+    try std.testing.expectEqualStrings("safe", try tmp.dir.readFile(io, "keep", &data));
+    try view.event(&.{ .key = .escape });
+    try view.event(&.{ .key = .tab });
+    try std.testing.expect(view.panes[1].focused());
+}
+
+test "View propagates fatal Provider failures without converting them to rejection" {
+    const Pane = @import("../core/pane.zig").Pane;
+    const Fixture = @import("../core/testing_provider.zig").Opaque;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture: Fixture = .{};
+    const left = try Pane.create(io, allocator, Fixture.root, .{ .provider = fixture.provider() });
+    defer left.destroy();
+    const right = try Pane.create(io, allocator, "/", .{});
+    defer right.destroy();
+    const emulator = try Emulator.create(io, allocator, 80, 8);
+    defer emulator.destroy();
+    const state = try State.create(io, allocator, .{ left, right });
+    defer state.destroy();
+    const view = try View.create(allocator, state, emulator);
+    defer view.destroy();
+    var decoder: ui.input.Decoder = .{};
+    try feed(view, &decoder, "\x0cfolder");
+    for ([_]anyerror{ error.OutOfMemory, error.Canceled, error.ConcurrencyUnavailable, error.ConnectionResetByPeer }) |err| {
+        fixture.resolve_failure = err;
+        try std.testing.expectError(err, view.event(&.{ .key = .enter }));
+        try std.testing.expect(state.view().rejection == null);
+        try std.testing.expect(state.view().operation == null);
+        try std.testing.expectEqualStrings("folder", state.view().modal.editor.input.text());
+        try std.testing.expectEqualStrings(Fixture.root, left.location().locator);
+    }
+}

@@ -67,6 +67,13 @@ one fails. The finished result remains owned until dismissal, including while
 focus visits the persistent terminal. `App` schedules polling without accessing
 or destroying workflow payloads.
 
+`State.modalEvent` owns recoverable submission rejection for the event interface:
+it retains the editor or prepared delete confirmation and exposes a typed
+`State.view().rejection` for dialog presentation. Editing clears the explanation;
+retry rechecks support, and dismissal releases the payload. The explicit
+[recovery policy](PROVIDERS.md#workflow-recovery-policy) preserves fatal errors
+through `View.event` and keeps direct workflow/Pane synchronous errors intact.
+
 The palette belongs to `src/app/theme.zig`.
 
 ## Built-in commands
