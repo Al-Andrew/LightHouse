@@ -62,7 +62,9 @@ def external_editor():
             app.send("\x19")
             app.expect("Editor exited unsuccessfully")
             app.expect("FAILED_FINAL_OUTPUT")
-            app.send("\r")
+            app.send("\r" + F4)  # Dismiss and relaunch in one host-input batch.
+            app.expect("EDITOR_READY")
+            app.send("\x18")
             app.expect("Name")
             app.send("q")
             app.finished()
@@ -81,7 +83,11 @@ def editor_configuration():
         target.write_text("initial")
         report = root / "report"
         settings = config / "config.json"
+        bad_executable = root / "invalid-executable"
+        bad_executable.write_text("not an executable format")
+        bad_executable.chmod(0o755)
         cases = [
+            (json.dumps({"editor": [str(bad_executable)]}), "/bin/true", "SpawnFailed"),
             (None, "", "Configure editor argv"),
             ("{bad", "/bin/true", "Invalid editor configuration"),
             ('{"editor":[]}', "/bin/true", "Invalid editor configuration"),
