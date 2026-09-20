@@ -70,7 +70,15 @@ class Screen:
 
 
 class App:
-    def __init__(self, shell="/bin/sh", cols=100, rows=30, stderr=None, cwd=None, env_overrides=None):
+    def __init__(
+        self,
+        shell="/bin/sh",
+        cols=100,
+        rows=30,
+        stderr=None,
+        cwd=None,
+        env_overrides=None,
+    ):
         self.master, self.slave = os.openpty()
         self.saved = termios.tcgetattr(self.slave)
         self.screen = Screen(cols, rows)
