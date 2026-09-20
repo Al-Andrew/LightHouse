@@ -548,7 +548,7 @@ const Implementation = struct {
         defer file.close(self.io);
         const before = try file.stat(self.io);
         if (!same(observed.source, before) or before.kind != .file) return error.SourceChanged;
-        var output = try Dir.cwd().createFileAtomic(self.io, target, .{ .replace = true });
+        var output = try Dir.cwd().createFileAtomic(self.io, target, .{ .replace = true, .permissions = before.permissions });
         defer output.deinit(self.io);
         var buffer: [copy_buffer_bytes]u8 = undefined;
         var offset: u64 = 0;
@@ -875,6 +875,50 @@ test "partial batch failure reports completed items and preserves unprocessed so
     _ = try tmp.dir.statFile(io, "dest/a", .{});
     _ = try tmp.dir.statFile(io, "b", .{});
     _ = try tmp.dir.statFile(io, "c", .{});
+}
+
+test "copy preparation keeps restrictive source permissions on visible temporary files" {
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |overwrite| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buffer: [Dir.max_path_bytes]u8 = undefined;
+        const base = try testBase(&tmp, &buffer);
+        const source = try tmp.dir.createFile(io, "source", .{});
+        defer source.close(io);
+        try source.setPermissions(io, .fromMode(0o600));
+        try source.setLength(io, 2 * copy_buffer_bytes);
+        try source.writePositionalAll(io, "private content", 0);
+        if (overwrite) try tmp.dir.writeFile(io, .{ .sub_path = "destination", .data = "old" });
+        var gate = TestIoGate.init(.copy);
+        defer gate.threaded.deinit();
+        const job = try Job.create(gate.io(), std.testing.allocator, .copy, base, &.{"source"}, "destination");
+        defer job.destroy();
+        defer gate.unblock();
+        try job.start();
+        if (overwrite) {
+            _ = try waitForDecision(job);
+            try std.testing.expect(job.decide(.overwrite, false));
+        }
+        // The second source read waits after private data reached the temporary
+        // file, before finalization can change its creation permissions.
+        try gate.waitUntilEntered();
+        var iterator = tmp.dir.iterate();
+        var temporary_count: usize = 0;
+        while (try iterator.next(io)) |entry| {
+            if (std.mem.eql(u8, entry.name, "source") or std.mem.eql(u8, entry.name, "destination")) continue;
+            temporary_count += 1;
+            const stat = try tmp.dir.statFile(io, entry.name, .{});
+            try std.testing.expectEqual(@as(std.posix.mode_t, 0), stat.permissions.toMode() & 0o077);
+            var data: [15]u8 = undefined;
+            try std.testing.expectEqualStrings("private content", try tmp.dir.readFile(io, entry.name, &data));
+        }
+        try std.testing.expectEqual(@as(usize, 1), temporary_count);
+        gate.unblock();
+        try waitForJob(job);
+        try std.testing.expectEqual(null, job.status().finished.failure);
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), (try tmp.dir.statFile(io, "destination", .{})).permissions.toMode() & 0o777);
+    }
 }
 
 test "canceling an active copy never publishes a partial destination" {

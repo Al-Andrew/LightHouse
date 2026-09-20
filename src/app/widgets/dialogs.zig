@@ -91,8 +91,8 @@ pub fn paintOperation(painter: ui.Painter, job: *const operations.Job) !void {
         const prompt = status.waiting.prompt;
         const title = if (prompt.err) |err| try std.fmt.allocPrint(allocator, "{s}: {s}", .{ @tagName(prompt.stage), operationError(err) }) else if (prompt.conflict == .mismatch) "Type mismatch: directory replacement is not allowed" else "Destination conflict";
         inside.label(0, 2, title, style);
-        try inside.text(0, 3, prompt.source, style);
-        try inside.text(0, 4, prompt.destination, style);
+        try inside.child(.{ .x = 0, .y = 3, .width = inside.rect.width, .height = 1 }).textEnd(prompt.source, style);
+        try inside.child(.{ .x = 0, .y = 4, .width = inside.rect.width, .height = 1 }).textEnd(prompt.destination, style);
         inside.label(0, 5, if (prompt.err != null) "r Retry | s Skip | c / Esc Cancel job" else if (prompt.conflict == .mismatch) "s Skip | c / Esc Cancel job" else "o Overwrite | s Skip | c / Esc Cancel job", style);
         inside.label(0, 7, "F10 quit | Terminal input blocked", style);
     } else if (status == .finished) {

@@ -7,8 +7,9 @@ panes, concurrent directory scans, marking, sorting, hidden-file toggling,
 refresh, path entry, keyboard help, and background file jobs with progress and
 cancellation. F5 copies, F6 moves/renames within a filesystem, and F7 creates a
 folder. F8 confirms permanent recursive deletion without following symlinks.
-Jobs refuse conflicts and report partial completion; overwrite/skip prompts,
-cross-filesystem moves, and external tools remain pending.
+Copy/move jobs merge directories, offer conflict and error decisions, and report
+partial completion. F4 opens a configured editor in a separate terminal session.
+Cross-filesystem moves remain pending.
 The retained widget foundation now exists as the independent `lighthouse-ui`
 build module: parent ownership, measurement/layout/paint callbacks, focus,
 modal input routing, clipped composition, invalidation, and deferred removal.

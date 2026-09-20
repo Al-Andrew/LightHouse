@@ -304,7 +304,8 @@ def shift_marked_actions():
 
 def merge_decisions():
     with tempfile.TemporaryDirectory(prefix="lh-merge-") as directory:
-        root = Path(directory)
+        root = Path(directory) / ("long-directory-" * 8)
+        root.mkdir()
         source, dest = root / "source", root / "dest"
         source.mkdir()
         dest.mkdir()
@@ -319,6 +320,8 @@ def merge_decisions():
             submit(app, dest)
             app.expect("Destination conflict")
             app.expect("[ ] Apply to all")
+            app.expect("source/a")
+            app.expect("dest/a")
             app.expect("BACKGROUND_FINISHED")
             app.send("\x07\n\x06\x1bOS")
             app.pump(0.1)
