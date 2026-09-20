@@ -274,7 +274,9 @@ def shift_marked_actions():
                 app.send("\t")
                 go(app, destination)
                 in_pane(app, 1, "0 items")
-                app.send("\t\x1b[B\x1b[B" + "\x1b[1;2B" * 2)  # Mark a/b; cursor on keep.
+                app.send(
+                    "\t\x1b[B\x1b[B" + "\x1b[1;2B" * 2
+                )  # Mark a/b; cursor on keep.
                 in_pane(app, 0, "2 marked")
                 app.send("\x1b[H\x1b[B\x1b[B" + "\x1b[1;2B" * 2)  # Unmark a/b.
                 in_pane(app, 0, "0 marked")
