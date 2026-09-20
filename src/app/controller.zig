@@ -249,10 +249,14 @@ const Implementation = struct {
         const pane = self.activePane();
         const base = try pane.provider().localPath(pane.location().locator);
         const provider = pane.provider();
-        const local_target = if (kind == .delete) try self.allocator.dupe(u8, base) else try provider.localTarget(self.allocator, base, target);
+        const destination_pane = if (kind == .copy or kind == .move) self.panes[if (self.last_pane == .left) @as(usize, 1) else 0] else pane;
+        const destination_provider = destination_pane.provider();
+        // Keep the destination endpoint's context when checking edited input.
+        // Relative local targets still resolve against the source pane's base.
+        const local_target = if (kind == .delete) try self.allocator.dupe(u8, base) else try destination_provider.localTarget(self.allocator, base, target);
         defer self.allocator.free(local_target);
-        if (!operations.available(kind, provider, pane.location(), provider, provider.location(local_target), pane.sources().count)) return error.UnsupportedOperation;
-        _ = try provider.localPath(local_target);
+        if (!operations.available(kind, provider, pane.location(), destination_provider, destination_provider.location(local_target), pane.sources().count)) return error.UnsupportedOperation;
+        _ = try destination_provider.localPath(local_target);
         var names: std.ArrayList([]const u8) = .empty;
         defer names.deinit(self.allocator);
         if (kind != .mkdir) {
@@ -698,7 +702,7 @@ test "workflow submission rechecks actual destination capabilities and delete co
     var fixture: CapabilityFixture = .{ .blocked = blocked };
     const left = try Pane.create(io, std.testing.allocator, path, .{ .provider = fixture.provider(true) });
     defer left.destroy();
-    const right = try Pane.create(io, std.testing.allocator, path, .{});
+    const right = try Pane.create(io, std.testing.allocator, path, .{ .provider = fixture.provider(true) });
     defer right.destroy();
     const state = try State.create(io, std.testing.allocator, .{ left, right });
     defer state.destroy();
@@ -775,4 +779,46 @@ test "local workflow targets preserve symlink parent traversal and trailing slas
     try settle(state);
     try std.testing.expect(state.view().operation.?.status().finished.failure != null);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "missing-directory", .{}));
+}
+
+test "edited transfer destination uses destination provider context and source-relative input" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "source", .data = "safe" });
+    try tmp.dir.createDir(io, "destination", .default_dir);
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    const blocked = try std.fs.path.join(std.testing.allocator, &.{ path, "blocked" });
+    defer std.testing.allocator.free(blocked);
+    const destination = try std.fs.path.join(std.testing.allocator, &.{ path, "destination" });
+    defer std.testing.allocator.free(destination);
+    var fixture: CapabilityFixture = .{ .blocked = blocked };
+    const left = try Pane.create(io, std.testing.allocator, path, .{});
+    defer left.destroy();
+    const right = try Pane.create(io, std.testing.allocator, destination, .{ .provider = fixture.provider(true) });
+    defer right.destroy();
+    const state = try State.create(io, std.testing.allocator, .{ left, right });
+    defer state.destroy();
+    try left.refresh();
+    try settle(state);
+    left.move(.last, false);
+    for ([_]operations.Kind{ .copy, .move }) |kind| {
+        for ([_][]const u8{ blocked, "blocked" }) |target| {
+            try std.testing.expect(state.actionAvailable(kind));
+            try state.openAction(kind);
+            try std.testing.expectError(error.UnsupportedOperation, state.submit(target));
+            try std.testing.expect(state.view().operation == null);
+            try std.testing.expect(state.view().modal == .editor);
+            state.dismiss();
+        }
+    }
+    try state.openAction(.copy);
+    try state.submit("copied");
+    try settle(state);
+    try std.testing.expect(state.view().operation.?.status().finished.failure == null);
+    _ = try tmp.dir.statFile(io, "copied", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "destination/copied", .{}));
+    _ = try tmp.dir.statFile(io, "source", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "blocked", .{}));
 }

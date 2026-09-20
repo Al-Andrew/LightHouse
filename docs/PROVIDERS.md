@@ -102,7 +102,10 @@ preserving local relative destinations, home expansion, trailing slashes and OS
 symlink/parent traversal. File-job destinations keep their absolute execution
 spelling instead of the lexical normalization used for navigation; capability
 callbacks must accept these absolute destination locators too. Submission rechecks
-the actual destination as well as current default-context availability. Both
+the actual destination as well as current default-context availability. Copy/move
+retain the other pane's provider and context for the edited destination; mkdir
+and delete use the active provider. Relative local input still uses the source
+pane's base. Both
 source and destination cross the local adapter bridge before job construction. Delete confirmation rechecks
 availability before starting its prepared job. Unsupported entry points do not
 open an editor/confirmation; support lost during an open workflow returns
