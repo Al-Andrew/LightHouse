@@ -28,7 +28,7 @@ pub const View = struct {
         const root = try self.tree.create(null, Root, .{ .view = self });
         self.pane_area = try self.tree.create(root, ui.layout.Box, .{ .axis = .horizontal });
         for (state.panes(), 0..) |pane, i| {
-            self.panes[i] = try self.tree.create(self.pane_area, FilePane, .{ .pane = pane });
+            self.panes[i] = try self.tree.create(self.pane_area, FilePane, .{ .pane = pane, .allocator = allocator });
             self.panes[i].setFocusable(true);
         }
         self.terminal = try self.tree.create(root, Terminal, .{ .emulator = emulator });
@@ -60,11 +60,7 @@ pub const View = struct {
     pub fn event(self: *View, ev: *const ui.Event) !void {
         if (self.state.view().tool != .none) return self.state.toolEvent(ev);
         try self.sync();
-        // LF must reach visibility policy before a Pane consumes Enter. Modal
-        // input retains LF-as-Enter, and paste events never resolve a binding.
-        if (!self.state.view().modalVisible() and @import("commands.zig").resolve(ev) == .visibility_terminal) {
-            _ = try self.state.invoke(.visibility_terminal, self.emulator);
-        } else _ = try self.tree.dispatch(ev);
+        _ = try self.tree.dispatch(ev);
         try self.sync();
     }
 
@@ -383,7 +379,7 @@ fn expectFrameText(frame: *const ui.Frame, expected: []const u8) !void {
     return error.MissingFrameText;
 }
 
-test "View retains path aliases terminal geometry and job quit text binding" {
+test "View retains absolute path entry terminal geometry and job quit text binding" {
     const Pane = @import("../core/pane.zig").Pane;
     const io = std.testing.io;
     const allocator = std.testing.allocator;
@@ -401,7 +397,7 @@ test "View retains path aliases terminal geometry and job quit text binding" {
     try feed(view, &decoder, "\x0c");
     try std.testing.expectEqualStrings("/tmp", state.view().modal.editor.input.text());
     try view.event(&.{ .key = .escape });
-    try feed(view, &decoder, "/");
+    try feed(view, &decoder, "\x0c/");
     try std.testing.expectEqualStrings("/", state.view().modal.editor.input.text());
     try std.testing.expect(!state.view().modal.editor.input.select_all);
     try view.event(&.{ .key = .escape });
@@ -963,4 +959,50 @@ test "Ctrl page shortcuts navigate only the active Pane and preserve focused inp
     try feed(view, &decoder, "\x1b[5;5~");
     try std.testing.expectEqualStrings("/", right.view().path);
     try std.testing.expect(right.view().status == .ready);
+}
+
+test "View filter input owns edits paste and controls independently for each Pane" {
+    const Pane = @import("../core/pane.zig").Pane;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const left = try Pane.create(io, allocator, "/", .{});
+    defer left.destroy();
+    const right = try Pane.create(io, allocator, "/", .{});
+    defer right.destroy();
+    const emulator = try Emulator.create(io, allocator, 80, 8);
+    defer emulator.destroy();
+    const state = try State.create(io, allocator, .{ left, right });
+    defer state.destroy();
+    const view = try View.create(allocator, state, emulator);
+    defer view.destroy();
+    var decoder: ui.input.Decoder = .{};
+    try feed(view, &decoder, "/q.srt");
+    try std.testing.expect(state.view().modal == .none);
+    try std.testing.expect(left.view().filter.active);
+    try std.testing.expectEqualStrings("q.srt", left.view().filter.query);
+    try std.testing.expect(!state.view().quit);
+    try std.testing.expect(!left.view().requested_options.hidden);
+    try feed(view, &decoder, "\n");
+    try std.testing.expect(state.view().terminal_visible);
+    try std.testing.expectEqual(.left, state.view().focus);
+    try feed(view, &decoder, "/");
+    try feed(view, &decoder, "\x1b[200~ /界\n\x07\x1b[201~");
+    try std.testing.expectEqualStrings("q.srt /界", left.view().filter.query);
+    try std.testing.expectEqual(@as(usize, 0), emulator.queued().len);
+    try feed(view, &decoder, "\r\t/right\r\t/");
+    try std.testing.expectEqualStrings("q.srt /界", left.view().filter.query);
+    try std.testing.expectEqualStrings("right", right.view().filter.query);
+    try feed(view, &decoder, "\x15");
+    try std.testing.expectEqualStrings("", left.view().filter.query);
+    try std.testing.expect(left.view().filter.active);
+    var frame = ui.Frame.init(allocator);
+    defer frame.deinit();
+    for ([_]ui.Size{ .{ .width = 80, .height = 24 }, .{ .width = 18, .height = 10 }, .{ .width = 7, .height = 4 } }) |size| {
+        try view.paint(&frame, size);
+        if (frame.cursor) |cursor| try std.testing.expect(cursor.x < size.width and cursor.y < size.height);
+    }
+    try view.event(&.{ .key = .escape });
+    try std.testing.expect(!left.view().filter.active);
+    try feed(view, &decoder, "\x0c");
+    try std.testing.expect(state.view().modal == .editor);
 }

@@ -15,6 +15,12 @@ Requires **Zig 0.16.0**, Linux, and an interactive UTF-8 terminal with xterm-sty
 control sequences and truecolor support. Dependencies are fetched by Zig on the
 first build. No existing TUI or GUI framework is used.
 
+Pane filtering requires [fzf](https://github.com/junegunn/fzf#installation) in
+`PATH` (for example, `sudo apt install fzf` on Debian/Ubuntu). Browsing remains
+available without it; `/` reports an actionable error when matching is requested.
+The filtering tests also require fzf. fzf supports Windows packages, although
+LightHouse currently supports Linux only.
+
 ```sh
 zig build run
 ```
@@ -65,7 +71,7 @@ the shell is focused, where function keys pass through to the child.
 | Shift+Up / Shift+Down | Toggle the current mark and move |
 | Shift+Home / Shift+End | Toggle marks through the first/last row |
 | Ctrl+L | Edit the active pane's path; typing replaces the initial selection |
-| / | Enter an absolute path, starting with `/` |
+| / | Open or resume the Pane filter |
 | Ctrl+R | Refresh the active pane and redraw |
 | Escape | Cancel a pending directory read or dismiss its error |
 | . | Toggle hidden entries in the active pane |
@@ -86,6 +92,20 @@ Path entry accepts absolute paths, paths relative to the current pane, and
 Left/Right/Home/End and Backspace/Delete edit the path. Opening the path field
 cancels earlier navigation so relative paths keep the same base while editing.
 Pasting into this field never sends commands to the shell.
+
+The bottom filter searches names in the current Pane, without changing its
+Location or searching recursively. It uses fzf's default fuzzy, smart-case,
+Unicode-normalized and extended query matching, preserving the Pane's sort order.
+Enter returns to browsing matches; `/` resumes editing; Esc clears and closes
+the filter; Ctrl+U clears its query while editing. Tab switches Panes, each with
+its own query. Ctrl+L still opens path entry, including absolute paths.
+
+Every query change clears all marks; reopening an unchanged query preserves
+them. Queries survive refresh, sorting and hidden-entry changes, and clear after
+successful navigation to another Location. Reference rows remain available even
+with no matching entries. Missing or failing fzf keeps the last usable listing;
+Esc closes the filter so browsing can continue. User `FZF_*` settings do not
+override LightHouse's matching or output contract.
 
 Each pane starts in the launch directory and keeps its own location, cursor,
 marks, scroll position, hidden-file setting, and sorting. Directories sort first.
@@ -275,7 +295,7 @@ errors, partial completion, and stale sources.
 - Overwrite/merge handling, cross-filesystem moves, editor/viewer launching,
   directory synchronization, the broader widget set/signals, and native plugins
   are not implemented yet.
-- Browsing is keyboard-driven; mouse interaction, search/filtering, automatic
+- Browsing is keyboard-driven; mouse interaction, recursive search, automatic
   refresh, and persistent navigation history are later work.
 - Mouse routing, clipboard integration, image protocols, and enhanced host
   keyboard protocols are deferred. Input currently uses conventional xterm

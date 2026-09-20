@@ -603,7 +603,7 @@ const Implementation = struct {
                 self.last_pane = self.focus;
             },
             .path => try self.openPath(false),
-            .absolute_path => try self.openPath(true),
+            .filter => try self.activePane().setFilter(self.activePane().view().filter.query),
             .refresh => {
                 self.force_redraw = true;
                 try self.activePane().refresh();
