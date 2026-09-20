@@ -14,3 +14,6 @@ pub const failure: ui.Style = .{ .fg = .{ .r = 255, .g = 130, .b = 130 } };
 pub const disabled_key: ui.Rgb = .{ .r = 110, .g = 120, .b = 133 };
 pub const action: ui.Style = .{ .fg = .{ .r = 15, .g = 26, .b = 33 }, .bg = accent.fg };
 pub const disabled_action: ui.Style = .{ .fg = .{ .r = 133, .g = 153, .b = 164 }, .bg = .{ .r = 39, .g = 54, .b = 65 } };
+
+/// Readable keyboard controls on both ordinary and problem dialogs.
+pub const dialog_control: ui.Style = .{ .fg = .{ .r = 240, .g = 244, .b = 250 }, .bg = .{ .r = 73, .g = 91, .b = 116 }, .bold = true };

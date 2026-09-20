@@ -14,6 +14,7 @@ test {
     _ = @import("app/controller.zig");
     _ = @import("app/layout.zig");
     _ = @import("app/view.zig");
+    _ = @import("app/widgets/dialogs.zig");
     _ = @import("core/directory.zig");
     _ = @import("core/pane.zig");
     _ = @import("core/operations.zig");

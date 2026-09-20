@@ -314,6 +314,15 @@ exit returns immediately, while failure retains the emulator output until
 acknowledgement. Host shutdown releases/reaps both sessions before restoring
 the console. Configuration and argument syntax are documented in README.
 
+## Copy/move destination entry
+
+Copy and Move / Rename show the operation title, a labeled source summary and
+a separately labeled Destination path input. The bottom shortcut controls use
+contrasting backgrounds and wrap on narrow terminals. Content spacing contracts
+with the available height; validation stays above the footer. Very short windows
+prioritize the editable field and omit groups that cannot fit. Go to directory
+and Create directory keep their existing compact layouts and key bindings.
+
 ## Copy/move decisions
 
 One retained Job owns execution, decision waiting, cancellation and the result.
