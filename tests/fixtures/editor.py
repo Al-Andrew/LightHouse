@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Deterministic full-area editor fixture; needs no installed interactive editor."""
+
 import json
 import os
 import signal
@@ -16,8 +17,21 @@ tty.setraw(0)
 
 def publish(*_):
     size = os.get_terminal_size(0)
-    report.write_text(json.dumps({"argv": sys.argv[2:], "cwd": os.getcwd(), "pid": os.getpid(), "size": [size.columns, size.lines], "input": received.hex()}))
-    os.write(1, f"\x1b[2J\x1b[HEDITOR_READY\x1b[{size.lines};1HEDITOR_BOTTOM\x1b[2;1H".encode())
+    report.write_text(
+        json.dumps(
+            {
+                "argv": sys.argv[2:],
+                "cwd": os.getcwd(),
+                "pid": os.getpid(),
+                "size": [size.columns, size.lines],
+                "input": received.hex(),
+            }
+        )
+    )
+    os.write(
+        1,
+        f"\x1b[2J\x1b[HEDITOR_READY\x1b[{size.lines};1HEDITOR_BOTTOM\x1b[2;1H".encode(),
+    )
 
 
 signal.signal(signal.SIGWINCH, publish)

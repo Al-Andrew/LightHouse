@@ -31,7 +31,13 @@ def external_editor():
         report = root / "report"
         argv = [sys.executable, FIXTURE, str(report), "fixed spaces", "$(touch BAD)"]
         (config / "config.json").write_text(json.dumps({"editor": argv}))
-        app = App(cwd=work, env_overrides={"XDG_CONFIG_HOME": str(root / "config"), "EDITOR": "/invalid/fallback"})
+        app = App(
+            cwd=work,
+            env_overrides={
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "EDITOR": "/invalid/fallback",
+            },
+        )
         try:
             app.start()
             in_pane(app, 0, "1 items")
@@ -44,9 +50,15 @@ def external_editor():
             assert "EDITOR_BOTTOM" in app.screen.text().splitlines()[-1]
             payload = b"\x07\nq\x1bOS\x1b[200~pasted\x07\n\x1b[201~"
             app.send(payload)
-            wait(app, lambda: read_report(report).get("input") == payload.hex(), "tool input interception")
+            wait(
+                app,
+                lambda: read_report(report).get("input") == payload.hex(),
+                "tool input interception",
+            )
             app.resize(80, 24)
-            wait(app, lambda: read_report(report).get("size") == [80, 24], "tool resize")
+            wait(
+                app, lambda: read_report(report).get("size") == [80, 24], "tool resize"
+            )
             app.send("\x18")
             app.expect("Name")
             in_pane(app, 0, "created-by-tool")
@@ -62,7 +74,9 @@ def external_editor():
             app.send("\x19")
             app.expect("Editor exited unsuccessfully")
             app.expect("FAILED_FINAL_OUTPUT")
-            app.send("\r")
+            app.send("\r" + F4)  # Dismiss and relaunch in one host-input batch.
+            app.expect("EDITOR_READY")
+            app.send("\x18")
             app.expect("Name")
             app.send("q")
             app.finished()
@@ -81,18 +95,32 @@ def editor_configuration():
         target.write_text("initial")
         report = root / "report"
         settings = config / "config.json"
+        bad_executable = root / "invalid-executable"
+        bad_executable.write_text("not an executable format")
+        bad_executable.chmod(0o755)
         cases = [
+            (json.dumps({"editor": [str(bad_executable)]}), "/bin/true", "SpawnFailed"),
             (None, "", "Configure editor argv"),
             ("{bad", "/bin/true", "Invalid editor configuration"),
             ('{"editor":[]}', "/bin/true", "Invalid editor configuration"),
-            ('{"editor":["/no/such/editor"]}', "/bin/true", "Configured editor executable"),
+            (
+                '{"editor":["/no/such/editor"]}',
+                "/bin/true",
+                "Configured editor executable",
+            ),
             (None, "unterminated '", "Invalid quoted arguments"),
         ]
         for explicit, fallback, error in cases:
             settings.unlink(missing_ok=True)
             if explicit is not None:
                 settings.write_text(explicit)
-            app = App(cwd=work, env_overrides={"XDG_CONFIG_HOME": str(root / "config"), "EDITOR": fallback})
+            app = App(
+                cwd=work,
+                env_overrides={
+                    "XDG_CONFIG_HOME": str(root / "config"),
+                    "EDITOR": fallback,
+                },
+            )
             try:
                 app.start()
                 in_pane(app, 0, "1 items")
@@ -103,14 +131,30 @@ def editor_configuration():
             finally:
                 app.close()
         settings.write_text("{}")
-        fallback = " ".join(shlex.quote(arg) for arg in [sys.executable, FIXTURE, str(report), "quoted ' argument", "$(literal)"])
-        app = App(cwd=work, env_overrides={"XDG_CONFIG_HOME": str(root / "config"), "EDITOR": fallback})
+        fallback = " ".join(
+            shlex.quote(arg)
+            for arg in [
+                sys.executable,
+                FIXTURE,
+                str(report),
+                "quoted ' argument",
+                "$(literal)",
+            ]
+        )
+        app = App(
+            cwd=work,
+            env_overrides={"XDG_CONFIG_HOME": str(root / "config"), "EDITOR": fallback},
+        )
         try:
             app.start()
             in_pane(app, 0, "1 items")
             app.send("\x1b[B" + F4)
             app.expect("EDITOR_READY")
-            assert read_report(report)["argv"] == ["quoted ' argument", "$(literal)", str(target)]
+            assert read_report(report)["argv"] == [
+                "quoted ' argument",
+                "$(literal)",
+                str(target),
+            ]
             app.send("\x18")
             app.expect("Name")
             app.send("q")
@@ -132,8 +176,17 @@ def editor_eligibility_and_shutdown():
         (work / "c-file").write_text("edit this")
         (work / "d-marked").write_text("keep marked")
         report = root / "report"
-        (config / "config.json").write_text(json.dumps({"editor": [sys.executable, FIXTURE, str(report)]}))
-        app = App(cwd=work, env_overrides={"XDG_CONFIG_HOME": "", "HOME": str(root), "EDITOR": "/invalid/fallback"})
+        (config / "config.json").write_text(
+            json.dumps({"editor": [sys.executable, FIXTURE, str(report)]})
+        )
+        app = App(
+            cwd=work,
+            env_overrides={
+                "XDG_CONFIG_HOME": "",
+                "HOME": str(root),
+                "EDITOR": "/invalid/fallback",
+            },
+        )
         pid = None
         try:
             app.start()
@@ -159,8 +212,11 @@ def editor_eligibility_and_shutdown():
             app.close()
 
 
-
 if __name__ == "__main__":
-    for test in [external_editor, editor_configuration, editor_eligibility_and_shutdown]:
+    for test in [
+        external_editor,
+        editor_configuration,
+        editor_eligibility_and_shutdown,
+    ]:
         test()
         print("PASS", test.__name__)

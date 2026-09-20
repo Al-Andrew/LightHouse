@@ -38,7 +38,18 @@ def directory_browsing():
                 "shell must follow the pane border directly"
             )
             for index, label in enumerate(
-                ["Help", "", "", "Edit", "Copy", "RenMov", "Mkdir", "Delete", "", "Quit"]
+                [
+                    "Help",
+                    "",
+                    "",
+                    "Edit",
+                    "Copy",
+                    "RenMov",
+                    "Mkdir",
+                    "Delete",
+                    "",
+                    "Quit",
+                ]
             ):
                 assert lines[-1][
                     index * 16 : (index + 1) * 16

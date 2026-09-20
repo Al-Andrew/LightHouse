@@ -13,7 +13,10 @@ pub const Tool = struct {
 
     pub fn start(context: *anyopaque, argv: []const [:0]const u8, cwd: []const u8) !*Emulator {
         const self: *Tool = @ptrCast(@alignCast(context));
-        if (self.session != null) return error.ToolBusy;
+        if (self.session) |session| {
+            if (session.pty != null) return error.ToolBusy;
+            self.release();
+        }
         const session = try Session.create(self.io, self.allocator, argv[0], cwd, self.dimensions, self.termios);
         errdefer session.destroy();
         try session.startCommand(argv, cwd);

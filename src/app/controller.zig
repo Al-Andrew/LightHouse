@@ -325,6 +325,10 @@ const Implementation = struct {
     decision_id: usize = 0,
     decision_all: bool = false,
 
+    fn foregroundBusy(self: *const Implementation) bool {
+        return self.modal != .none or self.operation != null or self.tool != .none;
+    }
+
     fn activePane(self: *const Implementation) *Pane {
         return self.panes[if (self.last_pane == .right) @as(usize, 1) else 0];
     }
@@ -341,7 +345,7 @@ const Implementation = struct {
     }
 
     fn openPath(self: *Implementation, absolute: bool) !void {
-        if (self.modal != .none or self.operation != null or self.tool != .none) return error.WorkflowBusy;
+        if (self.foregroundBusy()) return error.WorkflowBusy;
         const pane = self.activePane();
         const initial = if (absolute) try pane.rootInput(self.allocator) else try self.allocator.dupe(u8, pane.location().locator);
         defer self.allocator.free(initial);
@@ -353,7 +357,7 @@ const Implementation = struct {
     }
 
     fn openAction(self: *Implementation, kind: operations.Kind) !void {
-        if (self.modal != .none or self.operation != null or self.tool != .none) return error.WorkflowBusy;
+        if (self.foregroundBusy()) return error.WorkflowBusy;
         if (kind == .delete) return self.openDelete();
         const pane = self.activePane();
         if (!self.actionAvailable(kind)) return;
@@ -387,7 +391,7 @@ const Implementation = struct {
     }
 
     fn openDelete(self: *Implementation) !void {
-        if (self.modal != .none or self.operation != null or self.tool != .none) return error.WorkflowBusy;
+        if (self.foregroundBusy()) return error.WorkflowBusy;
         const pane = self.activePane();
         if (!self.actionAvailable(.delete)) return;
         // Own the exact names shown in the confirmation, independent of scans.
@@ -487,7 +491,7 @@ const Implementation = struct {
     }
 
     fn toggleTerminal(self: *Implementation) void {
-        if (self.modal != .none or self.operation != null or self.tool != .none or !self.terminal_visible or !self.terminal_exists) return;
+        if (self.foregroundBusy() or !self.terminal_visible or !self.terminal_exists) return;
         if (self.focus == .terminal) {
             self.focus = self.last_pane;
             self.zoom = false;
@@ -507,7 +511,7 @@ const Implementation = struct {
     }
 
     fn showTerminal(self: *Implementation) void {
-        if (self.modal != .none or self.operation != null or self.tool != .none) return;
+        if (self.foregroundBusy()) return;
         self.ensureTerminal() catch |err| {
             self.modal = .{ .notice = @errorName(err) };
             return;
@@ -552,7 +556,8 @@ const Implementation = struct {
         var command = try Editor.load(self.io, self.allocator, cwd, file);
         defer command.deinit();
         const host = self.tool_host orelse return error.ToolLaunchUnavailable;
-        self.tool = .{ .running = try host.start(host.context, command.argv, cwd) };
+        const emulator = try host.start(host.context, command.argv, cwd);
+        self.tool = .{ .running = emulator };
     }
 
     fn available(self: *const Implementation, id: commands.Id) bool {
