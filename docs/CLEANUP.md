@@ -12,7 +12,12 @@ build script, and Python integration suites before further feature work.
 - **Strategy:** `directory.Provider` already separates directory scans from pane
   state through a callback and context. Keep this interface for new providers.
 - **Adapter:** `terminal.Emulator` already isolates Ghostty state, rendering, and
-  key encoding. Queue admission now lives beside the queue's capacity policy.
+  key and paste event encoding. The adapter captures paste framing mode once per
+  paste, owns queue admission beside capacity policy, and exposes semantic page
+  scrolling. Application code consumes these operations without inspecting
+  Ghostty fields. Layout owns presentation size bounds and accepts toolkit
+  geometry; host conversion stays in the event loop alongside synchronized
+  emulator/PTY resizing.
 - **Composition:** shared dialog framing and painter insets provide reusable UI
   operations; the path editor owns its rendering and caret placement. Styles
   remain caller-supplied, with the application palette in `ui/theme.zig`.

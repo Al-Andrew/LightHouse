@@ -102,7 +102,14 @@ application state; call `node.invalidate()` when an external update needs paint.
 rectangles with `setRect`; a parent may use `child.measure(available)` to obtain
 a clamped preferred size. The library provides horizontal/vertical equal-share
 boxes and centered geometry. Applications can supply custom layouts using the
-same interface. The file-pane widget updates its viewport during layout, even
+same interface. Application layout and view accept toolkit `Size` values.
+`Layout.boundedSize` limits presentation geometry to nonzero dimensions and a
+bounded allocation size. `App` converts host dimensions at the event-loop seam
+and derives both emulator and PTY sizes from the same layout, including zoom,
+compact, and one-cell windows. Linux continues to own the outer console and PTY
+lifecycle; `App` retains nonblocking transport scheduling.
+
+The file-pane widget updates its viewport during layout, even
 when a compact window gives it no visible rows.
 
 `Tree.paint(frame)` walks the tree in child order, creating nested clipped
@@ -124,10 +131,19 @@ handler returns `true`. `false` allows a parent to interpret an unhandled comman
 `View.event` is the sole application input entry point. File-pane widgets handle
 local navigation and marking; unhandled global bindings bubble to the root's
 `State.globalEvent`. The root never retries pane bindings. Terminal input is
-handled by the terminal widget; only Ctrl+G bubbles to the root. Modal widgets
+handled by the terminal widget; only Ctrl+G key events bubble to the root. Modal widgets
 call `State.modalEvent` and consume every event, including ignored paste events.
 The controller owns focus policy; the view only projects its observed focus and
 modal visibility into the tree.
+
+Terminal input is handled by the terminal widget; Ctrl+G key events bubble to the
+app. Paste bytes, including Ctrl+G, stay terminal data. The widget forwards keys
+and paste events through `Emulator.event`; the emulator owns paste state, captures
+bracketed-paste mode at paste start, and frames the entire paste using that mode
+even if child output changes it before paste end. Key encoding and VT replies
+share its bounded output queue. `Emulator.scrollPage(.up/.down)` keeps page size
+and Ghostty viewport state behind the terminal interface. Keys and paste start
+return the viewport to the bottom.
 
 `Tree.setModal(node)` establishes one modal scope. Input cannot escape that
 subtree, including ignored events and the event that opens or closes the modal.

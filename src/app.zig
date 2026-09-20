@@ -25,7 +25,7 @@ pub const App = struct {
     panes: [2]*Pane,
     state: *State,
     view: *View,
-    size: platform.Size,
+    size: toolkit.Size,
     layout: Layout,
     current: ui.Frame,
     previous: ui.Frame,
@@ -40,7 +40,7 @@ pub const App = struct {
     pub fn init(io: std.Io, allocator: std.mem.Allocator, shell: [:0]const u8) !App {
         var console = try platform.Console.init();
         errdefer console.deinit();
-        const size = platform.Console.size();
+        const size = screenSize(platform.Console.size());
         const layout = Layout.calculate(size, 0, false);
         var pty = try platform.Pty.spawn(shell, terminalSize(layout), &console.saved);
         errdefer pty.deinit();
@@ -125,7 +125,7 @@ pub const App = struct {
     }
 
     fn resize(self: *App) !void {
-        const size = platform.Console.size();
+        const size = screenSize(platform.Console.size());
         const layout = Layout.calculate(size, self.state.view().adjustment, self.state.view().zoom);
         if (std.meta.eql(self.size, size) and std.meta.eql(self.layout, layout)) return;
         self.size = size;
@@ -215,4 +215,10 @@ pub const App = struct {
 
 fn terminalSize(layout: Layout) platform.Size {
     return .{ .cols = @intCast(layout.terminal.width), .rows = @intCast(layout.terminal.height) };
+}
+
+// Convert the host's geometry once at the event-loop boundary. Both the view
+// and PTY/emulator layout use this same nonzero, allocation-bounded size.
+fn screenSize(size: platform.Size) toolkit.Size {
+    return Layout.boundedSize(.{ .width = size.cols, .height = size.rows });
 }
