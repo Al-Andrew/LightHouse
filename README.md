@@ -54,6 +54,7 @@ the shell is focused, where function keys pass through to the child.
 | Key | Action |
 | --- | --- |
 | Ctrl+G | Switch focus between the visible shell and last active Pane; leave zoom |
+| Ctrl+F | Insert the Cursor entry’s Provider reference into the shell without Enter |
 | Ctrl+J | Hide/show the shell; start a fresh session if absent |
 | Up / Down / PageUp / PageDown / Home / End | Move the file cursor |
 | Enter / Right | Enter a directory or directory symlink |
@@ -270,3 +271,14 @@ errors, partial completion, and stale sources.
 - Quitting ends the embedded shell session. There is no detach/session recovery.
 - Automated PTY coverage is not a substitute for testing a range of terminal
   emulators and SSH configurations; that compatibility pass is still pending.
+
+Ctrl+F from a Pane uses the Cursor entry independently of Marks; the Parent row
+is excluded. The local Provider supplies absolute paths for files, directories,
+and symlinks (the link's own path). LightHouse applies POSIX shell single quoting
+and exactly one trailing space, preserves existing input, and never sends Enter.
+Control-character references are rejected. This quoting targets sh/Bash/Zsh;
+the current foreground program receives the bytes even when it is not a shell.
+Hidden sessions are reused and absent sessions are started only after reference
+validation. Resolution, launch and queue failures explain the problem without
+inserting a prefix or moving focus. Jobs/results, modals and tools block insertion.
+Ctrl+F with terminal focus remains normal child input.

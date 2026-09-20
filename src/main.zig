@@ -32,6 +32,7 @@ pub fn main(init: std.process.Init) !void {
                 "In panes: arrows/PageUp/PageDown navigate, Enter opens directories,\n" ++
                 "Backspace goes up, Tab switches pane, Space/Insert marks entries.\n" ++
                 "Shift+Up/Down/Home/End toggles marks while moving.\n" ++
+                "Ctrl+F inserts the Cursor reference into the shell without Enter.\n" ++
                 "Ctrl+L enters a path, Ctrl+R refreshes, . toggles hidden files,\n" ++
                 "s cycles sorting, r reverses it, F1 shows help, q/F10 quits.\n" ++
                 "F5 copies, F6 moves/renames, F7 creates a directory, F8 deletes.\n" ++

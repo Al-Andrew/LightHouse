@@ -53,7 +53,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&check_ui.step);
     b.step("test-ui", "Test the UI library independently of the application").dependOn(&check_ui.step);
     const integration_step = b.step("test-integration", "Run Linux PTY integration checks (requires Python 3)");
-    for ([_][]const u8{ "tests/pty_smoke.py", "tests/browsing.py", "tests/operations.py" }) |script| {
+    for ([_][]const u8{ "tests/pty_smoke.py", "tests/browsing.py", "tests/operations.py", "tests/insertion.py" }) |script| {
         const integration = b.addSystemCommand(&.{ "python3", "-u" });
         integration.addFileArg(b.path(script));
         integration.addArtifactArg(exe);

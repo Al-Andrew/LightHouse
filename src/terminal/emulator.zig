@@ -94,6 +94,21 @@ pub const Emulator = struct {
         if (self.pending.items.len + bytes.len > max_pending_bytes) return error.TerminalInputBackpressure;
         try self.pending.appendSlice(self.allocator, bytes);
     }
+    /// Admit one entire insertion, including paste framing, or leave the queue
+    /// unchanged. Physical delivery can still use normal short PTY writes.
+    pub fn insert(self: *Emulator, bytes: []const u8) !void {
+        const bracketed = self.terminal.modes.get(.bracketed_paste);
+        const framing: usize = if (bracketed) input.paste_start.len + input.paste_end.len else 0;
+        const remaining = self.pending.items.len - self.pending_offset;
+        if (bytes.len > max_pending_bytes - remaining or framing > max_pending_bytes - remaining - bytes.len) return error.TerminalInputBackpressure;
+        // Reserve before touching queue contents, offsets or viewport.
+        try self.pending.ensureUnusedCapacity(self.allocator, bytes.len + framing);
+        if (bracketed) self.pending.appendSliceAssumeCapacity(input.paste_start);
+        self.pending.appendSliceAssumeCapacity(bytes);
+        if (bracketed) self.pending.appendSliceAssumeCapacity(input.paste_end);
+        self.bottom();
+    }
+
     pub fn acceptsInput(self: *const Emulator) bool {
         return self.pending.items.len - self.pending_offset < input_high_water_bytes;
     }
@@ -331,4 +346,25 @@ test "page scrolling uses resized height and input returns to the bottom" {
     try emulator.event(&.{ .kind = .paste_start });
     try emulator.paint(frame.painter(rect), true);
     try std.testing.expectEqualStrings("7", frame.cells[0].text);
+}
+
+test "whole insertion rejects allocation and backpressure without queueing framing or prefix" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const emulator = try Emulator.create(std.testing.io, failing.allocator(), 80, 8);
+    defer emulator.destroy();
+    try emulator.insert("existing");
+    try emulator.feed("\x1b[?2004h");
+    const before = try std.testing.allocator.dupe(u8, emulator.queued());
+    defer std.testing.allocator.free(before);
+    const large = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(large);
+    @memset(large, 'x');
+    try std.testing.expectError(error.TerminalInputBackpressure, emulator.insert(large));
+    try std.testing.expectEqualStrings(before, emulator.queued());
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, emulator.insert(large[0..10000]));
+    try std.testing.expectEqualStrings(before, emulator.queued());
+    failing.fail_index = std.math.maxInt(usize);
+    try emulator.insert("'path' ");
+    try std.testing.expectEqualStrings("existing\x1b[200~'path' \x1b[201~", emulator.queued());
 }

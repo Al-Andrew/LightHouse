@@ -15,9 +15,17 @@ pub const Opaque = struct {
     missing_a: bool = false,
     fail: bool = false,
     resolve_failure: ?anyerror = null,
+    insertion_supported: bool = true,
+    entry_reference: ?[]const u8 = null,
 
     pub fn provider(self: *Opaque) directory.Provider {
-        return .{ .identity = self, .context = self, .resolve = resolve, .has_parent = hasParent, .parent_hint = parentHint, .display = display, .capabilities = capabilities, .scan = scan };
+        return .{ .identity = self, .context = self, .resolve = resolve, .has_parent = hasParent, .parent_hint = parentHint, .display = display, .capabilities = capabilities, .scan = scan, .reference = reference };
+    }
+    fn reference(context: ?*anyopaque, allocator: std.mem.Allocator, _: []const u8, entry: directory.Entry) ![]const u8 {
+        const self: *Opaque = @ptrCast(@alignCast(context.?));
+        if (!self.insertion_supported) return error.UnsupportedReference;
+        if (self.entry_reference) |value| return allocator.dupe(u8, value);
+        return std.fmt.allocPrint(allocator, "vault:{s}", .{entry.name});
     }
     fn resolve(context: ?*anyopaque, allocator: std.mem.Allocator, base: []const u8, request: directory.Resolution) ![]const u8 {
         const self: *Opaque = @ptrCast(@alignCast(context.?));
