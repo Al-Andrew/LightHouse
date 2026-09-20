@@ -337,7 +337,8 @@ const Implementation = struct {
             }
             return;
         }
-        const destination_stat = Dir.cwd().statFile(self.io, self.destination, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        const classification_path = std.mem.trimEnd(u8, self.destination, "/");
+        const destination_stat = Dir.cwd().statFile(self.io, if (classification_path.len == 0) "/" else classification_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
@@ -457,14 +458,18 @@ const Implementation = struct {
 
     const Consent = struct { source: std.Io.File.Stat, destination: ?std.Io.File.Stat };
 
-    fn consent(self: *Implementation, source: []const u8, target: []const u8, fresh: bool) !?Consent {
+    fn consent(self: *Implementation, source: []const u8, target: []const u8, fresh: bool, entry_changed: bool) !?Consent {
         var force_prompt = fresh;
+        var changed = entry_changed;
         while (true) {
             try self.check();
             const from = (try self.entryStat(source)) orelse return error.FileNotFound;
             try self.validateTarget(source, target, from.kind == .directory);
             const to = try self.entryStat(target);
-            if (to == null or (from.kind == .directory and to.?.kind == .directory)) return .{ .source = from, .destination = to };
+            if (to == null or (from.kind == .directory and to.?.kind == .directory)) {
+                if (changed) return error.EntriesChanged;
+                return .{ .source = from, .destination = to };
+            }
             const category: Conflict = if (from.kind == .directory or to.?.kind == .directory) .mismatch else if (from.kind == .sym_link or to.?.kind == .sym_link) .symlink else .file;
             const choice = if (!force_prompt and self.conflict_policies[@intFromEnum(category)] != null)
                 self.conflict_policies[@intFromEnum(category)].?
@@ -473,6 +478,7 @@ const Implementation = struct {
                 // Never store consent for entries changed while a prompt was open.
                 if (!same(from, try self.entryStat(source)) or !same(to, try self.entryStat(target))) {
                     force_prompt = true;
+                    changed = true;
                     continue;
                 }
                 if (self.remember) self.conflict_policies[@intFromEnum(category)] = answer;
@@ -491,7 +497,7 @@ const Implementation = struct {
         while (true) {
             try self.check();
             self.pathError(source);
-            const observed = self.consent(source, target, fresh) catch |err| {
+            const observed = self.consent(source, target, fresh, false) catch |err| {
                 if (try self.recover(source, target, .inspect, err)) {
                     fresh = true;
                     continue;
@@ -520,7 +526,7 @@ const Implementation = struct {
             while (true) {
                 try self.check();
                 if (!same(current.source, try self.entryStat(source)) or !same(current.destination, try self.entryStat(target))) {
-                    current = (try self.consent(source, target, true)) orelse return false;
+                    current = (try self.consent(source, target, true, true)) orelse return false;
                     if (current.source.kind == .directory) return error.SourceChanged;
                 }
                 if (current.destination != null) {
@@ -564,10 +570,12 @@ const Implementation = struct {
         var current = observed;
         while (true) {
             try self.check();
+            try self.publicationParent(output.dir, target);
             if (!same(before, try self.entryStat(source))) return error.SourceChanged;
             if (!same(current.destination, try self.entryStat(target))) {
-                current = (try self.consent(source, target, true)) orelse return false;
+                current = (try self.consent(source, target, true, true)) orelse return false;
                 if (!same(before, current.source)) return error.SourceChanged;
+                try self.publicationParent(output.dir, target);
             }
             self.publishFile(&output, current.destination != null) catch |err| {
                 if (try self.recover(source, target, .publication, err)) continue;
@@ -577,6 +585,12 @@ const Implementation = struct {
             _ = self.transferred.fetchAdd(1, .release);
             return true;
         }
+    }
+
+    fn publicationParent(self: *Implementation, opened: Dir, target: []const u8) !void {
+        const expected = try opened.stat(self.io);
+        const current = try Dir.cwd().statFile(self.io, std.fs.path.dirname(target).?, .{});
+        if (current.kind != .directory or current.inode != expected.inode) return error.DestinationParentChanged;
     }
 
     fn finalizeFile(self: *Implementation, output: *std.Io.File.Atomic, stat: std.Io.File.Stat) !void {
@@ -595,18 +609,25 @@ const Implementation = struct {
         if (len == buffer.len) return error.NameTooLong;
         var random: [16]u8 = undefined;
         self.io.random(&random);
-        const temporary = try std.fmt.allocPrint(self.allocator, "{s}/.lighthouse-link-{x}", .{ std.fs.path.dirname(target).?, &random });
+        const parent = try Dir.openDirAbsolute(self.io, std.fs.path.dirname(target).?, .{});
+        defer parent.close(self.io);
+        const temporary = try std.fmt.allocPrint(self.allocator, ".lighthouse-link-{x}", .{&random});
         defer self.allocator.free(temporary);
-        try Dir.cwd().symLink(self.io, buffer[0..len], temporary, .{});
-        defer Dir.cwd().deleteFile(self.io, temporary) catch {};
+        try parent.symLink(self.io, buffer[0..len], temporary, .{});
+        defer parent.deleteFile(self.io, temporary) catch {};
         var current = observed;
         while (true) {
             try self.check();
+            try self.publicationParent(parent, target);
             if (!same(observed.source, try self.entryStat(source))) return error.SourceChanged;
-            if (!same(current.destination, try self.entryStat(target))) current = (try self.consent(source, target, true)) orelse return false;
+            if (!same(current.destination, try self.entryStat(target))) {
+                current = (try self.consent(source, target, true, true)) orelse return false;
+                if (!same(observed.source, current.source)) return error.SourceChanged;
+                try self.publicationParent(parent, target);
+            }
             if (current.destination != null) {
-                try Dir.cwd().rename(temporary, .cwd(), target, self.io);
-            } else try Dir.cwd().renamePreserve(temporary, .cwd(), target, self.io);
+                try parent.rename(temporary, parent, std.fs.path.basename(target), self.io);
+            } else try parent.renamePreserve(temporary, parent, std.fs.path.basename(target), self.io);
             _ = self.transferred.fetchAdd(1, .release);
             return true;
         }
@@ -1773,4 +1794,132 @@ test "a destination symlink to a directory is a conflict entry rather than a dir
     try waitForJob(job);
     try std.testing.expectEqual(.file, (try tmp.dir.statFile(io, "target", .{})).kind);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "outside/source", .{}));
+}
+
+test "trailing destination separators cannot follow a symlink into another directory" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [Dir.max_path_bytes]u8 = undefined;
+    const base = try testBase(&tmp, &buffer);
+    try tmp.dir.createDir(io, "outside", .default_dir);
+    try tmp.dir.symLink(io, "outside", "target", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "source", .data = "source" });
+    const job = try testJob(.copy, base, &.{"source"}, "target/");
+    defer job.destroy();
+    try std.testing.expectEqual(error.DestinationMustBeDirectory, job.status().finished.failure.?.err);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "outside/source", .{}));
+}
+
+test "destination removed during a Skip prompt requires a fresh decision" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [Dir.max_path_bytes]u8 = undefined;
+    const base = try testBase(&tmp, &buffer);
+    for ([_][]const u8{ "source", "target" }) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = name });
+    const job = try Job.create(io, std.testing.allocator, .copy, base, &.{"source"}, "target");
+    defer job.destroy();
+    try job.start();
+    _ = try waitForDecision(job);
+    try tmp.dir.deleteFile(io, "target");
+    try std.testing.expect(job.decide(.skip, true));
+    try std.testing.expectEqual(error.EntriesChanged, (try waitForDecision(job)).err.?);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "target", .{}));
+    try std.testing.expect(job.decide(.skip, false));
+    try waitForJob(job);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "target", .{}));
+}
+
+test "file publication cannot apply new-path consent to a displaced parent directory" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [Dir.max_path_bytes]u8 = undefined;
+    const base = try testBase(&tmp, &buffer);
+    try tmp.dir.createDir(io, "dest", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "source", .data = "replacement" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "dest/source", .data = "old directory" });
+    var controlled: RecoveryIo = .{ .threaded = .init(std.testing.allocator, .{}), .stage = .file_finalization };
+    defer controlled.threaded.deinit();
+    const job = try Job.create(controlled.io(), std.testing.allocator, .copy, base, &.{"source"}, "dest");
+    defer job.destroy();
+    try job.start();
+    _ = try waitForDecision(job);
+    try std.testing.expect(job.decide(.overwrite, false));
+    try std.testing.expectEqual(Stage.file_finalization, (try waitForDecision(job)).stage);
+    try tmp.dir.rename("dest", tmp.dir, "retired", io);
+    try tmp.dir.createDir(io, "dest", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "dest/source", .data = "new directory" });
+    try std.testing.expect(job.decide(.retry, false));
+    try std.testing.expectEqual(error.DestinationParentChanged, (try waitForDecision(job)).err.?);
+    var data: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("old directory", try tmp.dir.readFile(io, "retired/source", &data));
+    try std.testing.expectEqualStrings("new directory", try tmp.dir.readFile(io, "dest/source", &data));
+    try std.testing.expect(job.decide(.retry, false));
+    _ = try waitForDecision(job);
+    try std.testing.expect(job.decide(.overwrite, false));
+    try waitForJob(job);
+    try std.testing.expectEqualStrings("old directory", try tmp.dir.readFile(io, "retired/source", &data));
+    try std.testing.expectEqualStrings("replacement", try tmp.dir.readFile(io, "dest/source", &data));
+    try std.testing.expectEqual(@as(u64, 11), job.status().progress().bytes);
+}
+
+const LinkPreparationGate = struct {
+    threaded: std.Io.Threaded,
+    vtable: std.Io.VTable = undefined,
+    entered: std.Io.Event = .unset,
+    released: std.Io.Event = .unset,
+    fn io(self: *LinkPreparationGate) std.Io {
+        const base = self.threaded.io();
+        self.vtable = base.vtable.*;
+        self.vtable.dirSymLink = symlink;
+        return .{ .userdata = base.userdata, .vtable = &self.vtable };
+    }
+    fn symlink(context: ?*anyopaque, dir: Dir, target: []const u8, path: []const u8, flags: Dir.SymLinkFlags) Dir.SymLinkError!void {
+        const threaded: *std.Io.Threaded = @ptrCast(@alignCast(context.?));
+        const self: *LinkPreparationGate = @fieldParentPtr("threaded", threaded);
+        const base = self.threaded.io();
+        try base.vtable.dirSymLink(base.userdata, dir, target, path, flags);
+        self.entered.set(base);
+        try self.released.wait(base);
+    }
+};
+
+test "renewed symlink consent cannot publish the old source link contents" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [Dir.max_path_bytes]u8 = undefined;
+    const base = try testBase(&tmp, &buffer);
+    try tmp.dir.symLink(io, "old-link", "source", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "target", .data = "old destination" });
+    var gate: LinkPreparationGate = .{ .threaded = .init(std.testing.allocator, .{}) };
+    defer gate.threaded.deinit();
+    const job = try Job.create(gate.io(), std.testing.allocator, .copy, base, &.{"source"}, "target");
+    defer job.destroy();
+    defer gate.released.set(gate.threaded.io());
+    try job.start();
+    _ = try waitForDecision(job);
+    try std.testing.expect(job.decide(.overwrite, false));
+    for (0..5000) |_| {
+        if (gate.entered.isSet()) break;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(gate.entered.isSet());
+    try tmp.dir.writeFile(io, .{ .sub_path = "target", .data = "changed destination" });
+    gate.released.set(gate.threaded.io());
+    _ = try waitForDecision(job);
+    try tmp.dir.deleteFile(io, "source");
+    try tmp.dir.symLink(io, "new-link", "source", .{});
+    try std.testing.expect(job.decide(.overwrite, false));
+    _ = try waitForDecision(job);
+    try std.testing.expect(job.decide(.overwrite, false));
+    try std.testing.expectEqual(error.SourceChanged, (try waitForDecision(job)).err.?);
+    try std.testing.expect(job.decide(.retry, false));
+    _ = try waitForDecision(job);
+    try std.testing.expect(job.decide(.overwrite, false));
+    try waitForJob(job);
+    var data: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("new-link", data[0..try tmp.dir.readLink(io, "target", &data)]);
 }

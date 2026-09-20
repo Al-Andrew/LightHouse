@@ -388,6 +388,8 @@ const Implementation = struct {
         // This ownership transfer happens once; launch failures stay in the job.
         job.start() catch unreachable;
         self.operation = job;
+        self.decision_id = 0;
+        self.decision_all = false;
     }
 
     fn openDelete(self: *Implementation) !void {
@@ -414,6 +416,8 @@ const Implementation = struct {
             if (job.status() == .finished) {
                 job.destroy();
                 self.operation = null;
+                self.decision_id = 0;
+                self.decision_all = false;
             } else job.cancel();
         }
     }
@@ -1140,11 +1144,26 @@ test "waiting file decisions block every terminal route through retained result 
         try std.testing.expectEqual(prompt.id, state.view().operation.?.status().waiting.prompt.id);
     }
     try panes.expectScans(1);
-    try std.testing.expect(state.decideOperation(.skip, false));
+    var decoder: input.Decoder = .{};
+    const space = decoder.feed(' ').?;
+    try state.modalEvent(emulator, &space);
+    try std.testing.expect(state.view().decision_all);
+    try std.testing.expect(state.decideOperation(.skip, true));
     try settle(state);
     try panes.expectScans(2);
     try std.testing.expectEqual(@as(usize, 1), state.view().operation.?.status().progress().skipped);
     for (routes) |id| try std.testing.expect(!try state.invoke(id, emulator));
     state.dismiss();
     try std.testing.expect(state.available(.visibility_terminal));
+    try state.openAction(.copy);
+    try state.submit("dest");
+    for (0..5000) |_| {
+        _ = try state.poll();
+        if (state.view().operation.?.status() == .waiting) break;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(state.view().operation.?.status() == .waiting);
+    try std.testing.expect(!state.view().decision_all);
+    try std.testing.expect(state.decideOperation(.skip, false));
+    try settle(state);
 }
