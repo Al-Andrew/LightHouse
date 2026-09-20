@@ -97,7 +97,7 @@ fn paintListing(painter: ui.Painter, view: Pane.View, focused: bool) !void {
         if (entry) |item| {
             if (item.directory) style.fg = accent.fg;
             if (item.kind == .sym_link) style.fg = theme.symlink;
-            if (item.selected) style.fg = theme.marked;
+            if (item_row.marked) style.fg = theme.marked;
         }
         if (item_row.focused) {
             style.bg = if (focused) theme.selection else theme.inactive_selection;
@@ -106,7 +106,7 @@ fn paintListing(painter: ui.Painter, view: Pane.View, focused: bool) !void {
         const row = inside.child(.{ .x = 0, .y = row_index + 1, .width = width, .height = 1 });
         row.fill(style);
         if (entry) |item| {
-            row.label(0, 0, if (item.selected) "*" else " ", style);
+            row.label(0, 0, if (item_row.marked) "*" else " ", style);
             row.label(1, 0, if (item.kind == .sym_link) "@" else if (item.directory) "/" else " ", style);
             try row.child(.{ .x = 2, .y = 0, .width = name_width, .height = 1 }).text(0, 0, item.name, style);
             if (with_size) {
