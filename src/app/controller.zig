@@ -11,6 +11,7 @@ const operations = @import("../core/operations.zig");
 const Layout = @import("layout.zig").Layout;
 const dialogs = @import("widgets/dialogs.zig");
 const paintOperation = dialogs.paintOperation;
+const commands = @import("commands.zig");
 
 pub const Focus = enum { left, right, terminal };
 // A tagged state owns exactly one modal payload. An action cannot outlive its
@@ -123,14 +124,26 @@ pub const State = opaque {
         state.implementation().toggleTerminal();
     }
 
+    /// Cheap observation only: no allocation, I/O, polling, or state changes.
+    pub fn available(state: *const State, id: commands.Id) bool {
+        const self: *const Implementation = @ptrCast(@alignCast(state));
+        return self.available(id);
+    }
+
+    /// Rechecks current context. False explicitly rejects an unavailable action.
+    /// The emulator is borrowed for this call only, never retained.
+    pub fn invoke(state: *State, id: commands.Id, emulator: *Emulator) !bool {
+        return state.implementation().invoke(id, emulator);
+    }
+
     /// Root bindings only. Pane and terminal input stay in their widgets.
     pub fn globalEvent(state: *State, emulator: *Emulator, ev: *const input.Event) !void {
         try state.implementation().globalEvent(emulator, ev);
     }
 
     /// Called only by the modal widget, whose tree scope consumes every event.
-    pub fn modalEvent(state: *State, ev: *const input.Event) !void {
-        try state.implementation().modalEvent(ev);
+    pub fn modalEvent(state: *State, emulator: *Emulator, ev: *const input.Event) !void {
+        try state.implementation().modalEvent(emulator, ev);
     }
 
     pub fn requestRedraw(state: *State) void {
@@ -171,10 +184,6 @@ pub const State = opaque {
         return @ptrCast(@alignCast(state));
     }
 };
-
-fn isToggleTerminal(ev: *const input.Event) bool {
-    return ev.len == 1 and ev.bytes[0] == input.control('g');
-}
 
 const Implementation = struct {
     io: std.Io,
@@ -280,7 +289,7 @@ const Implementation = struct {
         }
     }
 
-    fn modalEvent(self: *Implementation, ev: *const input.Event) !void {
+    fn modalEvent(self: *Implementation, emulator: *Emulator, ev: *const input.Event) !void {
         switch (self.modal) {
             .confirm_delete => {
                 // Paste contents cannot confirm or dismiss a destructive action.
@@ -309,18 +318,13 @@ const Implementation = struct {
             .none => {},
         }
         if (ev.kind != .key) return;
-        if (isToggleTerminal(ev)) {
-            self.toggleTerminal();
+        if (commands.resolve(ev)) |id| {
+            // Availability admits only job quit and Ctrl+G in this scope.
+            _ = try self.invoke(id, emulator);
             return;
         }
         if (self.operation) |job| {
-            const finished = job.status() == .finished;
-            if (ev.key == .f10 or (ev.key == .text and ev.len == 1 and ev.bytes[0] == 'q')) {
-                self.quit = true;
-            } else if (ev.key == .escape or (ev.key == .enter and finished)) {
-                self.dismiss();
-            }
-            return;
+            if (ev.key == .escape or (ev.key == .enter and job.status() == .finished)) self.dismiss();
         }
     }
 
@@ -335,52 +339,51 @@ const Implementation = struct {
         }
     }
 
-    fn globalEvent(self: *Implementation, emulator: *Emulator, ev: *const input.Event) !void {
-        if (self.modal != .none or ev.kind != .key) return;
-        if (isToggleTerminal(ev)) {
-            self.toggleTerminal();
-            return;
-        }
-        if (self.focus == .terminal or self.operation != null) return;
-        const pane = self.activePane();
-        switch (ev.key) {
-            .f1 => self.modal = .help,
-            .f5 => try self.openAction(.copy),
-            .f6 => try self.openAction(.move),
-            .f7 => try self.openAction(.mkdir),
-            .f8 => try self.openDelete(),
-            .tab => {
+    fn available(self: *const Implementation, id: commands.Id) bool {
+        if (self.modal != .none) return false;
+        if (id == .toggle_terminal) return true;
+        if (self.focus == .terminal) return false;
+        if (self.operation != null) return id == .quit;
+        return switch (id) {
+            .copy, .move, .delete => self.panes[if (self.last_pane == .right) @as(usize, 1) else 0].sources().count > 0,
+            else => true,
+        };
+    }
+
+    fn invoke(self: *Implementation, id: commands.Id, emulator: *Emulator) !bool {
+        if (!self.available(id)) return false;
+        switch (id) {
+            .help => self.modal = .help,
+            .copy => try self.openAction(.copy),
+            .move => try self.openAction(.move),
+            .mkdir => try self.openAction(.mkdir),
+            .delete => try self.openDelete(),
+            .quit => self.quit = true,
+            .switch_pane => {
                 self.focus = if (self.focus == .left) .right else .left;
                 self.last_pane = self.focus;
             },
-            .f10 => self.quit = true,
-            .page_up => if (ev.shift) emulator.scrollPage(.up),
-            .page_down => if (ev.shift) emulator.scrollPage(.down),
-            .text => if (ev.len == 1) {
-                switch (ev.bytes[0]) {
-                    'q' => self.quit = true,
-                    't' => {
-                        self.last_pane = self.focus;
-                        self.focus = .terminal;
-                    },
-                    'z' => {
-                        self.zoom = true;
-                        self.last_pane = self.focus;
-                        self.focus = .terminal;
-                    },
-                    '+' => self.adjustment = @min(self.adjustment + 1, Layout.max_adjustment),
-                    '-' => self.adjustment = @max(self.adjustment - 1, -Layout.max_adjustment),
-                    input.control('l') => try self.openPath(false),
-                    '/' => try self.openPath(true),
-                    input.control('r') => {
-                        self.force_redraw = true;
-                        try pane.refresh();
-                    },
-                    else => {},
-                }
+            .path => try self.openPath(false),
+            .absolute_path => try self.openPath(true),
+            .refresh => {
+                self.force_redraw = true;
+                try self.activePane().refresh();
             },
-            else => {},
+            .toggle_terminal, .focus_terminal => self.toggleTerminal(),
+            .zoom_terminal => {
+                self.zoom = true;
+                self.toggleTerminal();
+            },
+            .grow_terminal => self.adjustment = @min(self.adjustment + 1, Layout.max_adjustment),
+            .shrink_terminal => self.adjustment = @max(self.adjustment - 1, -Layout.max_adjustment),
+            .history_up => emulator.scrollPage(.up),
+            .history_down => emulator.scrollPage(.down),
         }
+        return true;
+    }
+
+    fn globalEvent(self: *Implementation, emulator: *Emulator, ev: *const input.Event) !void {
+        if (commands.resolve(ev)) |id| _ = try self.invoke(id, emulator);
     }
 };
 

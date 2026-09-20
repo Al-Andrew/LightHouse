@@ -34,7 +34,7 @@ pub const View = struct {
         self.terminal = try self.tree.create(root, Terminal, .{ .emulator = emulator });
         self.terminal.setFocusable(true);
         self.key_bar = try self.tree.create(root, KeyBar, .{ .state = state });
-        self.modal = try self.tree.create(root, Modal, .{ .state = state });
+        self.modal = try self.tree.create(root, Modal, .{ .state = state, .emulator = emulator });
         self.modal.setFocusable(true);
         try self.sync();
         return self;
@@ -116,7 +116,7 @@ test "retained app view traps editor paste and restores the active pane after di
     const extra_rect: ui.Rect = .{ .x = 3, .y = 2, .width = 1, .height = 1 };
     extra.setRect(extra_rect);
     view.modal.destroy();
-    view.modal = try view.tree.create(view.tree.root(), Modal, .{ .state = state });
+    view.modal = try view.tree.create(view.tree.root(), Modal, .{ .state = state, .emulator = emulator });
     view.modal.setFocusable(true);
     try view.resize(.{ .width = 80, .height = 24 });
     try std.testing.expectEqual(extra_rect, extra.rect());
@@ -255,4 +255,106 @@ test "view routes Ctrl+G keys to focus policy and preserves Ctrl+G inside termin
     try std.testing.expect(view.panes[0].focused());
     try std.testing.expect(!state.view().quit);
     try std.testing.expectEqualStrings("q\x07\n\x03", emulator.queued());
+}
+
+test "command presentation and direct invocation recheck sources modal focus and job context" {
+    const theme = @import("theme.zig");
+    const Pane = @import("../core/pane.zig").Pane;
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "source", .data = "" });
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buffer);
+    const left = try Pane.create(io, allocator, buffer[0..len], .{});
+    defer left.destroy();
+    const right = try Pane.create(io, allocator, buffer[0..len], .{});
+    defer right.destroy();
+    const emulator = try Emulator.create(io, allocator, 80, 8);
+    defer emulator.destroy();
+    const state = try State.create(std.Io.failing, allocator, .{ left, right });
+    defer state.destroy();
+    const view = try View.create(allocator, state, emulator);
+    defer view.destroy();
+    var frame = ui.Frame.init(allocator);
+    defer frame.deinit();
+    try view.paint(&frame, .{ .width = 80, .height = 24 });
+    try std.testing.expect(!state.available(.copy));
+    try std.testing.expect(!state.available(.move));
+    try std.testing.expect(!state.available(.delete));
+    try std.testing.expect(state.available(.mkdir));
+    try std.testing.expectEqualDeep(theme.disabled_action, frame.cells[23 * 80 + 33].style);
+    try std.testing.expectEqualDeep(theme.action, frame.cells[23 * 80 + 49].style);
+    try view.event(&.{ .key = .f5 });
+    try std.testing.expect(!try state.invoke(.copy, emulator));
+    try std.testing.expect(state.view().modal == .none);
+    try std.testing.expect(state.view().operation == null);
+    try left.refresh();
+    for (0..5000) |_| {
+        _ = try state.poll();
+        if (left.view().status != .loading) break;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try view.event(&.{ .key = .down });
+    try std.testing.expect(state.available(.copy));
+    try view.paint(&frame, .{ .width = 80, .height = 24 });
+    try std.testing.expectEqualDeep(theme.action, frame.cells[23 * 80 + 33].style);
+    // A previously enabled action cannot bypass current pane/source observations.
+    try view.event(&.{ .key = .tab });
+    try std.testing.expect(!try state.invoke(.copy, emulator));
+    try view.event(&.{ .key = .tab });
+    try std.testing.expect(try state.invoke(.help, emulator));
+    try std.testing.expect(!try state.invoke(.copy, emulator));
+    try std.testing.expect(!try state.invoke(.quit, emulator));
+    try std.testing.expect(!try state.invoke(.toggle_terminal, emulator));
+    try view.paint(&frame, .{ .width = 80, .height = 24 });
+    // Help still fits a normal terminal and displays aliases from the binding data.
+    try expectFrameText(&frame, "q/F10 Quit");
+    try expectFrameText(&frame, "Ctrl+G Shell/pane");
+    try expectFrameText(&frame, "Shift+PgDn History down");
+    try expectFrameText(&frame, "Any key closes help");
+    try view.event(&.{ .key = .f5 }); // Help dismissal must not also open Copy.
+    try std.testing.expect(state.view().modal == .none);
+    var decoder: ui.input.Decoder = .{};
+    try feed(view, &decoder, "t");
+    try std.testing.expect(!try state.invoke(.copy, emulator));
+    try std.testing.expect(!try state.invoke(.quit, emulator));
+    try feed(view, &decoder, "\x1b[15~q\x1b[21~t/\x0c\x07");
+    try std.testing.expectEqualStrings("\x1b[15~q\x1b[21~t/\x0c", emulator.queued());
+    try std.testing.expect(!state.view().quit);
+    try std.testing.expect(view.panes[0].focused());
+    try std.testing.expect(try state.invoke(.mkdir, emulator));
+    try std.testing.expect(!try state.invoke(.copy, emulator));
+    try state.submit("created");
+    // Launch failure stays uncollected across availability, invocation and paint.
+    for (0..3) |_| {
+        try std.testing.expect(state.available(.quit));
+        try std.testing.expect(state.available(.toggle_terminal));
+        try std.testing.expect(!state.available(.mkdir));
+        try std.testing.expect(!try state.invoke(.copy, emulator));
+        try view.paint(&frame, .{ .width = 80, .height = 24 });
+        try std.testing.expectEqualDeep(theme.action, frame.cells[23 * 80 + 74].style);
+        try std.testing.expectEqualDeep(theme.disabled_action, frame.cells[23 * 80 + 49].style);
+        try std.testing.expect(state.view().operation.?.status() == .running);
+    }
+    try view.event(&.{ .key = .f5 });
+    try std.testing.expect(state.view().modal == .none);
+    try feed(view, &decoder, "\x07");
+    try std.testing.expect(view.terminal.focused());
+    try std.testing.expect(!try state.invoke(.quit, emulator));
+    try feed(view, &decoder, "\x07");
+    try std.testing.expect(view.modal.focused());
+    try view.event(&.{ .key = .f10 });
+    try std.testing.expect(state.view().quit);
+}
+
+fn expectFrameText(frame: *const ui.Frame, expected: []const u8) !void {
+    for (0..frame.rows) |y| {
+        var row: std.ArrayList(u8) = .empty;
+        defer row.deinit(std.testing.allocator);
+        for (frame.cells[y * frame.cols ..][0..frame.cols]) |cell| try row.appendSlice(std.testing.allocator, cell.text);
+        if (std.mem.indexOf(u8, row.items, expected) != null) return;
+    }
+    return error.MissingFrameText;
 }

@@ -69,6 +69,36 @@ or destroying workflow payloads.
 
 The palette belongs to `src/app/theme.zig`.
 
+## Built-in commands
+
+`src/app/commands.zig` holds the static built-in command identities, labels,
+help descriptions, and default bindings/aliases. Binding lookup, grouped help,
+and the ten-slot function-key bar share these descriptions. The unassigned
+function-key slots remain empty. Descriptions and binding slices have process
+lifetime and retain no workflow context. Pane navigation/marking and editor
+handling stay local to their widgets; their help is documented separately.
+
+`State.available(id)` is the controller's observational command policy. It
+checks modal scope, terminal focus, the retained job, file-action sources, and
+provider support without I/O, polling, allocation, or mutation. The key bar
+uses that exact policy, including disabling source-dependent actions on an
+empty pane while keeping Mkdir available. Job-context Quit remains enabled.
+`State.invoke(id, emulator)` rechecks current observations and returns `false`
+when unavailable, so a previously enabled action cannot bypass later focus,
+modal, job, source, or provider changes. The emulator is borrowed only for the
+call. Eligibility does not guarantee execution: filesystem failures still
+belong to the workflow's error/result handling.
+
+Bindings resolve inside the receiving widget scope. Unhandled pane events
+bubble to root dispatch; modal editors, confirmations, and help consume their
+own events first. The job modal resolves the same built-ins and invokes the
+same controller policy, which admits only Quit and Ctrl+G there. Unavailable
+recognized commands stay consumed in that scope. Terminal keys, including F5,
+q, and F10, continue to reach the child; only a Ctrl+G key bubbles to controller
+focus policy. Ctrl+G bytes inside a paste remain data. No application-wide
+interceptor runs before widgets. Configurable bindings and runtime/plugin
+command registration remain future work.
+
 ## Defining a widget
 
 `Tree` and `Widget` are opaque handles: ownership links, callback tables, focus,

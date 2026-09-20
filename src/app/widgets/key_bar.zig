@@ -2,43 +2,33 @@
 const ui = @import("lighthouse-ui").screen;
 const theme = @import("../theme.zig");
 const toolkit = @import("lighthouse-ui");
+const commands = @import("../commands.zig");
 const State = @import("../controller.zig").State;
 
 pub const KeyBar = struct {
     state: *const State,
 
     pub fn paint(self: *KeyBar, _: *toolkit.Widget, painter: ui.Painter) !void {
-        const state = self.state.view();
-        paintActions(painter, state.focus != .terminal and state.modal == .none and state.operation == null);
+        paintActions(painter, self.state);
     }
 };
 
-fn paintActions(painter: ui.Painter, pane_active: bool) void {
-    const actions = [_]struct { key: []const u8, label: []const u8 = "" }{
-        .{ .key = "1", .label = "Help" },
-        .{ .key = "2" },
-        .{ .key = "3" },
-        .{ .key = "4" },
-        .{ .key = "5", .label = "Copy" },
-        .{ .key = "6", .label = "RenMov" },
-        .{ .key = "7", .label = "Mkdir" },
-        .{ .key = "8", .label = "Delete" },
-        .{ .key = "9" },
-        .{ .key = "10", .label = "Quit" },
-    };
+fn paintActions(painter: ui.Painter, state: *const State) void {
     const key_style = theme.base;
     painter.fill(key_style);
-    for (actions, 0..) |action, i| {
-        const x = painter.rect.width * i / actions.len;
-        const end = painter.rect.width * (i + 1) / actions.len;
+    for (commands.function_keys, commands.function_numbers, 0..) |key, number, i| {
+        const id = commands.functionCommand(key);
+        const caption = if (id) |command| commands.describe(command).label else "";
+        const x = painter.rect.width * i / commands.function_keys.len;
+        const end = painter.rect.width * (i + 1) / commands.function_keys.len;
         const slot = painter.child(.{ .x = x, .y = 0, .width = end - x, .height = 1 });
-        const enabled = pane_active and action.label.len > 0;
+        const enabled = if (id) |command| state.available(command) else false;
         var number_style = key_style;
         if (!enabled) number_style.fg = theme.disabled_key;
-        slot.label(0, 0, action.key, number_style);
-        const label = slot.child(.{ .x = action.key.len, .y = 0, .width = slot.rect.width -| (action.key.len + 1), .height = 1 });
+        slot.label(0, 0, number, number_style);
+        const label = slot.child(.{ .x = number.len, .y = 0, .width = slot.rect.width -| (number.len + 1), .height = 1 });
         const style = if (enabled) theme.action else theme.disabled_action;
         label.fill(style);
-        label.label(0, 0, action.label, style);
+        label.label(0, 0, caption, style);
     }
 }

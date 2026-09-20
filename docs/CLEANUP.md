@@ -64,9 +64,11 @@ build script, and Python integration suites before further feature work.
 
 ## Deferred abstractions
 
-- A Command/action registry could eventually unify keyboard dispatch, footer
-  labels, and help. Introduce it with configurable bindings or plugin actions,
-  when the command interface has concrete requirements.
+- Static built-in command descriptions now unify binding lookup, help, and the
+  ten-slot function-key bar. The controller owns availability and invocation;
+  widgets retain scoped input routing. See [UI.md](UI.md) for the interface.
+  Configurable bindings, persistence, and runtime/plugin registration remain
+  deferred; the static built-ins do not require a callback registry.
 - Directory scans and file operations both use workers, but scans supersede
   pending requests and transfer snapshots while operations report partial
   progress. A generic worker framework would currently obscure those different

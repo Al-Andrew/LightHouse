@@ -5,6 +5,7 @@ const dialogs = @import("dialogs.zig");
 
 pub const Modal = struct {
     state: *State,
+    emulator: *@import("../../terminal/emulator.zig").Emulator,
 
     pub fn measure(self: *Modal, _: toolkit.Size) toolkit.Size {
         return switch (self.state.view().modal) {
@@ -25,7 +26,7 @@ pub const Modal = struct {
     }
 
     pub fn event(self: *Modal, _: *toolkit.Widget, ev: *const toolkit.Event) !bool {
-        try self.state.modalEvent(ev);
+        try self.state.modalEvent(self.emulator, ev);
         return true;
     }
 };
