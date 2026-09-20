@@ -1,6 +1,5 @@
 //! Provider-aware file-action preparation and local execution.
-//! Requests own their paths; only atomic counters cross threads.
-//! Never replace an existing destination. Completed items remain after failure.
+//! Requests and waiting decisions own their paths. Completed work is retained.
 const std = @import("std");
 const Dir = std.Io.Dir;
 const Pane = @import("pane.zig").Pane;
@@ -97,6 +96,10 @@ pub const Progress = struct {
     completed: usize = 0,
     removed: usize = 0,
     bytes: u64 = 0,
+    transferred: usize = 0,
+    skipped: usize = 0,
+    errors: usize = 0,
+    incomplete: usize = 0,
 };
 
 pub const Failure = struct {
@@ -110,9 +113,30 @@ pub const Result = struct {
     failure: ?Failure,
 };
 
+pub const Choice = enum { overwrite, retry, skip, cancel };
+pub const Conflict = enum { file, symlink, mismatch };
+pub const Stage = enum { inspect, transfer, traversal, file_finalization, publication, directory_finalization, move_cleanup };
+pub const Prompt = struct {
+    id: usize,
+    source: []const u8,
+    destination: []const u8,
+    stage: Stage,
+    conflict: ?Conflict = null,
+    err: ?anyerror = null,
+
+    pub fn permits(self: Prompt, choice: Choice) bool {
+        return switch (choice) {
+            .cancel, .skip => true,
+            .retry => self.err != null,
+            .overwrite => if (self.conflict) |kind| kind != .mismatch else false,
+        };
+    }
+};
+
 pub const Status = union(enum) {
     prepared,
     running: Progress,
+    waiting: struct { progress: Progress, prompt: Prompt },
     canceling: Progress,
     finished: Result,
 
@@ -121,6 +145,7 @@ pub const Status = union(enum) {
             .prepared => .{},
             .running, .canceling => |value| value,
             .finished => |result| result.progress,
+            .waiting => |value| value.progress,
         };
     }
 };
@@ -171,6 +196,20 @@ pub const Job = opaque {
         if (self.phase != .running) return;
         self.phase = .canceling;
         self.canceled.store(true, .release);
+        self.decision_event.set(self.io);
+    }
+
+    /// Decisions are accepted only for the current observed prompt. Workers own
+    /// its path storage until this mutation (or cancellation) resumes them.
+    pub fn decide(job: *Job, choice: Choice, remember: bool) bool {
+        const self: *Implementation = @ptrCast(@alignCast(job));
+        if (self.phase != .running or !self.waiting.load(.acquire)) return false;
+        if (!self.prompt.permits(choice)) return false;
+        self.waiting.store(false, .release);
+        self.answer = choice;
+        self.remember = remember and (choice == .skip or choice == .overwrite);
+        self.decision_event.set(self.io);
+        return true;
     }
 
     /// Reports completion exactly once, including launch failure. A running
@@ -197,10 +236,14 @@ pub const Job = opaque {
             .completed = self.completed.load(.acquire),
             .removed = self.removed.load(.acquire),
             .bytes = self.bytes.load(.acquire),
+            .transferred = self.transferred.load(.acquire),
+            .skipped = self.skipped.load(.acquire),
+            .errors = self.errors.load(.acquire),
+            .incomplete = self.incomplete.load(.acquire),
         };
         return switch (self.phase) {
             .prepared => .prepared,
-            .running => .{ .running = progress },
+            .running => if (self.waiting.load(.acquire)) .{ .waiting = .{ .progress = progress, .prompt = self.prompt } } else .{ .running = progress },
             .canceling => .{ .canceling = progress },
             .finished => .{ .finished = .{
                 .progress = progress,
@@ -218,9 +261,11 @@ pub const Job = opaque {
         const self: *Implementation = @ptrCast(@alignCast(job));
         if (self.future) |*future| {
             self.canceled.store(true, .release);
+            self.decision_event.set(self.io);
             future.cancel(self.io);
         }
         const allocator = self.allocator;
+        self.error_policies.deinit(allocator);
         self.arena.deinit();
         allocator.destroy(self);
     }
@@ -238,6 +283,18 @@ const Implementation = struct {
     completed: std.atomic.Value(usize) = .init(0),
     removed: std.atomic.Value(usize) = .init(0),
     bytes: std.atomic.Value(u64) = .init(0),
+    transferred: std.atomic.Value(usize) = .init(0),
+    skipped: std.atomic.Value(usize) = .init(0),
+    errors: std.atomic.Value(usize) = .init(0),
+    incomplete: std.atomic.Value(usize) = .init(0),
+    waiting: std.atomic.Value(bool) = .init(false),
+    decision_event: std.Io.Event = .unset,
+    prompt: Prompt = undefined,
+    prompt_id: usize = 0,
+    answer: Choice = .cancel,
+    remember: bool = false,
+    conflict_policies: [3]?Choice = .{ null, null, null },
+    error_policies: std.ArrayList(struct { stage: Stage, err: anyerror }) = .empty,
     failure: ?anyerror = null,
     // Worker-owned until done; fixed storage also reports allocation failures.
     failed_path: [std.Io.Dir.max_path_bytes]u8 = undefined,
@@ -280,7 +337,7 @@ const Implementation = struct {
             }
             return;
         }
-        const destination_stat = Dir.cwd().statFile(self.io, self.destination, .{}) catch |err| switch (err) {
+        const destination_stat = Dir.cwd().statFile(self.io, self.destination, .{ .follow_symlinks = false }) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
@@ -290,16 +347,7 @@ const Implementation = struct {
             try self.check();
             const target = if (into_directory) try std.fs.path.join(self.allocator, &.{ self.destination, std.fs.path.basename(source) }) else try self.allocator.dupe(u8, self.destination);
             defer self.allocator.free(target);
-            self.pathError(source);
-            const stat = try Dir.cwd().statFile(self.io, source, .{ .follow_symlinks = false });
-            self.pathError(target);
-            try self.validateTarget(source, target, stat.kind == .directory);
-            if (self.kind == .move) {
-                // Atomic no-replace rename. Cross-device moves deliberately fail
-                // without touching either tree until a safe copy/delete stage exists.
-                try Dir.cwd().renamePreserve(source, .cwd(), target, self.io);
-            } else try self.copyNode(source, target, 0);
-            _ = self.completed.fetchAdd(1, .release);
+            if (try self.transferNode(source, target, 0)) _ = self.completed.fetchAdd(1, .release);
         }
     }
 
@@ -347,71 +395,322 @@ const Implementation = struct {
             if (std.mem.eql(u8, canonical, dest_parent) or
                 (std.mem.startsWith(u8, dest_parent, canonical) and dest_parent.len > canonical.len and dest_parent[canonical.len] == '/')) return error.DestinationInsideSource;
         }
-        // lstat rejects dangling links as well as files and directories.
-        _ = Dir.cwd().statFile(self.io, target, .{ .follow_symlinks = false }) catch |err| switch (err) {
-            error.FileNotFound => return,
-            else => return err,
-        };
-        return error.PathAlreadyExists;
+        const from = try Dir.cwd().statFile(self.io, source, .{ .follow_symlinks = false });
+        if (try self.entryStat(target)) |to| {
+            if (from.inode == to.inode and from.kind == to.kind and from.ctime.nanoseconds == to.ctime.nanoseconds) return error.SourceDestinationAlias;
+        }
     }
 
-    fn copyNode(self: *Implementation, source: []const u8, target: []const u8, depth: usize) anyerror!void {
+    fn ask(self: *Implementation, source: []const u8, target: []const u8, stage: Stage, conflict: ?Conflict, err: ?anyerror) !Choice {
         try self.check();
-        if (depth >= max_recursion_depth) return error.DirectoryTooDeep;
-        self.pathError(source);
-        const stat = try Dir.cwd().statFile(self.io, source, .{ .follow_symlinks = false });
-        switch (stat.kind) {
-            .file => {
-                const file = try Dir.openFileAbsolute(self.io, source, .{ .follow_symlinks = false });
-                defer file.close(self.io);
-                const before = try file.stat(self.io);
-                if (before.kind != .file) return error.SourceChanged;
-                self.pathError(target);
-                var output = try Dir.cwd().createFileAtomic(self.io, target, .{ .permissions = before.permissions });
-                defer output.deinit(self.io);
-                var buffer: [copy_buffer_bytes]u8 = undefined;
-                var offset: u64 = 0;
-                while (offset < before.size) {
-                    try self.check();
-                    const n = try file.readPositional(self.io, &.{buffer[0..@intCast(@min(buffer.len, before.size - offset))]}, offset);
-                    if (n == 0) return error.SourceChanged;
-                    try output.file.writePositionalAll(self.io, buffer[0..n], offset);
-                    offset += n;
-                    _ = self.bytes.fetchAdd(n, .release);
-                }
-                const after = try file.stat(self.io);
-                if (before.size != after.size or before.mtime.nanoseconds != after.mtime.nanoseconds or before.ctime.nanoseconds != after.ctime.nanoseconds) return error.SourceChanged;
-                try output.file.setTimestamps(self.io, .{ .modify_timestamp = .init(before.mtime) });
-                try self.check();
-                try output.link(self.io);
-            },
-            .sym_link => {
-                var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-                const len = try Dir.cwd().readLink(self.io, source, &buffer);
-                if (len == buffer.len) return error.NameTooLong;
-                self.pathError(target);
-                try Dir.cwd().symLink(self.io, buffer[0..len], target, .{});
-            },
-            .directory => {
-                const src = try Dir.openDirAbsolute(self.io, source, .{ .iterate = true, .follow_symlinks = false });
-                defer src.close(self.io);
-                self.pathError(target);
-                try Dir.cwd().createDir(self.io, target, .default_dir);
-                const dest = try Dir.openDirAbsolute(self.io, target, .{ .iterate = true, .follow_symlinks = false });
-                defer dest.close(self.io);
-                var iterator = src.iterate();
-                while (try iterator.next(self.io)) |entry| {
-                    try self.check();
-                    const child_source = try std.fs.path.join(self.allocator, &.{ source, entry.name });
-                    defer self.allocator.free(child_source);
-                    const child_target = try std.fs.path.join(self.allocator, &.{ target, entry.name });
-                    defer self.allocator.free(child_target);
-                    try self.copyNode(child_source, child_target, depth + 1);
-                }
-                try dest.setPermissions(self.io, stat.permissions);
-            },
-            else => return error.UnsupportedFileType,
+        self.decision_event.reset();
+        self.prompt_id += 1;
+        self.prompt = .{ .id = self.prompt_id, .source = source, .destination = target, .stage = stage, .conflict = conflict, .err = err };
+        self.remember = false;
+        self.waiting.store(true, .release);
+        defer self.waiting.store(false, .release);
+        // Recheck after publishing: cancellation may have raced with reset.
+        try self.check();
+        try self.decision_event.wait(self.io);
+        try self.check();
+        if (self.answer == .cancel) return error.Canceled;
+        return self.answer;
+    }
+
+    fn recover(self: *Implementation, source: []const u8, target: []const u8, stage: Stage, err: anyerror) !bool {
+        if (err == error.Canceled) return err;
+        try self.check();
+        self.pathError(if (stage == .directory_finalization or stage == .publication or stage == .file_finalization) target else source);
+        for (self.error_policies.items) |policy| {
+            if (policy.stage == stage and policy.err == err) {
+                self.skipError();
+                return false;
+            }
         }
+        const choice = self.ask(source, target, stage, null, err) catch |failure| {
+            _ = self.errors.fetchAdd(1, .release);
+            return failure;
+        };
+        if (choice == .retry) return true;
+        if (self.remember) try self.error_policies.append(self.allocator, .{ .stage = stage, .err = err });
+        self.skipError();
+        return false;
+    }
+
+    fn skipError(self: *Implementation) void {
+        _ = self.errors.fetchAdd(1, .release);
+        _ = self.skipped.fetchAdd(1, .release);
+    }
+
+    fn entryStat(self: *Implementation, path: []const u8) !?std.Io.File.Stat {
+        return Dir.cwd().statFile(self.io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+    }
+
+    fn same(a: ?std.Io.File.Stat, b: ?std.Io.File.Stat) bool {
+        if (a == null or b == null) return a == null and b == null;
+        return a.?.inode == b.?.inode and a.?.kind == b.?.kind and a.?.size == b.?.size and
+            a.?.mtime.nanoseconds == b.?.mtime.nanoseconds and a.?.ctime.nanoseconds == b.?.ctime.nanoseconds;
+    }
+
+    const Consent = struct { source: std.Io.File.Stat, destination: ?std.Io.File.Stat };
+
+    fn consent(self: *Implementation, source: []const u8, target: []const u8, fresh: bool) !?Consent {
+        var force_prompt = fresh;
+        while (true) {
+            try self.check();
+            const from = (try self.entryStat(source)) orelse return error.FileNotFound;
+            try self.validateTarget(source, target, from.kind == .directory);
+            const to = try self.entryStat(target);
+            if (to == null or (from.kind == .directory and to.?.kind == .directory)) return .{ .source = from, .destination = to };
+            const category: Conflict = if (from.kind == .directory or to.?.kind == .directory) .mismatch else if (from.kind == .sym_link or to.?.kind == .sym_link) .symlink else .file;
+            const choice = if (!force_prompt and self.conflict_policies[@intFromEnum(category)] != null)
+                self.conflict_policies[@intFromEnum(category)].?
+            else blk: {
+                const answer = try self.ask(source, target, .inspect, category, null);
+                // Never store consent for entries changed while a prompt was open.
+                if (!same(from, try self.entryStat(source)) or !same(to, try self.entryStat(target))) {
+                    force_prompt = true;
+                    continue;
+                }
+                if (self.remember) self.conflict_policies[@intFromEnum(category)] = answer;
+                break :blk answer;
+            };
+            if (choice == .skip) {
+                _ = self.skipped.fetchAdd(1, .release);
+                return null;
+            }
+            return .{ .source = from, .destination = to };
+        }
+    }
+
+    fn transferNode(self: *Implementation, source: []const u8, target: []const u8, depth: usize) anyerror!bool {
+        var fresh = false;
+        while (true) {
+            try self.check();
+            self.pathError(source);
+            const observed = self.consent(source, target, fresh) catch |err| {
+                if (try self.recover(source, target, .inspect, err)) {
+                    fresh = true;
+                    continue;
+                }
+                return false;
+            } orelse return false;
+            if (depth >= max_recursion_depth) {
+                if (try self.recover(source, target, .traversal, error.DirectoryTooDeep)) continue;
+                return false;
+            }
+            const result = self.transferObserved(source, target, observed, depth) catch |err| {
+                if (try self.recover(source, target, if (observed.source.kind == .directory) .traversal else .transfer, err)) {
+                    fresh = true;
+                    continue;
+                }
+                return false;
+            };
+            return result;
+        }
+    }
+
+    fn transferObserved(self: *Implementation, source: []const u8, target: []const u8, observed: Consent, depth: usize) !bool {
+        if (observed.source.kind == .directory and (self.kind == .copy or observed.destination != null)) return self.transferDirectory(source, target, observed, depth);
+        if (self.kind == .move) {
+            var current = observed;
+            while (true) {
+                try self.check();
+                if (!same(current.source, try self.entryStat(source)) or !same(current.destination, try self.entryStat(target))) {
+                    current = (try self.consent(source, target, true)) orelse return false;
+                    if (current.source.kind == .directory) return error.SourceChanged;
+                }
+                if (current.destination != null) {
+                    try Dir.cwd().rename(source, .cwd(), target, self.io);
+                } else try Dir.cwd().renamePreserve(source, .cwd(), target, self.io);
+                _ = self.transferred.fetchAdd(1, .release);
+                return true;
+            }
+        }
+        return switch (observed.source.kind) {
+            .file => self.copyFile(source, target, observed),
+            .sym_link => self.copyLink(source, target, observed),
+            else => error.UnsupportedFileType,
+        };
+    }
+
+    fn copyFile(self: *Implementation, source: []const u8, target: []const u8, observed: Consent) !bool {
+        const file = try Dir.openFileAbsolute(self.io, source, .{ .follow_symlinks = false });
+        defer file.close(self.io);
+        const before = try file.stat(self.io);
+        if (!same(observed.source, before) or before.kind != .file) return error.SourceChanged;
+        var output = try Dir.cwd().createFileAtomic(self.io, target, .{ .replace = true });
+        defer output.deinit(self.io);
+        var buffer: [copy_buffer_bytes]u8 = undefined;
+        var offset: u64 = 0;
+        while (offset < before.size) {
+            try self.check();
+            const n = try file.readPositional(self.io, &.{buffer[0..@intCast(@min(buffer.len, before.size - offset))]}, offset);
+            if (n == 0) return error.SourceChanged;
+            try output.file.writePositionalAll(self.io, buffer[0..n], offset);
+            offset += n;
+        }
+        if (!same(before, try file.stat(self.io)) or !same(before, try self.entryStat(source))) return error.SourceChanged;
+        while (true) {
+            self.finalizeFile(&output, before) catch |err| {
+                if (try self.recover(source, target, .file_finalization, err)) continue;
+                return false;
+            };
+            break;
+        }
+        var current = observed;
+        while (true) {
+            try self.check();
+            if (!same(before, try self.entryStat(source))) return error.SourceChanged;
+            if (!same(current.destination, try self.entryStat(target))) {
+                current = (try self.consent(source, target, true)) orelse return false;
+                if (!same(before, current.source)) return error.SourceChanged;
+            }
+            self.publishFile(&output, current.destination != null) catch |err| {
+                if (try self.recover(source, target, .publication, err)) continue;
+                return false;
+            };
+            _ = self.bytes.fetchAdd(before.size, .release);
+            _ = self.transferred.fetchAdd(1, .release);
+            return true;
+        }
+    }
+
+    fn finalizeFile(self: *Implementation, output: *std.Io.File.Atomic, stat: std.Io.File.Stat) !void {
+        try self.check();
+        try output.file.setPermissions(self.io, stat.permissions);
+        try output.file.setTimestamps(self.io, .{ .modify_timestamp = .init(stat.mtime) });
+    }
+
+    fn publishFile(self: *Implementation, output: *std.Io.File.Atomic, overwrite: bool) !void {
+        if (overwrite) try output.replace(self.io) else try output.link(self.io);
+    }
+
+    fn copyLink(self: *Implementation, source: []const u8, target: []const u8, observed: Consent) !bool {
+        var buffer: [Dir.max_path_bytes]u8 = undefined;
+        const len = try Dir.cwd().readLink(self.io, source, &buffer);
+        if (len == buffer.len) return error.NameTooLong;
+        var random: [16]u8 = undefined;
+        self.io.random(&random);
+        const temporary = try std.fmt.allocPrint(self.allocator, "{s}/.lighthouse-link-{x}", .{ std.fs.path.dirname(target).?, &random });
+        defer self.allocator.free(temporary);
+        try Dir.cwd().symLink(self.io, buffer[0..len], temporary, .{});
+        defer Dir.cwd().deleteFile(self.io, temporary) catch {};
+        var current = observed;
+        while (true) {
+            try self.check();
+            if (!same(observed.source, try self.entryStat(source))) return error.SourceChanged;
+            if (!same(current.destination, try self.entryStat(target))) current = (try self.consent(source, target, true)) orelse return false;
+            if (current.destination != null) {
+                try Dir.cwd().rename(temporary, .cwd(), target, self.io);
+            } else try Dir.cwd().renamePreserve(temporary, .cwd(), target, self.io);
+            _ = self.transferred.fetchAdd(1, .release);
+            return true;
+        }
+    }
+
+    fn directoryIdentity(self: *Implementation, path: []const u8, expected: std.Io.File.Stat) !void {
+        const current = (try self.entryStat(path)) orelse return error.SourceChanged;
+        if (current.inode != expected.inode or current.kind != .directory) return error.SourceChanged;
+    }
+
+    fn nextChild(self: *Implementation, iterator: *Dir.Iterator, source: []const u8, target: []const u8, from: std.Io.File.Stat, to: std.Io.File.Stat) !?Dir.Entry {
+        try self.directoryIdentity(source, from);
+        try self.directoryIdentity(target, to);
+        return iterator.next(self.io);
+    }
+
+    fn finalizeDirectory(self: *Implementation, dir: Dir, target: []const u8, identity: std.Io.File.Stat, permissions: Dir.Permissions) !void {
+        try self.check();
+        try self.directoryIdentity(target, identity);
+        try dir.setPermissions(self.io, permissions);
+    }
+
+    fn removeSourceDirectory(self: *Implementation, source: []const u8, identity: std.Io.File.Stat) !void {
+        try self.directoryIdentity(source, identity);
+        try Dir.cwd().deleteDir(self.io, source);
+    }
+
+    const ChildPaths = struct { source: []const u8, target: []const u8 };
+    fn prepareChild(self: *Implementation, visited: *std.StringHashMap(void), source: []const u8, target: []const u8, name: []const u8) !ChildPaths {
+        try visited.ensureUnusedCapacity(1);
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
+        const from = try std.fs.path.join(self.allocator, &.{ source, name });
+        errdefer self.allocator.free(from);
+        const to = try std.fs.path.join(self.allocator, &.{ target, name });
+        visited.putAssumeCapacity(owned_name, {});
+        return .{ .source = from, .target = to };
+    }
+
+    fn transferDirectory(self: *Implementation, source: []const u8, target: []const u8, observed: Consent, depth: usize) anyerror!bool {
+        const src = try Dir.openDirAbsolute(self.io, source, .{ .iterate = true, .follow_symlinks = false });
+        defer src.close(self.io);
+        if (observed.destination == null) try Dir.cwd().createDir(self.io, target, .default_dir);
+        const dest = blk: while (true) {
+            break :blk Dir.openDirAbsolute(self.io, target, .{ .iterate = true, .follow_symlinks = false }) catch |err| {
+                if (try self.recover(source, target, .traversal, err)) continue;
+                _ = self.incomplete.fetchAdd(1, .release);
+                return false;
+            };
+        };
+        defer dest.close(self.io);
+        const destination_identity = try dest.stat(self.io);
+        // Record processed children, including skips. Reopening traversal after
+        // an error must never replay successful work or prompt for old skips.
+        var visited: std.StringHashMap(void) = .init(self.allocator);
+        defer {
+            var names = visited.keyIterator();
+            while (names.next()) |name| self.allocator.free(name.*);
+            visited.deinit();
+        }
+        var complete = true;
+        var iterator = src.iterate();
+        traversal: while (true) {
+            try self.check();
+            const entry = self.nextChild(&iterator, source, target, observed.source, destination_identity) catch |err| {
+                if (try self.recover(source, target, .traversal, err)) {
+                    iterator = src.iterate();
+                    continue;
+                }
+                complete = false;
+                break;
+            } orelse break;
+            if (visited.contains(entry.name)) continue;
+            const child = blk: while (true) {
+                break :blk self.prepareChild(&visited, source, target, entry.name) catch |err| {
+                    if (try self.recover(source, target, .traversal, err)) continue;
+                    complete = false;
+                    break :traversal;
+                };
+            };
+            defer self.allocator.free(child.source);
+            defer self.allocator.free(child.target);
+            if (!try self.transferNode(child.source, child.target, depth + 1)) complete = false;
+        }
+        if (observed.destination == null) while (true) {
+            self.finalizeDirectory(dest, target, destination_identity, observed.source.permissions) catch |err| {
+                if (try self.recover(source, target, .directory_finalization, err)) continue;
+                complete = false;
+                break;
+            };
+            break;
+        };
+        if (self.kind == .move and complete) while (true) {
+            try self.check();
+            // deleteDir removes only an empty directory, never remaining children.
+            self.removeSourceDirectory(source, observed.source) catch |err| {
+                if (try self.recover(source, target, .move_cleanup, err)) continue;
+                complete = false;
+                break;
+            };
+            break;
+        };
+        if (!complete) _ = self.incomplete.fetchAdd(1, .release);
+        return complete;
     }
 };
 
@@ -419,8 +718,12 @@ fn testJob(kind: Kind, base: []const u8, names: []const []const u8, target: []co
     const job = try Job.create(std.testing.io, std.testing.allocator, kind, base, names, target);
     errdefer job.destroy();
     try job.start();
-    try waitForJob(job);
-    return job;
+    for (0..5000) |_| {
+        if (job.status() == .waiting) _ = job.decide(.cancel, false);
+        if (job.poll()) return job;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    return error.JobTimeout;
 }
 
 fn testBase(tmp: *std.testing.TmpDir, buffer: []u8) ![]const u8 {
@@ -465,7 +768,7 @@ test "copy and move conflicts preserve existing files and dangling links" {
         for ([_][]const u8{ "existing", "broken", "source" }) |target| {
             const job = try testJob(kind, base, &.{"source"}, target);
             defer job.destroy();
-            try std.testing.expectEqual(error.PathAlreadyExists, job.status().finished.failure.?.err);
+            try std.testing.expectEqual(error.Canceled, job.status().finished.failure.?.err);
         }
     }
     var data: [32]u8 = undefined;
@@ -508,7 +811,7 @@ test "reject descendants including symlink aliases and ambiguous multi-source de
         for ([_][]const u8{ "source/child/new", "alias/new" }) |target| {
             const job = try testJob(kind, base, &.{"source"}, target);
             defer job.destroy();
-            try std.testing.expectEqual(error.DestinationInsideSource, job.status().finished.failure.?.err);
+            try std.testing.expectEqual(error.Canceled, job.status().finished.failure.?.err);
         }
         const multiple = try testJob(kind, base, &.{ "source", "alias" }, "missing");
         defer multiple.destroy();
@@ -545,7 +848,7 @@ test "partial batch failure reports completed items and preserves unprocessed so
     for ([_][]const u8{ "a", "b", "c", "dest/b" }) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = name });
     const job = try testJob(.move, base, &.{ "a", "b", "c" }, "dest");
     defer job.destroy();
-    try std.testing.expectEqual(error.PathAlreadyExists, job.status().finished.failure.?.err);
+    try std.testing.expectEqual(error.Canceled, job.status().finished.failure.?.err);
     try std.testing.expectEqual(@as(usize, 1), job.status().progress().completed);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "a", .{}));
     _ = try tmp.dir.statFile(io, "dest/a", .{});
@@ -571,7 +874,7 @@ test "canceling an active copy never publishes a partial destination" {
     try job.start();
     try gate.waitUntilEntered();
     try std.testing.expect(job.status() == .running);
-    try std.testing.expect(job.status().progress().bytes > 0);
+    try std.testing.expectEqual(@as(u64, 0), job.status().progress().bytes);
     try std.testing.expect(!job.poll());
     try std.testing.expectError(error.AlreadyStarted, job.start());
     job.cancel();
@@ -1077,4 +1380,397 @@ test "prepared requests own marked sources and target after pane destruction" {
     try std.testing.expectEqualStrings("b", try tmp.dir.readFile(io, "copied", &data));
     // The prepared delete remains safe to dismiss, with no work launched.
     _ = try tmp.dir.statFile(io, "b", .{});
+}
+
+test "Directory merge preserves unrelated destination contents" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base = try testBase(&tmp, &buffer);
+    try tmp.dir.createDirPath(io, "source/nested");
+    try tmp.dir.createDirPath(io, "dest/source");
+    try tmp.dir.writeFile(io, .{ .sub_path = "source/nested/new", .data = "new" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "dest/source/keep", .data = "keep" });
+    const job = try testJob(.copy, base, &.{"source"}, "dest");
+    defer job.destroy();
+    try std.testing.expectEqual(null, job.status().finished.failure);
+    var data: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("new", try tmp.dir.readFile(io, "dest/source/nested/new", &data));
+    try std.testing.expectEqualStrings("keep", try tmp.dir.readFile(io, "dest/source/keep", &data));
+}
+
+fn waitForDecision(job: *Job) !Prompt {
+    for (0..5000) |_| {
+        if (job.status() == .waiting) return job.status().waiting.prompt;
+        if (job.poll()) return error.UnexpectedCompletion;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    return error.DecisionTimeout;
+}
+
+test "Destination conflict waits for explicit overwrite and publishes a complete file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base = try testBase(&tmp, &buffer);
+    try tmp.dir.writeFile(io, .{ .sub_path = "source", .data = "complete replacement" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "target", .data = "old" });
+    const job = try Job.create(io, std.testing.allocator, .copy, base, &.{"source"}, "target");
+    defer job.destroy();
+    try job.start();
+    const prompt = try waitForDecision(job);
+    try std.testing.expectEqual(Conflict.file, prompt.conflict.?);
+    var data: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("old", try tmp.dir.readFile(io, "target", &data));
+    try std.testing.expect(job.decide(.overwrite, false));
+    try waitForJob(job);
+    try std.testing.expectEqual(null, job.status().finished.failure);
+    try std.testing.expectEqualStrings("complete replacement", try tmp.dir.readFile(io, "target", &data));
+}
+
+test "merged move retains skipped children and counts successful work separately" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [Dir.max_path_bytes]u8 = undefined;
+    const base = try testBase(&tmp, &buffer);
+    try tmp.dir.createDirPath(io, "source/nested");
+    try tmp.dir.createDirPath(io, "dest/source");
+    try tmp.dir.writeFile(io, .{ .sub_path = "source/nested/new", .data = "moved" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "source/conflict", .data = "source" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "dest/source/conflict", .data = "keep" });
+    const job = try Job.create(io, std.testing.allocator, .move, base, &.{"source"}, "dest");
+    defer job.destroy();
+    try job.start();
+    _ = try waitForDecision(job);
+    try std.testing.expect(job.decide(.skip, false));
+    try waitForJob(job);
+    const result = job.status().finished;
+    try std.testing.expectEqual(@as(usize, 0), result.progress.completed);
+    try std.testing.expectEqual(@as(usize, 1), result.progress.skipped);
+    try std.testing.expectEqual(@as(usize, 1), result.progress.incomplete);
+    var data: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("moved", try tmp.dir.readFile(io, "dest/source/nested/new", &data));
+    try std.testing.expectEqualStrings("source", try tmp.dir.readFile(io, "source/conflict", &data));
+    try std.testing.expectEqualStrings("keep", try tmp.dir.readFile(io, "dest/source/conflict", &data));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "source/nested", .{}));
+}
+
+test "conflict policies distinguish regular files links and directory mismatches and reset per job" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [Dir.max_path_bytes]u8 = undefined;
+    const base = try testBase(&tmp, &buffer);
+    try tmp.dir.createDir(io, "dest", .default_dir);
+    for ([_][]const u8{ "a", "b", "c", "d", "dest/a", "dest/b" }) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = name });
+    try tmp.dir.symLink(io, "../a", "dest/c", .{});
+    try tmp.dir.createDir(io, "dest/d", .default_dir);
+    const job = try Job.create(io, std.testing.allocator, .copy, base, &.{ "a", "b", "c", "d" }, "dest");
+    defer job.destroy();
+    try job.start();
+    try std.testing.expectEqual(Conflict.file, (try waitForDecision(job)).conflict.?);
+    try std.testing.expect(job.decide(.overwrite, true));
+    try std.testing.expectEqual(Conflict.symlink, (try waitForDecision(job)).conflict.?);
+    try std.testing.expect(job.decide(.overwrite, true));
+    try std.testing.expectEqual(Conflict.mismatch, (try waitForDecision(job)).conflict.?);
+    try std.testing.expect(!job.decide(.overwrite, true));
+    try std.testing.expect(job.decide(.skip, true));
+    try waitForJob(job);
+    try std.testing.expectEqual(@as(usize, 3), job.status().progress().completed);
+    var data: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("a", try tmp.dir.readFile(io, "a", &data));
+    try std.testing.expectEqualStrings("b", try tmp.dir.readFile(io, "dest/b", &data));
+    try std.testing.expectEqualStrings("c", try tmp.dir.readFile(io, "dest/c", &data));
+    const next = try Job.create(io, std.testing.allocator, .copy, base, &.{"a"}, "dest");
+    defer next.destroy();
+    try next.start();
+    _ = try waitForDecision(next);
+    next.cancel();
+    try waitForJob(next);
+}
+
+test "changed destination requires fresh consent even with Apply to all" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [Dir.max_path_bytes]u8 = undefined;
+    const base = try testBase(&tmp, &buffer);
+    try tmp.dir.writeFile(io, .{ .sub_path = "source", .data = "source" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "target", .data = "before" });
+    const job = try Job.create(io, std.testing.allocator, .copy, base, &.{"source"}, "target");
+    defer job.destroy();
+    try job.start();
+    const first = try waitForDecision(job);
+    try tmp.dir.deleteFile(io, "target");
+    try tmp.dir.symLink(io, "source", "target", .{});
+    try std.testing.expect(job.decide(.overwrite, true));
+    const fresh = try waitForDecision(job);
+    try std.testing.expect(fresh.id != first.id);
+    try std.testing.expectEqual(Conflict.symlink, fresh.conflict.?);
+    try std.testing.expect(job.decide(.skip, false));
+    try waitForJob(job);
+    try std.testing.expectEqual(.sym_link, (try tmp.dir.statFile(io, "target", .{ .follow_symlinks = false })).kind);
+}
+
+test "waiting decisions wake for cancellation and shutdown" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [Dir.max_path_bytes]u8 = undefined;
+    const base = try testBase(&tmp, &buffer);
+    for ([_][]const u8{ "source", "target" }) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = name });
+    for ([_]bool{ false, true }) |shutdown| {
+        const job = try Job.create(io, std.testing.allocator, .copy, base, &.{"source"}, "target");
+        try job.start();
+        _ = try waitForDecision(job);
+        if (!shutdown) {
+            job.cancel();
+            try waitForJob(job);
+            try std.testing.expectEqual(error.Canceled, job.status().finished.failure.?.err);
+        }
+        job.destroy();
+    }
+    var data: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("target", try tmp.dir.readFile(io, "target", &data));
+}
+
+const RecoveryIo = struct {
+    threaded: std.Io.Threaded,
+    vtable: std.Io.VTable = undefined,
+    stage: Stage,
+    failures_left: usize = 1,
+    reads: usize = 0,
+    directory_reads: usize = 0,
+
+    fn io(self: *RecoveryIo) std.Io {
+        const base = self.threaded.io();
+        self.vtable = base.vtable.*;
+        self.vtable.fileReadPositional = read;
+        self.vtable.fileSetPermissions = filePermissions;
+        self.vtable.dirSetPermissions = dirPermissions;
+        self.vtable.dirRead = dirRead;
+        self.vtable.dirDeleteDir = deleteDir;
+        return .{ .userdata = base.userdata, .vtable = &self.vtable };
+    }
+    fn from(context: ?*anyopaque) *RecoveryIo {
+        const threaded: *std.Io.Threaded = @ptrCast(@alignCast(context.?));
+        return @fieldParentPtr("threaded", threaded);
+    }
+    fn fail(self: *RecoveryIo, stage: Stage) bool {
+        if (self.stage != stage or self.failures_left == 0) return false;
+        self.failures_left -= 1;
+        return true;
+    }
+    fn read(context: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+        const self = from(context);
+        self.reads += 1;
+        if (self.fail(.transfer)) return error.AccessDenied;
+        const base = self.threaded.io();
+        return base.vtable.fileReadPositional(base.userdata, file, data, offset);
+    }
+    fn filePermissions(context: ?*anyopaque, file: std.Io.File, permissions: std.Io.File.Permissions) std.Io.File.SetPermissionsError!void {
+        const self = from(context);
+        if (self.fail(.file_finalization)) return error.AccessDenied;
+        const base = self.threaded.io();
+        return base.vtable.fileSetPermissions(base.userdata, file, permissions);
+    }
+    fn dirPermissions(context: ?*anyopaque, dir: Dir, permissions: Dir.Permissions) Dir.SetPermissionsError!void {
+        const self = from(context);
+        if (self.fail(.directory_finalization)) return error.AccessDenied;
+        const base = self.threaded.io();
+        return base.vtable.dirSetPermissions(base.userdata, dir, permissions);
+    }
+    fn dirRead(context: ?*anyopaque, reader: *Dir.Reader, entries: []Dir.Entry) Dir.Reader.Error!usize {
+        const self = from(context);
+        self.directory_reads += 1;
+        if (self.directory_reads == 2 and self.fail(.traversal)) return error.AccessDenied;
+        const base = self.threaded.io();
+        return base.vtable.dirRead(base.userdata, reader, entries[0..@min(1, entries.len)]);
+    }
+    fn deleteDir(context: ?*anyopaque, dir: Dir, path: []const u8) Dir.DeleteDirError!void {
+        const self = from(context);
+        if (self.fail(.move_cleanup)) return error.AccessDenied;
+        const base = self.threaded.io();
+        return base.vtable.dirDeleteDir(base.userdata, dir, path);
+    }
+};
+
+test "Retry and Skip resume failed transfer traversal finalization and cleanup stages" {
+    const io = std.testing.io;
+    for ([_]Stage{ .transfer, .traversal, .file_finalization, .directory_finalization, .move_cleanup }) |stage| {
+        for ([_]Choice{ .retry, .skip }) |choice| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var buffer: [Dir.max_path_bytes]u8 = undefined;
+            const base = try testBase(&tmp, &buffer);
+            try tmp.dir.createDir(io, "source", .default_dir);
+            try tmp.dir.writeFile(io, .{ .sub_path = "source/a", .data = "a" });
+            try tmp.dir.writeFile(io, .{ .sub_path = "source/b", .data = "b" });
+            const moving = stage == .move_cleanup;
+            if (moving) try tmp.dir.createDirPath(io, "dest/source");
+            var controlled: RecoveryIo = .{ .threaded = .init(std.testing.allocator, .{}), .stage = stage };
+            defer controlled.threaded.deinit();
+            const job = try Job.create(controlled.io(), std.testing.allocator, if (moving) .move else .copy, base, &.{"source"}, if (moving) "dest" else "copied");
+            defer job.destroy();
+            try job.start();
+            const prompt = try waitForDecision(job);
+            try std.testing.expectEqual(stage, prompt.stage);
+            try std.testing.expectEqual(error.AccessDenied, prompt.err.?);
+            try std.testing.expect(job.decide(choice, false));
+            try waitForJob(job);
+            const progress = job.status().progress();
+            try std.testing.expectEqual(null, job.status().finished.failure);
+            if (choice == .retry) {
+                try std.testing.expectEqual(@as(usize, 1), progress.completed);
+                try std.testing.expectEqual(@as(usize, 2), progress.transferred);
+                try std.testing.expectEqual(@as(u64, if (moving) 0 else 2), progress.bytes);
+                try std.testing.expectEqual(@as(usize, if (moving) 0 else if (stage == .transfer) 3 else 2), controlled.reads);
+            } else {
+                try std.testing.expectEqual(@as(usize, 0), progress.completed);
+                try std.testing.expectEqual(@as(usize, 1), progress.skipped);
+                try std.testing.expectEqual(@as(usize, 1), progress.errors);
+                try std.testing.expectEqual(@as(usize, 1), progress.incomplete);
+                if (moving) _ = try tmp.dir.statFile(io, "source", .{});
+            }
+        }
+    }
+}
+
+test "skip error policy applies only to matching kinds and resets between jobs" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [Dir.max_path_bytes]u8 = undefined;
+    const base = try testBase(&tmp, &buffer);
+    try tmp.dir.createDir(io, "dest", .default_dir);
+    for ([_][]const u8{ "a", "b", "c" }) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = name });
+    var controlled: RecoveryIo = .{ .threaded = .init(std.testing.allocator, .{}), .stage = .transfer, .failures_left = 2 };
+    defer controlled.threaded.deinit();
+    const job = try Job.create(controlled.io(), std.testing.allocator, .copy, base, &.{ "a", "b", "c" }, "dest");
+    defer job.destroy();
+    try job.start();
+    _ = try waitForDecision(job);
+    try std.testing.expect(job.decide(.skip, true));
+    try waitForJob(job);
+    try std.testing.expectEqual(@as(usize, 2), job.status().progress().errors);
+    try std.testing.expectEqual(@as(usize, 1), job.status().progress().completed);
+    controlled.failures_left = 1;
+    const next = try Job.create(controlled.io(), std.testing.allocator, .copy, base, &.{"a"}, "dest");
+    defer next.destroy();
+    try next.start();
+    _ = try waitForDecision(next);
+    next.cancel();
+    try waitForJob(next);
+}
+
+test "failed or canceled overwrite preparation preserves old destination and completed-byte totals" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [Dir.max_path_bytes]u8 = undefined;
+    const base = try testBase(&tmp, &buffer);
+    const source = try tmp.dir.createFile(io, "source", .{});
+    defer source.close(io);
+    try source.setLength(io, 2 * copy_buffer_bytes);
+    try tmp.dir.writeFile(io, .{ .sub_path = "target", .data = "old destination" });
+    for ([_]Stage{ .transfer, .file_finalization }) |stage| {
+        var controlled: RecoveryIo = .{ .threaded = .init(std.testing.allocator, .{}), .stage = stage };
+        defer controlled.threaded.deinit();
+        const job = try Job.create(controlled.io(), std.testing.allocator, .copy, base, &.{"source"}, "target");
+        defer job.destroy();
+        try job.start();
+        _ = try waitForDecision(job);
+        try std.testing.expect(job.decide(.overwrite, false));
+        try std.testing.expectEqual(stage, (try waitForDecision(job)).stage);
+        try std.testing.expect(job.decide(.skip, false));
+        try waitForJob(job);
+        var data: [32]u8 = undefined;
+        try std.testing.expectEqualStrings("old destination", try tmp.dir.readFile(io, "target", &data));
+        try std.testing.expectEqual(@as(u64, 0), job.status().progress().bytes);
+    }
+    var gate = TestIoGate.init(.copy);
+    defer gate.threaded.deinit();
+    const job = try Job.create(gate.io(), std.testing.allocator, .copy, base, &.{"source"}, "target");
+    defer job.destroy();
+    defer gate.unblock();
+    try job.start();
+    _ = try waitForDecision(job);
+    try std.testing.expect(job.decide(.overwrite, false));
+    try gate.waitUntilEntered();
+    job.cancel();
+    gate.unblock();
+    try waitForJob(job);
+    var data: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("old destination", try tmp.dir.readFile(io, "target", &data));
+    try std.testing.expectEqual(@as(u64, 0), job.status().progress().bytes);
+}
+
+test "symlink overwrite replaces entries without following either link target" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [Dir.max_path_bytes]u8 = undefined;
+    const base = try testBase(&tmp, &buffer);
+    try tmp.dir.symLink(io, "absent", "source", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside", .data = "untouched" });
+    try tmp.dir.symLink(io, "outside", "target", .{});
+    const job = try Job.create(io, std.testing.allocator, .copy, base, &.{"source"}, "target");
+    defer job.destroy();
+    try job.start();
+    try std.testing.expectEqual(Conflict.symlink, (try waitForDecision(job)).conflict.?);
+    try std.testing.expect(job.decide(.overwrite, false));
+    try waitForJob(job);
+    var data: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("absent", data[0..try tmp.dir.readLink(io, "target", &data)]);
+    try std.testing.expectEqualStrings("untouched", try tmp.dir.readFile(io, "outside", &data));
+}
+
+test "hardlink aliases and directory descendants cannot be authorized for overwrite" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [Dir.max_path_bytes]u8 = undefined;
+    const base = try testBase(&tmp, &buffer);
+    try tmp.dir.writeFile(io, .{ .sub_path = "source", .data = "preserve" });
+    const file = try tmp.dir.openFile(io, "source", .{});
+    defer file.close(io);
+    try file.hardLink(io, tmp.dir, "alias", .{});
+    const job = try Job.create(io, std.testing.allocator, .move, base, &.{"source"}, "alias");
+    defer job.destroy();
+    try job.start();
+    try std.testing.expectEqual(error.SourceDestinationAlias, (try waitForDecision(job)).err.?);
+    try std.testing.expect(!job.decide(.overwrite, true));
+    try std.testing.expect(job.decide(.skip, false));
+    try waitForJob(job);
+    _ = try tmp.dir.statFile(io, "source", .{});
+    try tmp.dir.createDirPath(io, "tree/child");
+    const descendant = try Job.create(io, std.testing.allocator, .copy, base, &.{"tree"}, "tree/child/new");
+    defer descendant.destroy();
+    try descendant.start();
+    try std.testing.expectEqual(error.DestinationInsideSource, (try waitForDecision(descendant)).err.?);
+    try std.testing.expect(!descendant.decide(.overwrite, true));
+    descendant.cancel();
+    try waitForJob(descendant);
+}
+
+test "a destination symlink to a directory is a conflict entry rather than a directory target" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [Dir.max_path_bytes]u8 = undefined;
+    const base = try testBase(&tmp, &buffer);
+    try tmp.dir.createDir(io, "outside", .default_dir);
+    try tmp.dir.symLink(io, "outside", "target", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "source", .data = "copied" });
+    const job = try Job.create(io, std.testing.allocator, .copy, base, &.{"source"}, "target");
+    defer job.destroy();
+    try job.start();
+    try std.testing.expectEqual(Conflict.symlink, (try waitForDecision(job)).conflict.?);
+    try std.testing.expect(job.decide(.overwrite, false));
+    try waitForJob(job);
+    try std.testing.expectEqual(.file, (try tmp.dir.statFile(io, "target", .{})).kind);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "outside/source", .{}));
 }

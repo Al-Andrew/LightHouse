@@ -133,18 +133,31 @@ Enter/Escape dismisses the result, and both panes refresh after every
 job, including failures and cancellation. Only one file job runs at a time.
 Quitting cancels and joins the worker before shutdown.
 
-Copies include hidden children, preserve symlinks as links (including broken
-links), and support regular files and directories. A copied regular file is
-published atomically after its data is complete. Existing destinations are
-always refused, including dangling symlinks; directories are not merged. A job
-stops at its first error and reports the path and completed item count. Completed
-items remain; an interrupted directory copy may leave a partial directory, but
-an unfinished regular file is not published. A changing regular file is rejected
-if its size or timestamps change during copying.
+Copies include hidden children and preserve symlinks as entries, including broken
+links. Existing directories merge automatically, preserving unrelated destination
+contents. An existing directory target still places each source under its basename.
 
-Moves/renames currently use an atomic rename on the same filesystem. Moves
-between filesystems fail with the source retained. Overwrite/skip prompts,
-cross-filesystem moves and recursive parent creation are later work.
+File/link conflicts offer Overwrite, Skip, or Cancel job. Directory type mismatches
+offer only Skip or Cancel; no destination tree is deleted. Space toggles an initially
+unchecked Apply to all choice for matching conflicts in this job. Regular-file
+choices never authorize symlink replacement. A destination changed during a prompt
+requires fresh consent. Source aliases and directory descendants are refused.
+
+Copy/move entry errors offer Retry, Skip, or Cancel, with an initially unchecked
+Skip all errors of this kind option. Retry resumes the failed stage; successful
+children and file data are not replayed for traversal or finalization failures.
+Deletion and mkdir retain their existing error results.
+
+Regular-file overwrite publishes only after preparation and validation; failed or
+canceled preparation leaves the old destination intact. Symlink targets are never
+followed for replacement. Completed work remains after cancel/error, and a partial
+new directory may remain. Results report transferred entries, skips, errors and
+incomplete directories; partial work is labeled Partial. Completed bytes count
+published copies, excluding failed attempts.
+
+Moves use same-filesystem rename. Merged moves leave skipped children at source
+and remove source directories only when empty. Cross-filesystem moves remain
+unsupported, with no copy/delete fallback. Recursive parent creation is later work.
 Copies do not preserve ownership, ACLs, extended attributes, sparse allocation,
 or hard-link relationships. Recursive copying and deletion are limited to 128 levels.
 

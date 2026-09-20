@@ -167,3 +167,12 @@ F4 opens a configured terminal editor in a separate full-area session. JSON argv
 or quoted EDITOR configuration launches directly, with literal file arguments.
 Deterministic PTY fixtures exercise input, resizing, shell independence, normal
 and failed exit, configuration, eligibility and child cleanup. F3 remains open.
+
+## Delivered copy/move recovery (#24)
+
+Directory merge, explicit overwrite/skip/cancel decisions and per-entry
+retry/skip/cancel now share one retained Job workflow. Policies separate regular
+files, symlinks and mismatches and reset per job. Controlled I/O checks cover
+transfer, traversal, finalization and move cleanup; PTY checks cover fresh consent,
+checkbox defaults and terminal blocking through result dismissal. Cross-filesystem
+moves and recursive destination replacement remain unsupported.

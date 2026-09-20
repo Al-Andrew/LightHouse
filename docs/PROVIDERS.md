@@ -167,3 +167,18 @@ do not add shell syntax, spacing, or paste framing. Empty/control-character
 references are refused. LightHouse quotes for POSIX shell syntax, appends one
 space, and admits the entire insertion before taking terminal focus. Original
 filename bytes are retained; escaped display labels never become input.
+
+## Copy/move execution decisions
+
+Provider preparation continues to copy source and destination paths into the
+local Job. No borrowed Pane listing is retained by a worker or waiting prompt.
+Providers do not own conflict or retry policy. The local executor merges
+existing directories and replaces file/link entries only after validated consent;
+a final destination symlink remains an entry, including links to directories.
+Existing explicit parent-path traversal rules still apply to target input.
+
+One Job retains its request and worker-owned child paths through each decision.
+Prompt views borrow those paths until the next decision/cancel/completion mutation.
+The caller must not retain them across that boundary. Conflict/error policies
+are local to this Job and released with it. Unsupported Provider combinations
+still fail during preparation, before any worker or prompt is started.

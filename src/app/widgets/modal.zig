@@ -27,7 +27,10 @@ pub const Modal = struct {
                 box.label(0, 1, "Any key closes", @import("../theme.zig").dialog);
             },
             .confirm_delete => |job| try dialogs.paintDeleteConfirmation(painter, job, self.state.view().rejection),
-            .none => if (self.state.view().operation) |job| try dialogs.paintOperation(painter, job),
+            .none => if (self.state.view().operation) |job| {
+                try dialogs.paintOperation(painter, job);
+                dialogs.paintDecisionPolicy(painter, job, self.state.view().decision_all);
+            },
         }
     }
 
