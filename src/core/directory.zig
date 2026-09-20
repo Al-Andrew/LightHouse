@@ -1,4 +1,4 @@
-//! Provider-neutral listing data. A completed snapshot owns its names and path.
+//! Provider-neutral listing metadata and provisional location operations.
 const std = @import("std");
 
 pub const Sort = enum { name, size, modified };
@@ -13,11 +13,10 @@ pub const Entry = struct {
     directory: bool,
     size: ?u64,
     modified: ?i64,
-    selected: bool = false,
 };
 pub const Snapshot = struct {
     arena: std.heap.ArenaAllocator,
-    path: []const u8,
+    locator: []const u8,
     entries: []Entry,
     options: Options,
     pub fn deinit(self: *Snapshot) void {
@@ -25,14 +24,88 @@ pub const Snapshot = struct {
     }
 };
 
-pub const Provider = struct {
-    // Called on a worker. Context must outlive its pane; ownership of a returned
-    // snapshot transfers to the UI only after the scan completes. This is an
-    // internal interface, not the future native-plugin ABI.
-    context: ?*anyopaque = null,
-    scan: *const fn (?*anyopaque, std.Io, []const u8, Options, *const std.atomic.Value(bool)) anyerror!Snapshot,
+/// Equality uses adapter identity and canonical opaque locator, never display text.
+pub const Location = struct {
+    provider: *const anyopaque,
+    locator: []const u8,
+    pub fn eql(a: Location, b: Location) bool {
+        return a.provider == b.provider and std.mem.eql(u8, a.locator, b.locator);
+    }
 };
-pub const local: Provider = .{ .scan = scanLocal };
+pub const Resolution = union(enum) { user_input: []const u8, child: []const u8, parent, root };
+pub const Capabilities = struct { source_read: bool = false, destination_write: bool = false };
+
+/// Provisional internal interface; see docs/PROVIDERS.md for ownership/threading.
+pub const Provider = struct {
+    identity: *const anyopaque,
+    context: ?*anyopaque = null,
+    resolve: *const fn (?*anyopaque, std.mem.Allocator, []const u8, Resolution) anyerror![]const u8,
+    has_parent: *const fn (?*anyopaque, []const u8) bool,
+    display: *const fn (?*anyopaque, []const u8) []const u8,
+    parent_hint: *const fn (?*anyopaque, []const u8) ?[]const u8,
+    capabilities: *const fn (?*anyopaque, []const u8) Capabilities,
+    scan: *const fn (?*anyopaque, std.Io, []const u8, Options, *const std.atomic.Value(bool)) anyerror!Snapshot,
+
+    pub fn location(self: Provider, locator: []const u8) Location {
+        return .{ .provider = self.identity, .locator = locator };
+    }
+    /// Explicit bridge into the sole supported file-job executor.
+    /// Local file-action targets retain OS path traversal (including symlink/..).
+    /// Navigation normalization must not redirect a file job's destination.
+    pub fn localTarget(self: Provider, allocator: std.mem.Allocator, base: []const u8, input: []const u8) ![]const u8 {
+        _ = try self.localPath(base);
+        const expanded = try expandLocalInput(allocator, input);
+        defer allocator.free(expanded);
+        return if (std.fs.path.isAbsolute(expanded)) allocator.dupe(u8, expanded) else std.fs.path.join(allocator, &.{ base, expanded });
+    }
+    pub fn localPath(self: Provider, locator: []const u8) ![]const u8 {
+        if (self.identity != local.identity) return error.UnsupportedOperation;
+        return locator;
+    }
+};
+const local_identity: u8 = 0;
+pub const local: Provider = .{
+    .identity = &local_identity,
+    .resolve = resolveLocal,
+    .has_parent = localHasParent,
+    .display = localDisplay,
+    .parent_hint = localParentHint,
+    .capabilities = localCapabilities,
+    .scan = scanLocal,
+};
+fn localHasParent(_: ?*anyopaque, path: []const u8) bool {
+    return !std.mem.eql(u8, path, "/");
+}
+fn localDisplay(_: ?*anyopaque, path: []const u8) []const u8 {
+    return path;
+}
+fn localParentHint(_: ?*anyopaque, path: []const u8) ?[]const u8 {
+    return std.fs.path.basename(path);
+}
+fn localCapabilities(_: ?*anyopaque, _: []const u8) Capabilities {
+    return .{ .source_read = true, .destination_write = true };
+}
+
+/// Home expansion belongs to the local adapter, including file-action input.
+pub fn expandLocalInput(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
+    if (value.len > 0 and value[0] == '~' and (value.len == 1 or value[1] == '/')) {
+        const c = @import("../platform/linux.zig").c;
+        if (c.getenv("HOME")) |home| return std.fs.path.join(allocator, &.{ std.mem.span(home), if (value.len > 1) value[2..] else "" });
+    }
+    return allocator.dupe(u8, value);
+}
+fn resolveLocal(_: ?*anyopaque, allocator: std.mem.Allocator, base: []const u8, resolution: Resolution) ![]const u8 {
+    return switch (resolution) {
+        .root => allocator.dupe(u8, "/"),
+        .parent => allocator.dupe(u8, std.fs.path.dirname(base) orelse "/"),
+        .child => |name| std.fs.path.resolve(allocator, &.{ base, name }),
+        .user_input => |input| blk: {
+            const expanded = try expandLocalInput(allocator, input);
+            defer allocator.free(expanded);
+            break :blk std.fs.path.resolve(allocator, &.{ base, expanded });
+        },
+    };
+}
 
 fn scanLocal(_: ?*anyopaque, io: std.Io, path: []const u8, options: Options, canceled: *const std.atomic.Value(bool)) !Snapshot {
     var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
@@ -71,7 +144,7 @@ fn scanLocal(_: ?*anyopaque, io: std.Io, path: []const u8, options: Options, can
     }
     if (canceled.load(.acquire)) return error.Canceled;
     std.mem.sort(Entry, entries.items, options, lessThan);
-    return .{ .arena = arena, .path = try allocator.dupe(u8, path), .entries = entries.items, .options = options };
+    return .{ .arena = arena, .locator = try allocator.dupe(u8, path), .entries = entries.items, .options = options };
 }
 
 fn lessThan(options: Options, a: Entry, b: Entry) bool {
@@ -129,4 +202,28 @@ test "local provider keeps raw names, follows directory links, and tolerates bro
     try std.testing.expectEqual(@as(usize, 5), with_hidden.entries.len);
     canceled.store(true, .release);
     try std.testing.expectError(error.Canceled, local.scan(null, io, path_buffer[0..len], .{}, &canceled));
+}
+
+test "local resolution owns absolute relative home child parent and root semantics" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { base: []const u8, resolution: Resolution, expected: []const u8 }{
+        .{ .base = "/tmp/a", .resolution = .{ .user_input = "../b" }, .expected = "/tmp/b" },
+        .{ .base = "/tmp/a", .resolution = .{ .user_input = "/usr/../var" }, .expected = "/var" },
+        .{ .base = "/tmp", .resolution = .{ .child = "~literal" }, .expected = "/tmp/~literal" },
+        .{ .base = "/tmp/a", .resolution = .parent, .expected = "/tmp" },
+        .{ .base = "/tmp/a", .resolution = .root, .expected = "/" },
+    };
+    for (cases) |case| {
+        const resolved = try local.resolve(null, allocator, case.base, case.resolution);
+        defer allocator.free(resolved);
+        try std.testing.expectEqualStrings(case.expected, resolved);
+    }
+    const c = @import("../platform/linux.zig").c;
+    if (c.getenv("HOME")) |home| {
+        const resolved = try local.resolve(null, allocator, "/tmp", .{ .user_input = "~/folder" });
+        defer allocator.free(resolved);
+        const expected = try std.fs.path.resolve(allocator, &.{ std.mem.span(home), "folder" });
+        defer allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, resolved);
+    }
 }

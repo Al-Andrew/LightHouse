@@ -9,11 +9,11 @@ pub const KeyBar = struct {
 
     pub fn paint(self: *KeyBar, _: *toolkit.Widget, painter: ui.Painter) !void {
         const state = self.state.view();
-        paintActions(painter, state.focus != .terminal and state.modal == .none and state.operation == null);
+        paintActions(painter, state.focus != .terminal and state.modal == .none and state.operation == null, self.state);
     }
 };
 
-fn paintActions(painter: ui.Painter, pane_active: bool) void {
+fn paintActions(painter: ui.Painter, pane_active: bool, state: *const State) void {
     const actions = [_]struct { key: []const u8, label: []const u8 = "" }{
         .{ .key = "1", .label = "Help" },
         .{ .key = "2" },
@@ -32,7 +32,14 @@ fn paintActions(painter: ui.Painter, pane_active: bool) void {
         const x = painter.rect.width * i / actions.len;
         const end = painter.rect.width * (i + 1) / actions.len;
         const slot = painter.child(.{ .x = x, .y = 0, .width = end - x, .height = 1 });
-        const enabled = pane_active and action.label.len > 0;
+        const supported = switch (i) {
+            4 => state.actionAvailable(.copy),
+            5 => state.actionAvailable(.move),
+            6 => state.actionAvailable(.mkdir),
+            7 => state.actionAvailable(.delete),
+            else => true,
+        };
+        const enabled = pane_active and action.label.len > 0 and supported;
         var number_style = key_style;
         if (!enabled) number_style.fg = theme.disabled_key;
         slot.label(0, 0, action.key, number_style);

@@ -213,3 +213,11 @@ successful, failed, canceled, and launch-failed jobs. Allocation-failure and
 blocked-work tests verify cleanup; routing tests use `View.event` for compact
 pane input, editor/help/delete paste isolation, terminal forwarding, and result
 retention across focus changes.
+
+## Provider observations
+
+File panes render provider display text and pane-owned row marks. Navigation and
+path editors delegate location semantics to the provider. The function-key bar
+uses `State.actionAvailable` for file actions, and workflow submission rechecks
+support before constructing a local job. Provider identity, snapshot ownership,
+refresh rules and executor boundaries are documented in [PROVIDERS.md](PROVIDERS.md).
