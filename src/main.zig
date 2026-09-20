@@ -26,7 +26,9 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, args[i], "--help") or std.mem.eql(u8, args[i], "-h")) {
             try lighthouse.platform.writeAll(1, "LightHouse: dual-pane file browser with an integrated terminal\n" ++
                 "Usage: lighthouse [--shell /path/to/shell]\n\n" ++
-                "Ctrl+G switches between panes and shell.\n" ++
+                "Ctrl+G switches focus; Ctrl+J hides/shows or starts the shell.\n" ++
+                "Shell exit leaves browsing usable. Jobs block shell input until dismissed.\n" ++
+                "LF Enter is indistinguishable from Ctrl+J; CR Return stays Enter.\n" ++
                 "In panes: arrows/PageUp/PageDown navigate, Enter opens directories,\n" ++
                 "Backspace goes up, Tab switches pane, Space/Insert marks entries.\n" ++
                 "Shift+Up/Down/Home/End toggles marks while moving.\n" ++
@@ -34,7 +36,7 @@ pub fn main(init: std.process.Init) !void {
                 "s cycles sorting, r reverses it, F1 shows help, q/F10 quits.\n" ++
                 "F5 copies, F6 moves/renames, F7 creates a directory, F8 deletes.\n" ++
                 "+/- resizes the shell, z zooms, Shift+PgUp/PgDn scrolls its history.\n" ++
-                "In shell: all keys except Ctrl+G go to the child application.\n");
+                "In shell: all keys except Ctrl+G/Ctrl+J go to the child application.\n");
             return;
         } else if (std.mem.eql(u8, args[i], "--shell") and i + 1 < args.len) {
             i += 1;

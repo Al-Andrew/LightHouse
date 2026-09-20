@@ -11,6 +11,7 @@ pub const Modal = struct {
         return switch (self.state.view().modal) {
             .editor => |editor| dialogs.editorSize(editor.action, self.state.view().rejection),
             .help => dialogs.help_size,
+            .notice => .{ .width = 80, .height = 4 },
             .confirm_delete => |job| dialogs.deleteSize(job, self.state.view().rejection),
             .none => dialogs.operation_size,
         };
@@ -20,6 +21,11 @@ pub const Modal = struct {
         switch (self.state.view().modal) {
             .editor => |editor| try dialogs.paintPathInput(painter, editor.input, editor.action, self.state.activePane(), self.state.view().rejection),
             .help => dialogs.paintHelp(painter),
+            .notice => |message| {
+                const box = toolkit.dialog.beginIn(painter, 80, 4, @import("../theme.zig").dialog).inset(1);
+                try box.text(0, 0, message, @import("../theme.zig").dialog);
+                box.label(0, 1, "Any key closes", @import("../theme.zig").dialog);
+            },
             .confirm_delete => |job| try dialogs.paintDeleteConfirmation(painter, job, self.state.view().rejection),
             .none => if (self.state.view().operation) |job| try dialogs.paintOperation(painter, job),
         }

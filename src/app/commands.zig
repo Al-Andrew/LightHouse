@@ -14,6 +14,7 @@ pub const Id = enum {
     absolute_path,
     refresh,
     toggle_terminal,
+    visibility_terminal,
     focus_terminal,
     zoom_terminal,
     grow_terminal,
@@ -55,6 +56,7 @@ pub const descriptions = [_]Description{
     .{ .id = .absolute_path, .label = "Absolute", .help = "Absolute path", .bindings = &.{.{ .byte = '/', .text = "/" }} },
     .{ .id = .refresh, .label = "Refresh", .help = "Refresh directory", .bindings = &.{.{ .byte = input.control('r'), .text = "Ctrl+R" }} },
     .{ .id = .toggle_terminal, .label = "Shell/pane", .help = "Shell/pane", .bindings = &.{.{ .byte = input.control('g'), .text = "Ctrl+G" }} },
+    .{ .id = .visibility_terminal, .label = "Show/hide", .help = "Show/hide shell", .bindings = &.{.{ .key = .enter, .byte = 10, .text = "Ctrl+J" }} },
     .{ .id = .focus_terminal, .label = "Shell", .help = "Focus shell", .bindings = &.{.{ .byte = 't', .text = "t" }} },
     .{ .id = .zoom_terminal, .label = "Zoom", .help = "Zoom shell", .bindings = &.{.{ .byte = 'z', .text = "z" }} },
     .{ .id = .grow_terminal, .label = "Taller", .help = "Taller shell", .bindings = &.{.{ .byte = '+', .text = "+" }} },
@@ -97,6 +99,7 @@ pub const help_groups = [_][]const Id{
     &.{ .path, .absolute_path },
     &.{.refresh},
     &.{ .toggle_terminal, .focus_terminal, .zoom_terminal },
+    &.{.visibility_terminal},
     &.{ .grow_terminal, .shrink_terminal },
     &.{ .history_up, .history_down },
 };

@@ -59,7 +59,11 @@ pub const View = struct {
 
     pub fn event(self: *View, ev: *const ui.Event) !void {
         try self.sync();
-        _ = try self.tree.dispatch(ev);
+        // LF must reach visibility policy before a Pane consumes Enter. Modal
+        // input retains LF-as-Enter, and paste events never resolve a binding.
+        if (!self.state.view().modalVisible() and @import("commands.zig").resolve(ev) == .visibility_terminal) {
+            _ = try self.state.invoke(.visibility_terminal, self.emulator);
+        } else _ = try self.tree.dispatch(ev);
         try self.sync();
     }
 
@@ -81,9 +85,10 @@ const Root = struct {
     view: *View,
 
     pub fn layout(self: *Root, _: *ui.Widget, size: ui.Size) void {
-        const geometry = Layout.calculate(size, self.view.state.view().adjustment, self.view.state.view().zoom);
+        const geometry = Layout.forState(size, self.view.state.view().adjustment, self.view.state.view().zoom, self.view.state.view().terminal_visible);
         self.view.pane_area.setVisible(!geometry.compact);
         self.view.pane_area.setRect(.{ .x = 0, .y = 0, .width = size.width, .height = geometry.panes_height });
+        self.view.terminal.setVisible(self.view.state.view().terminal_visible);
         self.view.terminal.setRect(geometry.terminal);
         self.view.key_bar.setVisible(size.height > 1);
         self.view.key_bar.setRect(.{ .x = 0, .y = size.height -| 1, .width = size.width, .height = 1 });
@@ -213,9 +218,9 @@ test "View routes compact pane input terminal controls and workflow modals once"
     try std.testing.expect(state.view().operation.?.status() == .running);
     _ = try state.poll();
     try std.testing.expectEqual(error.ConcurrencyUnavailable, state.view().operation.?.status().finished.failure.?.err);
-    // Enter in the persistent terminal cannot dismiss the retained result.
-    try feed(view, &decoder, "\x07\r\x07");
-    try std.testing.expectEqualStrings("q\x03\r", emulator.queued());
+    // Job results retain input scope and block terminal interaction.
+    try feed(view, &decoder, "\x07\n");
+    try std.testing.expectEqualStrings("q\x03", emulator.queued());
     try std.testing.expect(view.modal.focused());
     try std.testing.expect(state.view().operation != null);
     try view.event(&.{ .key = .enter });
@@ -330,7 +335,7 @@ test "command presentation and direct invocation recheck sources modal focus and
     // Launch failure stays uncollected across availability, invocation and paint.
     for (0..3) |_| {
         try std.testing.expect(state.available(.quit));
-        try std.testing.expect(state.available(.toggle_terminal));
+        try std.testing.expect(!state.available(.toggle_terminal));
         try std.testing.expect(!state.available(.mkdir));
         try std.testing.expect(!try state.invoke(.copy, emulator));
         try view.paint(&frame, .{ .width = 80, .height = 24 });
@@ -341,8 +346,10 @@ test "command presentation and direct invocation recheck sources modal focus and
     try view.event(&.{ .key = .f5 });
     try std.testing.expect(state.view().modal == .none);
     try feed(view, &decoder, "\x07");
-    try std.testing.expect(view.terminal.focused());
-    try std.testing.expect(!try state.invoke(.quit, emulator));
+    try std.testing.expect(view.modal.focused());
+    try std.testing.expect(!try state.invoke(.visibility_terminal, emulator));
+    state.toggleTerminal();
+    try std.testing.expect(state.view().focus != .terminal);
     try feed(view, &decoder, "\x07");
     try std.testing.expect(view.modal.focused());
     try view.event(&.{ .key = .f10 });
@@ -807,4 +814,46 @@ fn settlePane(state: *State, pane: *@import("../core/pane.zig").Pane) !void {
         try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
     }
     return error.PaneReadTimedOut;
+}
+
+test "terminal visibility distinguishes raw LF from Return synthetic Enter and paste" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Pane = @import("../core/pane.zig").Pane;
+    const left = try Pane.create(io, allocator, "/", .{});
+    defer left.destroy();
+    const right = try Pane.create(io, allocator, "/", .{});
+    defer right.destroy();
+    const emulator = try Emulator.create(io, allocator, 80, 8);
+    defer emulator.destroy();
+    const state = try State.create(io, allocator, .{ left, right });
+    defer state.destroy();
+    const view = try View.create(allocator, state, emulator);
+    defer view.destroy();
+    var decoder: ui.input.Decoder = .{};
+    try feed(view, &decoder, "\r");
+    try view.event(&.{ .key = .enter });
+    try std.testing.expect(state.view().terminal_visible);
+    try feed(view, &decoder, "\n");
+    try std.testing.expect(!state.view().terminal_visible);
+    state.toggleTerminal();
+    try std.testing.expectEqual(.left, state.view().focus);
+    try std.testing.expect(!try state.invoke(.toggle_terminal, emulator));
+    for ([_]ui.Size{ .{ .width = 80, .height = 24 }, .{ .width = 7, .height = 4 } }) |size| {
+        try view.resize(size);
+        try std.testing.expect(view.pane_area.visible());
+        try std.testing.expectEqual(size.height - 1, view.pane_area.rect().height);
+        try std.testing.expect(!view.terminal.visible());
+    }
+    try feed(view, &decoder, "\n");
+    try std.testing.expectEqual(.terminal, state.view().focus);
+    try feed(view, &decoder, "\x1b[200~\n\x07\x1b[201~\r");
+    try std.testing.expectEqualStrings("\n\x07\r", emulator.queued());
+    state.terminalEnded();
+    try std.testing.expect(!state.view().terminal_exists);
+    try std.testing.expect(!state.view().terminal_visible);
+    try std.testing.expectEqual(.left, state.view().focus);
+    try std.testing.expect(try state.invoke(.visibility_terminal, emulator));
+    try std.testing.expect(state.view().modal == .notice);
+    try std.testing.expectEqual(.left, state.view().focus);
 }

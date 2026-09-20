@@ -109,11 +109,11 @@ belong to the workflow's error/result handling.
 Bindings resolve inside the receiving widget scope. Unhandled pane events
 bubble to root dispatch; modal editors, confirmations, and help consume their
 own events first. The job modal resolves the same built-ins and invokes the
-same controller policy, which admits only Quit and Ctrl+G there. Unavailable
+same controller policy, which admits only Quit there. Unavailable
 recognized commands stay consumed in that scope. Terminal keys, including F5,
-q, and F10, continue to reach the child; only a Ctrl+G key bubbles to controller
-focus policy. Ctrl+G bytes inside a paste remain data. No application-wide
-interceptor runs before widgets. Configurable bindings and runtime/plugin
+q, and F10, continue to reach the child; Ctrl+G and Ctrl+J keys reach controller
+policy. Their bytes inside a paste remain data. Raw LF is routed before ordinary
+Pane Enter handling; modal inputs retain their own Enter behavior. Configurable bindings and runtime/plugin
 command registration remain future work.
 
 ## Defining a widget
@@ -205,7 +205,7 @@ visit that widget and bubble through its parents until a handler returns `true`.
 `View.event` is the sole application input entry point. File-pane widgets handle
 local navigation and marking; unhandled global bindings bubble to the root's
 `State.globalEvent`. The root never retries pane bindings. Terminal input is
-handled by the terminal widget; only Ctrl+G key events bubble to the root. Modal
+handled by the terminal widget; Ctrl+G and Ctrl+J key events reach controller policy. Modal
 widgets call `State.modalEvent` and consume every event, including ignored paste
 events.
 The controller owns focus policy; the view only projects its observed focus and
@@ -272,3 +272,19 @@ job. The controller owns editor/confirmation payloads, launches prepared jobs,
 collects completion, refreshes both panes and retains results until dismissal.
 Provider identity, snapshot ownership, refresh rules and the local execution seam
 are documented in [PROVIDERS.md](PROVIDERS.md).
+
+## Persistent terminal lifetime
+
+The controller observes session existence separately from visibility and focus.
+Ctrl+G only changes focus for an existing visible session. Ctrl+J hides/shows or
+starts a session; t and z also show/create. Every retained file job blocks these
+routes, including direct calls, until dismissal. Hidden sessions keep draining.
+Hidden layouts give Panes all rows above the key bar, including small windows.
+
+`terminal/session.zig` owns the PTY and a stable emulator adapter. Runtime launch
+prepares argv, environment, PTY and directory descriptors in the parent; the
+forked child uses only async-signal-safe operations before execve. EOF retires
+polling/resize descriptors, reaps the child and discards queued input. Restart
+replaces all emulator/paste state. Host input remains available after EOF even
+when the old terminal queue was full. Shell EOF never cancels a file job or closes
+a modal. Explicit quit and host shutdown still release all sessions and workers.

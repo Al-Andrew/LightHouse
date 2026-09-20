@@ -94,10 +94,10 @@ pub fn paintOperation(painter: ui.Painter, job: *const operations.Job) !void {
             if (failure.path) |path| try inside.text(0, 3, path, style);
             inside.label(0, 4, if (request.kind == .copy) "Completed copies remain; unfinished folders may be partial." else if (request.kind == .delete) "Deleted entries stay deleted; folders may be partly removed." else "Completed actions remain; remaining items were not processed.", style);
         }
-        inside.label(0, 5, "Enter / Esc close  |  Ctrl+G shell", style);
+        inside.label(0, 5, "Enter / Esc close", style);
     } else {
         inside.label(0, 2, if (status == .canceling) "Canceling..." else if (request.kind == .delete) "Deleting..." else "Working... Existing destinations are never replaced.", style);
-        inside.label(0, 5, "Esc cancel  |  Ctrl+G shell  |  F10 quit", style);
+        inside.label(0, 5, "Esc cancel  |  F10 quit", style);
     }
 }
 

@@ -97,32 +97,74 @@ pub const Pty = struct {
     pid: c.pid_t,
     reaped: bool = false,
 
-    /// Spawn before starting worker threads: the child configures its environment
-    /// between forkpty and exec. The parent's environment is unchanged.
-    pub fn spawn(shell: [:0]const u8, dimensions: Size, termios: *const c.termios) !Pty {
-        if (c.access(shell.ptr, c.X_OK) != 0) return error.ShellNotExecutable;
-        var fd: c_int = -1;
+    /// All allocations/environment preparation happen in the parent. The forked
+    /// child uses only async-signal-safe operations before execve, so runtime
+    /// launch is safe after directory and file-job workers have started.
+    pub fn spawn(allocator: std.mem.Allocator, argv: []const [:0]const u8, cwd: [:0]const u8, dimensions: Size, termios: *const c.termios) !Pty {
+        if (argv.len == 0 or c.access(argv[0].ptr, c.X_OK) != 0) return error.ShellNotExecutable;
+        const directory = c.open(cwd.ptr, c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC);
+        if (directory < 0) return error.WorkingDirectoryUnavailable;
+        defer _ = c.close(directory);
+        var arguments: std.ArrayList(?[*:0]const u8) = .empty;
+        defer arguments.deinit(allocator);
+        for (argv) |arg| try arguments.append(allocator, arg.ptr);
+        try arguments.append(allocator, null);
+        var environment: std.ArrayList(?[*:0]const u8) = .empty;
+        defer environment.deinit(allocator);
+        var i: usize = 0;
+        while (c.environ[i]) |entry| : (i += 1) {
+            const value = std.mem.span(entry);
+            if (std.mem.startsWith(u8, value, "TERM=") or std.mem.startsWith(u8, value, "COLORTERM=") or std.mem.startsWith(u8, value, "TERM_PROGRAM=")) continue;
+            try environment.append(allocator, entry);
+        }
+        try environment.appendSlice(allocator, &.{ "TERM=xterm-256color", "COLORTERM=truecolor", null });
+        var pipe: [2]c_int = undefined;
+        if (c.pipe2(&pipe, c.O_CLOEXEC) != 0) return error.SpawnFailed;
+        defer _ = c.close(pipe[0]);
+        defer if (pipe[1] >= 0) {
+            _ = c.close(pipe[1]);
+        };
+        var master: c_int = -1;
+        var slave: c_int = -1;
         var ws = std.mem.zeroes(c.winsize);
         ws.ws_col = dimensions.cols;
         ws.ws_row = dimensions.rows;
-        const pid = c.forkpty(&fd, null, termios, &ws);
-        if (pid < 0) return error.SpawnFailed;
+        if (c.openpty(&master, &slave, null, termios, &ws) != 0) {
+            return error.SpawnFailed;
+        }
+        defer _ = c.close(slave);
+        errdefer _ = c.close(master);
+        if (c.fcntl(master, c.F_SETFD, c.FD_CLOEXEC) < 0) return error.PtySetupFailed;
+        const pid = c.fork();
         if (pid == 0) {
-            // Restore dispositions inherited from the UI before running a shell.
-            for ([_]c_int{ c.SIGINT, c.SIGTERM, c.SIGHUP, c.SIGPIPE, c.SIGQUIT }) |sig| {
-                _ = c.signal(sig, c.SIG_DFL);
-            }
-            _ = c.setenv("TERM", "xterm-256color", 1);
-            _ = c.setenv("COLORTERM", "truecolor", 1);
-            _ = c.unsetenv("TERM_PROGRAM");
-            _ = c.execl(shell.ptr, shell.ptr, @as([*:0]const u8, "-i"), @as(?[*:0]const u8, null));
-            const msg = "LightHouse: could not execute shell\r\n";
-            _ = c.write(2, msg.ptr, msg.len);
+            _ = c.close(pipe[0]);
+            _ = c.close(master);
+            for ([_]c_int{ c.SIGINT, c.SIGTERM, c.SIGHUP, c.SIGPIPE, c.SIGQUIT }) |sig| _ = c.signal(sig, c.SIG_DFL);
+            const ready = c.setsid() >= 0 and c.ioctl(slave, c.TIOCSCTTY, @as(c_int, 0)) == 0 and
+                c.dup2(slave, 0) >= 0 and c.dup2(slave, 1) >= 0 and c.dup2(slave, 2) >= 0 and c.fchdir(directory) == 0;
+            if (slave > 2) _ = c.close(slave);
+            if (ready) _ = c.execve(argv[0].ptr, @ptrCast(arguments.items.ptr), @ptrCast(environment.items.ptr));
+            const failure: u8 = 1;
+            _ = c.write(pipe[1], &failure, 1);
             c._exit(127);
         }
-        var self: Pty = .{ .fd = fd, .pid = pid };
-        errdefer self.deinit();
-        if (c.fcntl(fd, c.F_SETFL, c.O_NONBLOCK) < 0 or c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC) < 0) return error.PtySetupFailed;
+        _ = c.close(pipe[1]);
+        pipe[1] = -1;
+        if (pid < 0) return error.SpawnFailed;
+        const self: Pty = .{ .fd = master, .pid = pid };
+        // self now owns master; cleanup on subsequent failure closes it once.
+        var failure: u8 = 0;
+        var count: isize = undefined;
+        while (true) {
+            count = c.read(pipe[0], &failure, 1);
+            if (count >= 0 or errno() != c.EINTR) break;
+        }
+        if (count != 0 or c.fcntl(master, c.F_SETFL, c.O_NONBLOCK) < 0) {
+            // Outer errdefer owns the descriptor; reap the failed child here.
+            _ = c.kill(pid, c.SIGKILL);
+            while (c.waitpid(pid, null, 0) < 0 and errno() == c.EINTR) {}
+            return error.SpawnFailed;
+        }
         return self;
     }
 

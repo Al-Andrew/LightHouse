@@ -9,7 +9,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from support import App, wait
+from support import App, wait, go, in_pane
 
 
 def shell_and_resize():
@@ -111,9 +111,114 @@ def shell_exit():
     try:
         app.start()
         app.send("\x07exit\r")
+        wait(
+            app, lambda: not Path(f"/proc/{app.shell_pid}").exists(), "shell not reaped"
+        )
+        assert app.proc.poll() is None, "shell EOF exited LightHouse"
+        app.expect("Name")
+        app.send("\n")
+        app.expect("LH_PROMPT>")
+        app.send("printf '<%s>\\n' RESTARTED\r")
+        app.expect("<RESTARTED>")
+        app.send("\x07q")
         app.finished()
     finally:
         app.close()
+
+
+def terminal_lifetime():
+    with tempfile.TemporaryDirectory(prefix="lh-lifetime-") as directory:
+        root = Path(directory)
+        work = root / "work"
+        work.mkdir()
+        report = root / "output"
+        app = App(cwd=root)
+        try:
+            app.start()
+            app.send(
+                "\x07LH_KEEP=kept; sleep 0.2; printf hidden > " + str(report) + "\r"
+            )
+            app.send("\n")
+            app.pump(0.1)
+            assert "LH_PROMPT>" not in app.screen.text()
+            wait(app, report.exists, "hidden child did not run")
+            app.resize(12, 4)
+            app.pump(0.1)
+            assert "LH_PROMPT>" not in app.screen.text()
+            app.resize(100, 30)
+            app.send("\n")
+            app.send("printf '<%s>\\n' \"$LH_KEEP\"\r")
+            app.expect("<kept>")
+            app.send("\x07")
+            go(app, work)
+            app.send("\x07")
+
+            def exit_current_shell():
+                children = (
+                    Path(f"/proc/{app.proc.pid}/task/{app.proc.pid}/children")
+                    .read_text()
+                    .split()
+                )
+                assert len(children) == 1, "expected one current shell child"
+                shell_pid = int(children[0])
+                app.send("exit\r")
+                wait(
+                    app,
+                    lambda: not Path(f"/proc/{shell_pid}").exists(),
+                    "current shell not reaped",
+                )
+
+            for cycle in range(3):
+                exit_current_shell()
+                assert app.proc.poll() is None
+                app.send("\n")
+                app.expect("LH_PROMPT>")
+                app.send("printf 'cwd:'; pwd\r")
+                app.expect("cwd:" + str(work))
+            exit_current_shell()
+            work.rmdir()
+            app.send("\n")
+            app.expect("WorkingDirectoryUnavailable")
+            app.send("\r")
+            assert app.proc.poll() is None
+            go(app, root)
+            in_pane(app, 0, "output")
+            app.send("t")
+            app.expect("LH_PROMPT>")
+            app.send("\x07q")
+            app.finished()
+        finally:
+            app.close()
+
+
+def relative_shell_and_queued_exit():
+    with tempfile.TemporaryDirectory(prefix="lh-shell-") as directory:
+        root = Path(directory)
+        (root / "shell").symlink_to("/bin/sh")
+        (root / "sub").mkdir()
+        app = App(shell="./shell", cwd=root)
+        try:
+            app.start()
+            go(app, root / "sub")
+            app.expect("0 items")
+            app.send("\x07sleep 0.1; exit\r")
+            # Queue input while the exiting shell cannot consume it. It must
+            # never reach the replacement, nor prevent host input after EOF.
+            app.send("\x1b[200~" + "OLD_INPUT" * 1000 + "\x1b[201~")
+            wait(
+                app,
+                lambda: not Path(f"/proc/{app.shell_pid}").exists(),
+                "old child not reaped",
+            )
+            app.send("\n")
+            app.expect("LH_PROMPT>")
+            assert "OLD_INPUT" not in app.screen.text()
+            app.send("printf '<%s>\\n' CLEAN\r")
+            app.expect("<CLEAN>")
+            app.send("\x07q")
+            app.finished()
+        finally:
+            app.close()
 
 
 def signal_under_load():
@@ -279,6 +384,8 @@ if __name__ == "__main__":
         shell_and_resize,
         geometry_and_fragmented_paste,
         shell_exit,
+        terminal_lifetime,
+        relative_shell_and_queued_exit,
         signal_under_load,
         failed_start,
         stubborn_foreground,

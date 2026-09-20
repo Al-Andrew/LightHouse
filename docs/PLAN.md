@@ -16,10 +16,9 @@ Application widgets live under `src/app/widgets/`; see [UI.md](UI.md).
 Signals/slots and the plugin portion of milestone 2, mouse interaction, and the
 remaining milestone 3 work are pending.
 
-The next feature designs are recorded in [FEATURE-DESIGN.md](FEATURE-DESIGN.md):
-a configured F4 editor, Provider-defined Ctrl+F Path insertion, independent
-terminal visibility/session lifetime, and copy/move conflict and error prompts.
-These designs are agreed; the features are not implemented yet.
+The agreed feature designs are recorded in [FEATURE-DESIGN.md](FEATURE-DESIGN.md).
+Delivery status for terminal lifetime, Path insertion, external editing, and
+copy/move decisions is recorded in the issue-specific sections below.
 
 Milestone 1 provides a pinned Ghostty dependency, a handmade cell renderer,
 persistent shell/PTY, focus switching, resizable and zoomable terminal area,
@@ -153,3 +152,10 @@ to avoid expensive internal integrity scans; `-Dghostty-debug=true` enables them
 - [Ghostty's libghostty status](https://github.com/ghostty-org/ghostty#cross-platform-libghostty-for-embeddable-terminals): libghostty-vt is usable from Zig and C; its API is still evolving.
 - [Ghostling integration example](https://github.com/ghostty-org/ghostling): demonstrates that the consumer supplies rendering/windowing around libghostty-vt. LightHouse will supply terminal-cell rendering instead.
 - [Ghostty build manifest](https://github.com/ghostty-org/ghostty/blob/main/build.zig.zon): compiler/dependency baseline inspected while planning.
+
+## Delivered terminal lifetime (#21)
+
+Persistent shell existence, visibility and focus now have independent lifetimes.
+Runtime sessions start through a process boundary safe after workers exist.
+Ctrl+J, shell EOF/restart and retained-job input blocking are covered by controller,
+View and real PTY checks. Path insertion and F4 can use the same session owner.

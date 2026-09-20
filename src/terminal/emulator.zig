@@ -53,6 +53,14 @@ pub const Emulator = struct {
         self.pending.deinit(self.allocator);
         self.allocator.destroy(self);
     }
+    /// Keep the borrowed adapter address stable while replacing all VT state.
+    pub fn reset(self: *Emulator, io: std.Io, cols: u16, rows: u16) !void {
+        const fresh = try create(io, self.allocator, cols, rows);
+        std.mem.swap(Emulator, self, fresh);
+        self.stream.handler.terminal = &self.terminal;
+        fresh.stream.handler.terminal = &fresh.terminal;
+        fresh.destroy();
+    }
     fn reply(handler: *vt.TerminalStream.Handler, bytes: []const u8) void {
         const self: *Emulator = @fieldParentPtr("terminal", handler.terminal);
         self.queue(bytes) catch {

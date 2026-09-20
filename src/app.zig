@@ -4,14 +4,13 @@ const c = platform.c;
 const toolkit = @import("lighthouse-ui");
 const ui = toolkit.screen;
 const input = toolkit.input;
-const Emulator = @import("terminal/emulator.zig").Emulator;
+const Session = @import("terminal/session.zig").Session;
 const Pane = @import("core/pane.zig").Pane;
 const State = @import("app/controller.zig").State;
 const Layout = @import("app/layout.zig").Layout;
 const View = @import("app/view.zig").View;
 const poll_interval_ms = 40;
 const read_buffer_bytes = 4 * 1024;
-const pty_reads_per_turn = 4;
 
 /// Owns one interactive application session. After a successful init, call
 /// deinit exactly once, including when run fails. The view borrows heap-owned
@@ -20,8 +19,7 @@ pub const App = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
     console: platform.Console,
-    pty: platform.Pty,
-    emulator: *Emulator,
+    session: *Session,
     panes: [2]*Pane,
     state: *State,
     view: *View,
@@ -33,7 +31,6 @@ pub const App = struct {
     decoder: input.Decoder = .{},
     last_input: std.Io.Timestamp,
     dirty: bool = true,
-    pty_eof: bool = false,
 
     /// Acquires the console, shell, panes, and widgets. Failure releases all
     /// resources acquired so far and restores the outer terminal.
@@ -42,13 +39,11 @@ pub const App = struct {
         errdefer console.deinit();
         const size = screenSize(platform.Console.size());
         const layout = Layout.calculate(size, 0, false);
-        var pty = try platform.Pty.spawn(shell, terminalSize(layout), &console.saved);
-        errdefer pty.deinit();
-        const emulator = try Emulator.create(io, allocator, @intCast(layout.terminal.width), @intCast(layout.terminal.height));
-        errdefer emulator.destroy();
-        // Spawn the shell before starting directory workers (forkpty boundary).
         const cwd = try std.process.currentPathAlloc(io, allocator);
         defer allocator.free(cwd);
+        const session = try Session.create(io, allocator, shell, cwd, terminalSize(layout), console.saved);
+        errdefer session.destroy();
+        try session.start(cwd);
         const left = try Pane.create(io, allocator, cwd, .{});
         errdefer left.destroy();
         const right = try Pane.create(io, allocator, cwd, .{});
@@ -56,7 +51,8 @@ pub const App = struct {
         const panes: [2]*Pane = .{ left, right };
         const state = try State.create(io, allocator, panes);
         errdefer state.destroy();
-        const view = try View.create(allocator, state, emulator);
+        state.attachTerminal(.{ .context = session, .start = startTerminal });
+        const view = try View.create(allocator, state, session.emulator);
         errdefer view.destroy();
         try view.resize(size);
         for (panes) |pane| try pane.refresh();
@@ -65,8 +61,7 @@ pub const App = struct {
             .io = io,
             .allocator = allocator,
             .console = console,
-            .pty = pty,
-            .emulator = emulator,
+            .session = session,
             .panes = panes,
             .state = state,
             .view = view,
@@ -88,8 +83,7 @@ pub const App = struct {
         self.state.destroy();
         self.panes[1].destroy();
         self.panes[0].destroy();
-        self.emulator.destroy();
-        self.pty.deinit();
+        self.session.destroy();
         // Restore the outer terminal only after the embedded session has ended.
         self.console.deinit();
         self.* = undefined;
@@ -104,8 +98,6 @@ pub const App = struct {
                 if (platform.shouldStop()) break;
                 return err;
             };
-            // Render the child's final output before leaving on EOF.
-            if (self.pty_eof) break;
             if (!try self.pollIo()) break;
         }
     }
@@ -126,14 +118,14 @@ pub const App = struct {
 
     fn resize(self: *App) !void {
         const size = screenSize(platform.Console.size());
-        const layout = Layout.calculate(size, self.state.view().adjustment, self.state.view().zoom);
+        const layout = Layout.forState(size, self.state.view().adjustment, self.state.view().zoom, self.state.view().terminal_visible);
         if (std.meta.eql(self.size, size) and std.meta.eql(self.layout, layout)) return;
         self.size = size;
         self.layout = layout;
         try self.view.resize(size);
-        const dimensions = terminalSize(layout);
-        try self.emulator.resize(dimensions.cols, dimensions.rows);
-        try self.pty.resize(dimensions);
+        // Hidden sessions retain the chosen split geometry and keep draining.
+        const dimensions = terminalSize(Layout.calculate(size, self.state.view().adjustment, self.state.view().zoom));
+        try self.session.resize(dimensions);
         self.state.requestRedraw();
         self.dirty = true;
     }
@@ -152,8 +144,8 @@ pub const App = struct {
     /// False means host input closed. Child EOF is handled after its final paint.
     fn pollIo(self: *App) !bool {
         var fds = [_]c.pollfd{
-            .{ .fd = 0, .events = if (self.emulator.acceptsInput()) c.POLLIN else 0, .revents = 0 },
-            .{ .fd = self.pty.fd, .events = @as(c_short, c.POLLIN) | (if (self.emulator.queued().len > 0) @as(c_short, c.POLLOUT) else 0), .revents = 0 },
+            .{ .fd = 0, .events = if (self.state.view().focus != .terminal or self.session.emulator.acceptsInput()) c.POLLIN else 0, .revents = 0 },
+            .{ .fd = if (self.session.pty) |pty| pty.fd else -1, .events = @as(c_short, c.POLLIN) | (if (self.session.emulator.queued().len > 0) @as(c_short, c.POLLOUT) else 0), .revents = 0 },
         };
         const ready = c.poll(&fds, fds.len, poll_interval_ms);
         if (ready < 0) {
@@ -161,9 +153,13 @@ pub const App = struct {
             return error.PollFailed;
         }
         if (fds[0].revents & (c.POLLERR | c.POLLHUP | c.POLLNVAL) != 0) return false;
+        // Drain/retire the old child before accepting input that could start a
+        // replacement. A full ended-session queue cannot block host input.
+        if (fds[1].revents & (c.POLLIN | c.POLLHUP | c.POLLERR) != 0 and self.session.pty != null) try self.readPty();
+        if (self.session.pty != null and fds[1].revents & c.POLLOUT != 0) {
+            if (!try self.session.flush()) self.endTerminal();
+        }
         if (fds[0].revents & c.POLLIN != 0 and !try self.readInput()) return false;
-        if (fds[1].revents & c.POLLOUT != 0) try self.flushPty();
-        if (fds[1].revents & (c.POLLIN | c.POLLHUP | c.POLLERR) != 0) try self.readPty();
         return true;
     }
 
@@ -183,32 +179,17 @@ pub const App = struct {
         return true;
     }
 
-    fn flushPty(self: *App) !void {
-        const pending = self.emulator.queued();
-        if (pending.len == 0) return;
-        const count = c.write(self.pty.fd, pending.ptr, pending.len);
-        if (count > 0) {
-            self.emulator.consumed(@intCast(count));
-        } else if (count < 0 and platform.errno() != c.EAGAIN and platform.errno() != c.EINTR) return error.PtyWriteFailed;
+    fn endTerminal(self: *App) void {
+        self.session.end();
+        self.state.terminalEnded();
+        self.dirty = true;
     }
 
     fn readPty(self: *App) !void {
-        // Bound each batch so a noisy child cannot starve input or repaint.
-        var bytes: [read_buffer_bytes]u8 = undefined;
-        for (0..pty_reads_per_turn) |_| {
-            if (platform.shouldStop()) break;
-            const count = c.read(self.pty.fd, &bytes, bytes.len);
-            if (count > 0) {
-                try self.emulator.feed(bytes[0..@intCast(count)]);
-                self.dirty = true;
-            } else {
-                if (count == 0 or platform.errno() == c.EIO) {
-                    self.pty_eof = true;
-                    break;
-                }
-                if (platform.errno() == c.EAGAIN or platform.errno() == c.EINTR) break;
-                return error.PtyReadFailed;
-            }
+        switch (try self.session.drain()) {
+            .idle => {},
+            .output => self.dirty = true,
+            .ended => self.endTerminal(),
         }
     }
 };
@@ -221,4 +202,9 @@ fn terminalSize(layout: Layout) platform.Size {
 // and PTY/emulator layout use this same nonzero, allocation-bounded size.
 fn screenSize(size: platform.Size) toolkit.Size {
     return Layout.boundedSize(.{ .width = size.cols, .height = size.rows });
+}
+
+fn startTerminal(context: *anyopaque, cwd: ?[]const u8) !void {
+    const session: *Session = @ptrCast(@alignCast(context));
+    try session.start(cwd);
 }

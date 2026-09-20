@@ -2,6 +2,7 @@
 """File actions through the real TUI, exclusively in disposable directories."""
 
 import os
+import signal
 import tempfile
 from pathlib import Path
 
@@ -84,13 +85,16 @@ def file_actions():
             app.send(F7 + "abandoned\x1b")
             app.pump(0.15)
             assert not (source / "abandoned").exists()
-            # Errors remain in the app and the shell is accessible from results.
+            # Errors retain interaction until result dismissal.
             app.send(F7)
             submit(app, "missing/child")
             app.expect("Not found")
-            app.send("\x07printf '<%s>\\n' ACTION_SHELL\r")
-            app.expect("<ACTION_SHELL>")
-            app.send("\x07")
+            app.send("\x07\n")
+            app.pump(0.1)
+            app.expect("Not found")
+            os.kill(app.shell_pid, signal.SIGHUP)
+            app.pump(0.3)
+            assert app.proc.poll() is None
             app.expect("Not found")
             app.send("\r")
             # Refresh both panes after mkdir when they show the same directory.
