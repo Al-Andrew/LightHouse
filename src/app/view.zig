@@ -193,6 +193,7 @@ test "View routes compact pane input terminal controls and workflow modals once"
     try std.testing.expect(left.view().status == .ready);
     try view.resize(.{ .width = 7, .height = 4 });
     try view.event(&.{ .key = .down });
+    try view.event(&.{ .key = .down });
     try std.testing.expectEqualStrings("file", left.view().focused().?.name);
     var decoder: ui.input.Decoder = .{};
     try feed(view, &decoder, " ");
@@ -314,6 +315,7 @@ test "command presentation and direct invocation recheck sources modal focus and
         if (left.view().status != .loading) break;
         try std.Io.sleep(io, .fromMilliseconds(1), .awake);
     }
+    try view.event(&.{ .key = .down });
     try view.event(&.{ .key = .down });
     try std.testing.expect(state.available(.copy));
     try view.paint(&frame, .{ .width = 80, .height = 24 });
@@ -471,6 +473,7 @@ test "View and direct commands share current provider support without starting w
             try std.Io.sleep(io, .fromMilliseconds(1), .awake);
         }
         try view.event(&.{ .key = .down });
+        try view.event(&.{ .key = .down });
         try std.testing.expectEqual(!foreign, state.available(.copy));
         try std.testing.expectEqual(!foreign, state.available(.move));
         try std.testing.expect(state.available(.delete));
@@ -491,6 +494,7 @@ test "View and direct commands share current provider support without starting w
         try std.testing.expect(state.view().modal == .none);
         try std.testing.expect(state.view().operation == null);
         try view.event(&.{ .key = .tab });
+        try view.event(&.{ .key = .down });
         try view.event(&.{ .key = .down });
         try std.testing.expect(!try state.invoke(.mkdir, emulator));
         try std.testing.expect(!try state.invoke(.delete, emulator));
@@ -599,6 +603,7 @@ test "View retains capability rejection and never starts unsupported file action
     defer view.destroy();
     try left.refresh();
     try settleWorkflow(state);
+    try view.event(&.{ .key = .down });
     try view.event(&.{ .key = .down });
     var decoder: ui.input.Decoder = .{};
     var frame = ui.Frame.init(allocator);
@@ -713,14 +718,15 @@ test "View dispatches Pane aliases marking and modifiers while unhandled command
     try view.resize(.{ .width = 80, .height = 10 });
     try std.testing.expectEqual(@as(usize, 2), left.view().visible_rows);
     var decoder: ui.input.Decoder = .{};
-    try feed(view, &decoder, " "); // Parent row is never marked.
+    try feed(view, &decoder, " "); // Current row is never marked.
+    try view.event(&.{ .key = .down });
     try std.testing.expectEqual(@as(usize, 0), left.view().marked_count);
     try view.event(&.{ .key = .insert, .shift = true, .ctrl = true, .alt = true });
-    try std.testing.expectEqual(@as(usize, 1), left.view().cursor);
+    try std.testing.expectEqual(@as(usize, 2), left.view().cursor);
     try std.testing.expectEqual(@as(usize, 0), left.view().marked_count);
     try std.testing.expectEqualStrings("child", left.view().focused().?.name);
     try view.event(&.{ .key = .insert });
-    try std.testing.expectEqual(@as(usize, 2), left.view().cursor);
+    try std.testing.expectEqual(@as(usize, 3), left.view().cursor);
     try std.testing.expectEqual(@as(usize, 1), left.view().marked_count);
     try view.event(&.{ .key = .up, .ctrl = true, .alt = true });
     try std.testing.expect(left.view().focusedMarked());
@@ -729,6 +735,7 @@ test "View dispatches Pane aliases marking and modifiers while unhandled command
     try view.event(&space);
     try std.testing.expectEqual(@as(usize, 0), left.view().marked_count);
     try view.event(&.{ .key = .home });
+    try view.event(&.{ .key = .down, .shift = true });
     try view.event(&.{ .key = .down, .shift = true });
     try std.testing.expectEqual(@as(usize, 0), left.view().marked_count);
     try view.event(&.{ .key = .down, .shift = true });
@@ -739,7 +746,7 @@ test "View dispatches Pane aliases marking and modifiers while unhandled command
     try std.testing.expectEqual(@as(usize, 0), left.view().cursor);
     try std.testing.expectEqual(@as(usize, 1), left.view().marked_count);
     try view.event(&.{ .key = .end, .shift = true });
-    try std.testing.expectEqual(@as(usize, 4), left.view().cursor);
+    try std.testing.expectEqual(@as(usize, 5), left.view().cursor);
     try std.testing.expectEqual(@as(usize, 3), left.view().marked_count);
     try view.event(&.{ .key = .home, .shift = true });
     try std.testing.expectEqual(@as(usize, 1), left.view().marked_count);
@@ -748,11 +755,12 @@ test "View dispatches Pane aliases marking and modifiers while unhandled command
     try view.event(&.{ .key = .page_up });
     try std.testing.expectEqual(@as(usize, 0), left.view().cursor);
     try view.event(&.{ .key = .end });
-    try std.testing.expectEqual(@as(usize, 4), left.view().cursor);
+    try std.testing.expectEqual(@as(usize, 5), left.view().cursor);
     try std.testing.expectEqual(@as(usize, 1), left.view().marked_count);
     // Both entering and parent aliases operate through the focused widget.
     for ([_]ui.input.Key{ .enter, .right }, [_]ui.input.Key{ .backspace, .left }) |enter, parent| {
         try view.event(&.{ .key = .home });
+        try view.event(&.{ .key = .down });
         try view.event(&.{ .key = .down });
         try view.event(&.{ .key = enter, .shift = true, .alt = true, .ctrl = true });
         try settlePane(state, left);
@@ -892,8 +900,8 @@ test "View keeps Ctrl+F as child input when the persistent terminal has focus" {
     try std.testing.expectEqualStrings("\x06", emulator.queued());
     try std.testing.expect(!try state.invoke(.insert_reference, emulator));
     try feed(view, &decoder, "\x07\x06");
-    try std.testing.expect(state.view().modal == .notice);
-    try std.testing.expectEqualStrings("\x06", emulator.queued());
+    try std.testing.expectEqual(.terminal, state.view().focus);
+    try std.testing.expectEqualStrings("\x06'/' ", emulator.queued());
 }
 
 test "Ctrl page shortcuts navigate only the active Pane and preserve focused input" {
@@ -922,10 +930,10 @@ test "Ctrl page shortcuts navigate only the active Pane and preserve focused inp
         try pane.refresh();
         try settlePane(state, pane);
         if (index == 1) try view.event(&.{ .key = .tab });
-        try feed(view, &decoder, "\x1b[B\x1b[6;5~");
+        try feed(view, &decoder, "\x1b[B\x1b[B\x1b[6;5~");
         try settlePane(state, pane);
         try std.testing.expect(std.mem.endsWith(u8, pane.view().path, "/child"));
-        try feed(view, &decoder, "\x1b[6;5~"); // Parent row in an empty directory.
+        try feed(view, &decoder, "\x1b[B\x1b[6;5~"); // Parent row in an empty directory.
         try settlePane(state, pane);
         try std.testing.expectEqualStrings("child", pane.view().focused().?.name);
         try feed(view, &decoder, "\x1b[B\x1b[6;5~");

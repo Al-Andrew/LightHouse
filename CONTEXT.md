@@ -10,12 +10,16 @@ marks, and viewport.
 _Avoid_: panel
 
 **Cursor**:
-The current row in a pane, which may be a directory entry or the parent row.
+The current row in a pane, which may be a directory entry, Current row, or Parent row.
 _Avoid_: selection (when referring only to the cursor)
 
 **Mark**:
 A choice of a directory entry for a file action, independent of the cursor.
 _Avoid_: focus
+
+**Current row**:
+The synthetic `.` row representing a Pane's current Location; it is never
+a marked entry or a file-action source.
 
 **Parent row**:
 The synthetic `..` row for navigating to the containing directory; it is never
@@ -51,7 +55,7 @@ its reads and writes, and an executor supports their combination.
 
 **Path insertion**:
 An explicit action that inserts a Provider-defined representation of a Pane's
-Cursor entry into the persistent terminal's input without submitting it.
+Cursor row into the persistent terminal's input without submitting it.
 
 **External tool session**:
 A temporary terminal session for a file tool opened from a Pane, separate from

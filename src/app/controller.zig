@@ -526,10 +526,7 @@ const Implementation = struct {
 
     fn insertReference(self: *Implementation, emulator: *Emulator) !void {
         const pane = self.activePane();
-        const entry = pane.view().focused() orelse return error.NoCursorEntry;
-        const provider = pane.provider();
-        const reference = provider.reference orelse return error.UnsupportedReference;
-        const raw = try reference(provider.context, self.allocator, pane.location().locator, entry.*);
+        const raw = try pane.cursorReference(self.allocator);
         defer self.allocator.free(raw);
         if (raw.len == 0) return error.EmptyReference;
         for (raw) |byte| if (byte < 32 or byte == 127) return error.ControlCharacterReference;
@@ -983,6 +980,7 @@ test "Path insertion uses Provider Cursor reference independently of Marks" {
     defer emulator.destroy();
     try left.refresh();
     try settle(state);
+    left.move(.{ .by = 1 }, false);
     left.move(.{ .by = 1 }, true); // Mark folder, advance Cursor to a.
     try std.testing.expect(try state.invoke(.insert_reference, emulator));
     try std.testing.expectEqualStrings("'vault:a' ", emulator.queued());
@@ -1003,6 +1001,7 @@ test "Path insertion validates quotes and admits a complete reference before tak
     defer emulator.destroy();
     try left.refresh();
     try settle(state);
+    left.move(.{ .by = 1 }, false);
     const Host = struct {
         calls: usize = 0,
         fail: bool = false,
@@ -1056,7 +1055,7 @@ test "Path insertion validates quotes and admits a complete reference before tak
     try std.testing.expect(!try state.invoke(.insert_reference, emulator));
 }
 
-test "F4 direct invocation rejects Parent row without launching an external tool" {
+test "F4 direct invocation rejects Current row without launching an external tool" {
     const left = try Pane.create(std.testing.io, std.testing.allocator, "/tmp", .{});
     defer left.destroy();
     const right = try Pane.create(std.testing.io, std.testing.allocator, "/tmp", .{});
@@ -1086,6 +1085,7 @@ test "Path insertion workflow preserves queue and Pane focus on allocation and b
     defer emulator.destroy();
     try left.refresh();
     try settle(state);
+    left.move(.{ .by = 1 }, false);
     try emulator.insert("existing");
     failing.fail_index = failing.alloc_index;
     _ = try state.invoke(.insert_reference, emulator);
@@ -1166,4 +1166,33 @@ test "waiting file decisions block every terminal route through retained result 
     try std.testing.expect(!state.view().decision_all);
     try std.testing.expect(state.decideOperation(.skip, false));
     try settle(state);
+}
+
+test "Path insertion quotes current and parent rows on both Panes" {
+    const allocator = std.testing.allocator;
+    const left = try Pane.create(std.testing.io, allocator, "/home/user/a 'link", .{});
+    defer left.destroy();
+    const right = try Pane.create(std.testing.io, allocator, "/", .{});
+    defer right.destroy();
+    const state = try State.create(std.testing.io, allocator, .{ left, right });
+    defer state.destroy();
+    const emulator = try Emulator.create(std.testing.io, allocator, 80, 8);
+    defer emulator.destroy();
+    try emulator.insert("cd ");
+    try std.testing.expect(try state.invoke(.insert_reference, emulator));
+    try std.testing.expectEqualStrings("cd '/home/user/a '\\''link' ", emulator.queued());
+    state.toggleTerminal();
+    left.move(.{ .by = 1 }, false);
+    emulator.consumed(emulator.queued().len);
+    try std.testing.expect(try state.invoke(.insert_reference, emulator));
+    try std.testing.expectEqualStrings("'/home/user' ", emulator.queued());
+    state.toggleTerminal();
+    try std.testing.expect(try state.invoke(.switch_pane, emulator));
+    for (0..2) |_| {
+        emulator.consumed(emulator.queued().len);
+        try std.testing.expect(try state.invoke(.insert_reference, emulator));
+        try std.testing.expectEqualStrings("'/' ", emulator.queued());
+        state.toggleTerminal();
+        right.move(.{ .by = 1 }, false);
+    }
 }

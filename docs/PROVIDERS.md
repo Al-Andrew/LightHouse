@@ -23,8 +23,9 @@ them. User-input resolution must accept the adapter's own canonical locators
 unchanged, allowing current-location and root-prefilled path editors to round
 trip. Only the local adapter expands `~` and `~/...` using HOME and normalizes
 absolute/relative filesystem paths. Child entry names are not user input: a
-literal `~name` remains a child name. `has_parent` describes the displayed
-location's parent row. `parent_hint` optionally returns the exact entry name to
+literal `~name` remains a child name. `has_parent` determines whether parent navigation is available.
+`show_root_parent` opts into showing a parent reference even at the root; the
+local adapter enables it and resolves the root parent to `/`. `parent_hint` optionally returns the exact entry name to
 focus when returning to a parent. `display` returns an alias of its locator or immutable provider storage, valid
 until that pane next mutates or is destroyed. Shared mutable formatting scratch
 is forbidden: observing another pane must not invalidate an existing view.
@@ -46,7 +47,10 @@ and marks by exact entry name, independently of ordering. Only names still
 visible in the new snapshot retain marks; hidden or removed entries lose them.
 A different location clears marks even if its display is identical. Returning
 to a parent uses its provider hint; otherwise navigation begins at the first row.
-The synthetic parent row cannot be marked or used as a file-action source.
+The synthetic Current row `.` and Parent row `..` cannot be marked or used as
+file-action sources. They precede the entries, scroll normally, and remain
+available independently of hidden-entry settings or name filtering. New
+locations start on `.`, and refresh/sorting preserve Cursor identity.
 Cursor/viewport normalization happens during pane mutations, never painting.
 
 `Pane.view`, `location`, `sources`, and row observations borrow pane storage until
@@ -154,6 +158,14 @@ scan failures remain Pane status, and started-job failures remain job results.
 New Provider error names require an explicit recovery-policy decision.
 
 ## Cursor reference capability
+
+`Pane.cursorReference` resolves ordinary Cursor entries through `reference` and
+synthetic rows through the optional `location_reference` callback. That callback
+receives the current locator for `.`, or a Provider-resolved parent locator for
+`..`, and returns owned unquoted reference bytes. The local adapter preserves
+absolute locator spelling, including directory symlink spelling. Providers
+without this callback report `UnsupportedReference` for synthetic rows while
+retaining entry reference insertion and supported navigation.
 
 `Provider.reference` is an optional UI-thread callback receiving the opaque
 location and the original `Entry`. It returns one owned, unquoted reference

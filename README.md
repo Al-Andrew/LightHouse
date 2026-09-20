@@ -55,7 +55,7 @@ the shell is focused, where function keys pass through to the child.
 | --- | --- |
 | Ctrl+G | Switch focus between the visible shell and last active Pane; leave zoom |
 | F4 | Edit the Cursor file in a separate full-area terminal |
-| Ctrl+F | Insert the Cursor entry’s Provider reference into the shell without Enter |
+| Ctrl+F | Insert the Cursor row’s Provider reference into the shell without Enter |
 | Ctrl+J | Hide/show the shell; start a fresh session if absent |
 | Up / Down / PageUp / PageDown / Home / End | Move the file cursor |
 | Enter / Right / Ctrl+PageDown | Enter a directory or directory symlink |
@@ -105,7 +105,7 @@ scan succeeds; cycling sort again advances from the requested setting.
 Hold Shift while using Up/Down to toggle the current item's mark before moving:
 unmarked items become marked, and marked items become unmarked. Shift+Home/End
 toggles every item between the cursor and the first/last row, including both
-endpoints. The parent row is always skipped. Space/Insert also toggles individual
+endpoints. The `.` and `..` rows are always skipped. Space/Insert also toggles individual
 marks. Unmodified navigation leaves marks in place, and each pane keeps its own
 marks. Shift+PageUp/PageDown retains its terminal-history scrolling behavior.
 
@@ -286,8 +286,20 @@ errors, partial completion, and stale sources.
 - Automated PTY coverage is not a substitute for testing a range of terminal
   emulators and SSH configurations; that compatibility pass is still pending.
 
-Ctrl+F from a Pane uses the Cursor entry independently of Marks; the Parent row
-is excluded. The local Provider supplies absolute paths for files, directories,
+Each Pane starts with `.` (current directory) and `..` (parent directory), above
+ordinary entries regardless of sorting or hidden-entry settings. These rows
+scroll with the listing and cannot be marked or used as file-action sources;
+existing Marks still supply file actions while the Cursor rests on either row.
+Home and entering a new directory place the Cursor on `.`; returning to a parent
+restores the Cursor to the directory just left. Enter on `.` does nothing.
+Type `cd ` in the persistent shell, return to a Pane, press Home then Ctrl+F,
+and press Enter to change the shell to that Pane's directory. Providers without
+a parent omit `..`; unsupported reference insertion reports an error.
+
+Ctrl+F from a Pane uses the Cursor row independently of Marks. The `.` row
+inserts the current directory's full path; `..` inserts the containing directory's
+full path, resolved by the Provider. At the local root both insert `/`. The local
+Provider supplies absolute paths for files, directories,
 and symlinks (the link's own path). LightHouse applies POSIX shell single quoting
 and exactly one trailing space, preserves existing input, and never sends Enter.
 Control-character references are rejected. This quoting targets sh/Bash/Zsh;

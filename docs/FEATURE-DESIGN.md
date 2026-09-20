@@ -42,7 +42,8 @@ features are not implemented yet.
   changing is outside this design.
 - For local entries, insert the quoted absolute path followed by one space and
   no leading space. Files, directories, and symlinks are supported; use a
-  symlink's own path. Exclude the Parent row. Refuse control-character paths with
+  symlink's own path. Current and Parent rows insert their Provider-resolved
+  absolute directory paths; both insert `/` at the local root. Refuse control-character paths with
   an explanation initially. Quoting uses original filename bytes rather than
   display escapes. A Provider supplies one unquoted reference or reports that
   insertion is unsupported. LightHouse owns quoting, control-character checks,

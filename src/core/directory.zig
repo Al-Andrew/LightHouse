@@ -40,6 +40,8 @@ pub const Provider = struct {
     identity: *const anyopaque,
     context: ?*anyopaque = null,
     resolve: *const fn (?*anyopaque, std.mem.Allocator, []const u8, Resolution) anyerror![]const u8,
+    /// Display a root parent reference even when parent navigation is a no-op.
+    show_root_parent: bool = false,
     has_parent: *const fn (?*anyopaque, []const u8) bool,
     display: *const fn (?*anyopaque, []const u8) []const u8,
     parent_hint: *const fn (?*anyopaque, []const u8) ?[]const u8,
@@ -47,6 +49,8 @@ pub const Provider = struct {
     /// Returns one owned, unquoted Cursor entry reference; no local executor
     /// capability is implied. Called on the UI thread with original name bytes.
     reference: ?*const fn (?*anyopaque, std.mem.Allocator, []const u8, Entry) anyerror![]const u8 = null,
+    /// Owned representation of a resolved directory locator, for reference rows.
+    location_reference: ?*const fn (?*anyopaque, std.mem.Allocator, []const u8) anyerror![]const u8 = null,
     scan: *const fn (?*anyopaque, std.Io, []const u8, Options, *const std.atomic.Value(bool)) anyerror!Snapshot,
 
     pub fn location(self: Provider, locator: []const u8) Location {
@@ -71,12 +75,17 @@ pub const local: Provider = .{
     .identity = &local_identity,
     .resolve = resolveLocal,
     .has_parent = localHasParent,
+    .show_root_parent = true,
     .display = localDisplay,
     .parent_hint = localParentHint,
     .capabilities = localCapabilities,
     .scan = scanLocal,
     .reference = localReference,
+    .location_reference = localLocationReference,
 };
+fn localLocationReference(_: ?*anyopaque, allocator: std.mem.Allocator, locator: []const u8) ![]const u8 {
+    return allocator.dupe(u8, locator);
+}
 fn localReference(_: ?*anyopaque, allocator: std.mem.Allocator, base: []const u8, entry: Entry) ![]const u8 {
     return std.fs.path.join(allocator, &.{ base, entry.name });
 }

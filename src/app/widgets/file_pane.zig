@@ -181,8 +181,8 @@ fn paintListing(painter: ui.Painter, view: Pane.View, focused: bool) !void {
                 row.label(width - date_column_width, 0, date, style);
             }
         } else {
-            row.label(1, 0, "/..", style);
-            if (with_size) row.label(size_x, 0, "<UP>", style);
+            row.label(1, 0, if (item_row.kind == .current) "/." else "/..", style);
+            if (with_size) row.label(size_x, 0, if (item_row.kind == .current) "<DIR>" else "<UP>", style);
         }
     }
     const status = inside.child(.{ .x = 0, .y = h - 3, .width = width, .height = 1 });
