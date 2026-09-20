@@ -22,36 +22,95 @@ pub const FilePane = struct {
     }
 };
 
+// These descriptions own both dispatch and help. Shift marks movement only for
+// the keys that opt in; shifted pages must bubble to terminal history commands.
+const Action = union(enum) {
+    move: Pane.Movement,
+    enter,
+    parent,
+    mark,
+    mark_advance,
+    cancel,
+    listing: Pane.ListingChange,
+};
+const Binding = struct {
+    key: toolkit.input.Key = .text,
+    byte: ?u8 = null,
+    text: []const u8,
+    action: Action,
+    shift: enum { ignore, mark, bubble } = .ignore,
+
+    fn matches(self: Binding, ev: *const toolkit.Event) bool {
+        // Alt/Ctrl and extra Shift historically remain accepted, including on
+        // text bindings. Only shifted page keys are excluded from this scope.
+        return ev.key == self.key and !(ev.shift and self.shift == .bubble) and
+            (if (self.byte) |byte| ev.len == 1 and ev.bytes[0] == byte else true);
+    }
+};
+const Description = struct { help: []const u8, bindings: []const Binding };
+const descriptions = [_]Description{
+    .{ .help = "Move cursor", .bindings = &.{
+        .{ .key = .up, .text = "Up", .action = .{ .move = .{ .by = -1 } }, .shift = .mark },
+        .{ .key = .down, .text = "Down", .action = .{ .move = .{ .by = 1 } }, .shift = .mark },
+        .{ .key = .home, .text = "Home", .action = .{ .move = .first }, .shift = .mark },
+        .{ .key = .end, .text = "End", .action = .{ .move = .last }, .shift = .mark },
+        .{ .key = .page_up, .text = "PgUp", .action = .{ .move = .page_up }, .shift = .bubble },
+        .{ .key = .page_down, .text = "PgDn", .action = .{ .move = .page_down }, .shift = .bubble },
+    } },
+    .{ .help = "Enter directory", .bindings = &.{
+        .{ .key = .enter, .text = "Enter", .action = .enter },
+        .{ .key = .right, .text = "Right", .action = .enter },
+    } },
+    .{ .help = "Parent directory", .bindings = &.{
+        .{ .key = .backspace, .text = "Backspace", .action = .parent },
+        .{ .key = .left, .text = "Left", .action = .parent },
+    } },
+    .{ .help = "Toggle mark", .bindings = &.{.{ .byte = ' ', .text = "Space", .action = .mark }} },
+    .{ .help = "Mark and advance", .bindings = &.{.{ .key = .insert, .text = "Insert", .action = .mark_advance }} },
+    .{ .help = "Cancel read / clear error", .bindings = &.{.{ .key = .escape, .text = "Esc", .action = .cancel }} },
+    .{ .help = "Toggle hidden files", .bindings = &.{.{ .byte = '.', .text = ".", .action = .{ .listing = .toggle_hidden } }} },
+    .{ .help = "Sort field", .bindings = &.{.{ .byte = 's', .text = "s", .action = .{ .listing = .cycle_sort } }} },
+    .{ .help = "Reverse order", .bindings = &.{.{ .byte = 'r', .text = "r", .action = .{ .listing = .reverse } }} },
+};
+
+/// Process-lifetime help generated from the same aliases and modifier policy
+/// used by dispatch. Consumers only lay out these lines; they own no bindings.
+pub const help_lines = blk: {
+    var lines: [descriptions.len + 1][]const u8 = undefined;
+    var shifted: []const u8 = "";
+    for (descriptions, 0..) |description, i| {
+        var keys: []const u8 = "";
+        for (description.bindings, 0..) |binding, j| {
+            keys = keys ++ (if (j == 0) "" else "/") ++ binding.text;
+            if (binding.shift == .mark)
+                shifted = shifted ++ (if (shifted.len == 0) "Shift+" else "/") ++ binding.text;
+        }
+        lines[i] = keys ++ "  " ++ description.help;
+    }
+    lines[descriptions.len] = shifted ++ "  Toggle marks while moving";
+    break :blk lines;
+};
+
 /// Pane-local bindings. Unhandled commands bubble to the application widget.
 pub fn handleEvent(pane: *Pane, ev: *const toolkit.Event) !bool {
     if (ev.kind != .key) return false;
-    switch (ev.key) {
-        .up => pane.move(.{ .by = -1 }, ev.shift),
-        .down => pane.move(.{ .by = 1 }, ev.shift),
-        .home => pane.move(.first, ev.shift),
-        .end => pane.move(.last, ev.shift),
-        .enter, .right => try pane.enter(),
-        .backspace, .left => try pane.parent(),
-        .insert => {
-            pane.toggleSelection();
-            pane.move(.{ .by = 1 }, false);
-        },
-        .page_up => if (!ev.shift) pane.move(.page_up, false) else return false,
-        .page_down => if (!ev.shift) pane.move(.page_down, false) else return false,
-        .escape => pane.cancelNavigation(),
-        .text => {
-            if (ev.len != 1) return false;
-            switch (ev.bytes[0]) {
-                ' ' => pane.toggleSelection(),
-                '.' => try pane.changeListing(.toggle_hidden),
-                's' => try pane.changeListing(.cycle_sort),
-                'r' => try pane.changeListing(.reverse),
-                else => return false,
-            }
-        },
-        else => return false,
-    }
-    return true;
+    for (descriptions) |description| for (description.bindings) |binding| {
+        if (!binding.matches(ev)) continue;
+        switch (binding.action) {
+            .move => |movement| pane.move(movement, ev.shift and binding.shift == .mark),
+            .enter => try pane.enter(),
+            .parent => try pane.parent(),
+            .mark => pane.toggleSelection(),
+            .mark_advance => {
+                pane.toggleSelection();
+                pane.move(.{ .by = 1 }, false);
+            },
+            .cancel => pane.cancelNavigation(),
+            .listing => |change| try pane.changeListing(change),
+        }
+        return true;
+    };
+    return false;
 }
 
 // Borders plus the column header and status row.

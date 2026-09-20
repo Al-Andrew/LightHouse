@@ -663,3 +663,148 @@ test "View propagates fatal Provider failures without converting them to rejecti
         try std.testing.expectEqualStrings(Fixture.root, left.location().locator);
     }
 }
+
+test "View dispatches Pane aliases marking and modifiers while unhandled commands bubble" {
+    const Pane = @import("../core/pane.zig").Pane;
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "child", .default_dir);
+    for ([_][]const u8{ "a", "b", "c", ".hidden" }) |name|
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "" });
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buffer);
+    const left = try Pane.create(io, allocator, buffer[0..len], .{});
+    defer left.destroy();
+    const right = try Pane.create(io, allocator, buffer[0..len], .{});
+    defer right.destroy();
+    const emulator = try Emulator.create(io, allocator, 20, 3);
+    defer emulator.destroy();
+    const state = try State.create(io, allocator, .{ left, right });
+    defer state.destroy();
+    const view = try View.create(allocator, state, emulator);
+    defer view.destroy();
+    try left.refresh();
+    try settlePane(state, left);
+    // Two visible rows make PageUp/Down behavior observable independently of End.
+    try view.resize(.{ .width = 80, .height = 10 });
+    try std.testing.expectEqual(@as(usize, 2), left.view().visible_rows);
+    var decoder: ui.input.Decoder = .{};
+    try feed(view, &decoder, " "); // Parent row is never marked.
+    try std.testing.expectEqual(@as(usize, 0), left.view().marked_count);
+    try view.event(&.{ .key = .insert, .shift = true, .ctrl = true, .alt = true });
+    try std.testing.expectEqual(@as(usize, 1), left.view().cursor);
+    try std.testing.expectEqual(@as(usize, 0), left.view().marked_count);
+    try std.testing.expectEqualStrings("child", left.view().focused().?.name);
+    try view.event(&.{ .key = .insert });
+    try std.testing.expectEqual(@as(usize, 2), left.view().cursor);
+    try std.testing.expectEqual(@as(usize, 1), left.view().marked_count);
+    try view.event(&.{ .key = .up, .ctrl = true, .alt = true });
+    try std.testing.expect(left.view().focusedMarked());
+    var space: ui.Event = .{ .key = .text, .len = 1, .shift = true, .ctrl = true, .alt = true };
+    space.bytes[0] = ' ';
+    try view.event(&space);
+    try std.testing.expectEqual(@as(usize, 0), left.view().marked_count);
+    try view.event(&.{ .key = .home });
+    try view.event(&.{ .key = .down, .shift = true });
+    try std.testing.expectEqual(@as(usize, 0), left.view().marked_count);
+    try view.event(&.{ .key = .down, .shift = true });
+    try std.testing.expectEqual(@as(usize, 1), left.view().marked_count);
+    try view.event(&.{ .key = .up, .shift = true });
+    try std.testing.expectEqual(@as(usize, 2), left.view().marked_count);
+    try view.event(&.{ .key = .home, .shift = true });
+    try std.testing.expectEqual(@as(usize, 0), left.view().cursor);
+    try std.testing.expectEqual(@as(usize, 1), left.view().marked_count);
+    try view.event(&.{ .key = .end, .shift = true });
+    try std.testing.expectEqual(@as(usize, 4), left.view().cursor);
+    try std.testing.expectEqual(@as(usize, 3), left.view().marked_count);
+    try view.event(&.{ .key = .home, .shift = true });
+    try std.testing.expectEqual(@as(usize, 1), left.view().marked_count);
+    try view.event(&.{ .key = .page_down, .ctrl = true, .alt = true });
+    try std.testing.expectEqual(@as(usize, 2), left.view().cursor);
+    try view.event(&.{ .key = .page_up });
+    try std.testing.expectEqual(@as(usize, 0), left.view().cursor);
+    try view.event(&.{ .key = .end });
+    try std.testing.expectEqual(@as(usize, 4), left.view().cursor);
+    try std.testing.expectEqual(@as(usize, 1), left.view().marked_count);
+    // Both entering and parent aliases operate through the focused widget.
+    for ([_]ui.input.Key{ .enter, .right }, [_]ui.input.Key{ .backspace, .left }) |enter, parent| {
+        try view.event(&.{ .key = .home });
+        try view.event(&.{ .key = .down });
+        try view.event(&.{ .key = enter, .shift = true, .alt = true, .ctrl = true });
+        try settlePane(state, left);
+        try std.testing.expect(std.mem.endsWith(u8, left.view().path, "/child"));
+        try view.event(&.{ .key = parent, .shift = true, .alt = true, .ctrl = true });
+        try settlePane(state, left);
+        try std.testing.expectEqualStrings(buffer[0..len], left.view().path);
+    }
+    try feed(view, &decoder, ".");
+    try settlePane(state, left);
+    try std.testing.expect(left.view().options.hidden);
+    try std.testing.expectEqual(@as(usize, 5), left.view().entries.len);
+    const original_sort = left.view().options.sort;
+    try feed(view, &decoder, "s");
+    try settlePane(state, left);
+    try std.testing.expect(left.view().options.sort != original_sort);
+    try feed(view, &decoder, "r");
+    try settlePane(state, left);
+    try std.testing.expect(left.view().options.reverse);
+    // Escape clears a failed read without moving or changing focus.
+    try left.request("missing");
+    try settlePane(state, left);
+    try std.testing.expect(left.view().status == .failed);
+    try view.event(&.{ .key = .escape });
+    try std.testing.expect(left.view().status == .ready);
+    // Multi-byte text and paste cannot activate a single-byte Pane binding.
+    const cursor = left.view().cursor;
+    var text_event: ui.Event = .{ .key = .text, .len = 2 };
+    @memcpy(text_event.bytes[0..2], " r");
+    try view.event(&text_event);
+    try feed(view, &decoder, "\x1b[200~ .sr\x1b[201~");
+    try std.testing.expectEqual(cursor, left.view().cursor);
+    try std.testing.expectEqual(@as(usize, 0), left.view().marked_count);
+    try std.testing.expect(left.view().options.reverse);
+    try std.testing.expect(left.view().status == .ready);
+    // Shift pages reach terminal history even with extra modifiers, without
+    // moving/marking the Pane or delivering bytes to the shell.
+    try emulator.feed("0\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8\r\n9");
+    var frame = ui.Frame.init(allocator);
+    defer frame.deinit();
+    try frame.begin(20, 3);
+    const painter = frame.painter(.{ .x = 0, .y = 0, .width = 20, .height = 3 });
+    try view.event(&.{ .key = .page_up, .shift = true, .alt = true, .ctrl = true });
+    try emulator.paint(painter, false);
+    try std.testing.expectEqualStrings("4", frame.cells[0].text);
+    try view.event(&.{ .key = .page_down, .shift = true, .alt = true, .ctrl = true });
+    try emulator.paint(painter, false);
+    try std.testing.expectEqualStrings("7", frame.cells[0].text);
+    try std.testing.expectEqual(cursor, left.view().cursor);
+    try std.testing.expectEqual(@as(usize, 0), left.view().marked_count);
+    try std.testing.expectEqual(@as(usize, 0), emulator.queued().len);
+    try view.event(&.{ .key = .tab });
+    try std.testing.expect(view.panes[1].focused());
+    try view.event(&.{ .key = .f1 });
+    try std.testing.expect(state.view().modal == .help);
+    const pane_help = @import("widgets/file_pane.zig").help_lines;
+    const help_size = @import("widgets/dialogs.zig").help_size;
+    try std.testing.expect(help_size.width <= 80 and help_size.height <= 24);
+    for ([_]ui.Size{ .{ .width = 80, .height = 24 }, help_size }) |size| {
+        try view.paint(&frame, size);
+        for (pane_help) |line| try expectFrameText(&frame, line);
+        try expectFrameText(&frame, "Any key closes help");
+    }
+    for ([_]ui.Size{ .{ .width = 40, .height = 12 }, .{ .width = 7, .height = 4 }, .{ .width = 1, .height = 1 } }) |size| {
+        try view.paint(&frame, size);
+        try std.testing.expect(frame.cursor == null);
+    }
+}
+
+fn settlePane(state: *State, pane: *@import("../core/pane.zig").Pane) !void {
+    for (0..5000) |_| {
+        _ = try state.poll();
+        if (pane.view().status != .loading) return;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    return error.PaneReadTimedOut;
+}

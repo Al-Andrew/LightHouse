@@ -67,8 +67,11 @@ build script, and Python integration suites before further feature work.
 - Static built-in command descriptions now unify binding lookup, help, and the
   ten-slot function-key bar. The controller owns availability and invocation;
   widgets retain scoped input routing. See [UI.md](UI.md) for the interface.
-  Configurable bindings, persistence, and runtime/plugin registration remain
-  deferred; the static built-ins do not require a callback registry.
+  Pane-local descriptions likewise co-own dispatch and generated help in the
+  FilePane module, including aliases and Shift marking/page behavior. The
+  focused-widget adapter remains the input seam. Configurable bindings,
+  persistence, a general binding engine, and runtime/plugin registration remain
+  deferred; the static descriptions do not require a callback registry.
 - Directory scans and file operations both use workers, but scans supersede
   pending requests and transfer snapshots while operations report partial
   progress. A generic worker framework would currently obscure those different
