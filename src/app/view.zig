@@ -743,7 +743,7 @@ test "View dispatches Pane aliases marking and modifiers while unhandled command
     try std.testing.expectEqual(@as(usize, 3), left.view().marked_count);
     try view.event(&.{ .key = .home, .shift = true });
     try std.testing.expectEqual(@as(usize, 1), left.view().marked_count);
-    try view.event(&.{ .key = .page_down, .ctrl = true, .alt = true });
+    try view.event(&.{ .key = .page_down });
     try std.testing.expectEqual(@as(usize, 2), left.view().cursor);
     try view.event(&.{ .key = .page_up });
     try std.testing.expectEqual(@as(usize, 0), left.view().cursor);
@@ -894,4 +894,65 @@ test "View keeps Ctrl+F as child input when the persistent terminal has focus" {
     try feed(view, &decoder, "\x07\x06");
     try std.testing.expect(state.view().modal == .notice);
     try std.testing.expectEqualStrings("\x06", emulator.queued());
+}
+
+test "Ctrl page shortcuts navigate only the active Pane and preserve focused input" {
+    const Pane = @import("../core/pane.zig").Pane;
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "child", .default_dir);
+    try tmp.dir.symLink(io, "child", "link", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "file", .data = "" });
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buffer);
+    const left = try Pane.create(io, allocator, buffer[0..len], .{});
+    defer left.destroy();
+    const right = try Pane.create(io, allocator, buffer[0..len], .{});
+    defer right.destroy();
+    const emulator = try Emulator.create(io, allocator, 20, 3);
+    defer emulator.destroy();
+    const state = try State.create(io, allocator, .{ left, right });
+    defer state.destroy();
+    const view = try View.create(allocator, state, emulator);
+    defer view.destroy();
+    var decoder: ui.input.Decoder = .{};
+    for ([_]*Pane{ left, right }, 0..) |pane, index| {
+        try pane.refresh();
+        try settlePane(state, pane);
+        if (index == 1) try view.event(&.{ .key = .tab });
+        try feed(view, &decoder, "\x1b[B\x1b[6;5~");
+        try settlePane(state, pane);
+        try std.testing.expect(std.mem.endsWith(u8, pane.view().path, "/child"));
+        try feed(view, &decoder, "\x1b[6;5~"); // Parent row in an empty directory.
+        try settlePane(state, pane);
+        try std.testing.expectEqualStrings("child", pane.view().focused().?.name);
+        try feed(view, &decoder, "\x1b[B\x1b[6;5~");
+        try settlePane(state, pane);
+        try std.testing.expect(std.mem.endsWith(u8, pane.view().path, "/link"));
+        try feed(view, &decoder, "\x1b[5;5~");
+        try settlePane(state, pane);
+        try std.testing.expectEqualStrings("link", pane.view().focused().?.name);
+        try feed(view, &decoder, "\x1b[F\x1b[6;5~"); // Regular file never opens a tool.
+        try std.testing.expectEqualStrings(buffer[0..len], pane.view().path);
+        try std.testing.expect(pane.view().status == .ready);
+    }
+    try std.testing.expectEqualStrings(buffer[0..len], left.view().path);
+    try state.openPath(false);
+    try feed(view, &decoder, "\x1b[5;5~");
+    try std.testing.expect(right.view().status == .ready);
+    state.dismiss();
+    try view.event(&.{ .key = .f1 });
+    try feed(view, &decoder, "\x1b[5;5~");
+    try std.testing.expect(right.view().status == .ready);
+    state.toggleTerminal();
+    try feed(view, &decoder, "\x1b[5;5~\x1b[6;5~");
+    try std.testing.expectEqualStrings("\x1b[5;5~\x1b[6;5~", emulator.queued());
+    state.toggleTerminal();
+    try right.request("/");
+    try settlePane(state, right);
+    try feed(view, &decoder, "\x1b[5;5~");
+    try std.testing.expectEqualStrings("/", right.view().path);
+    try std.testing.expect(right.view().status == .ready);
 }
