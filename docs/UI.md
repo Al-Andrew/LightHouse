@@ -298,3 +298,18 @@ admission shows/focuses the persistent terminal; failures retain Pane focus and
 show an explanation. No Enter is appended and existing terminal input remains.
 Terminal-focused Ctrl+F stays child input. Modal and retained-job policy applies
 to direct invocation as well as View routing.
+
+## External tool session (F4)
+
+The controller validates the Cursor and local working directory, loads editor
+argv, and starts one independent `terminal/tool.zig` session. The View observes
+its emulator and renders across the entire application area. While running,
+View sends every input event directly to the tool; persistent-terminal focus
+and visibility commands cannot intercept it. Direct command invocation rejects
+tool/modals/jobs. F3 remains unassigned.
+
+App polls and resizes both sessions independently. Persistent-shell EOF only
+retires that session. Tool EOF refreshes both Panes exactly once; successful
+exit returns immediately, while failure retains the emulator output until
+acknowledgement. Host shutdown releases/reaps both sessions before restoring
+the console. Configuration and argument syntax are documented in README.

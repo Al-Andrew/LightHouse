@@ -12,6 +12,7 @@ pub const Session = struct {
     dimensions: platform.Size,
     pty: ?platform.Pty = null,
     emulator: *Emulator,
+    successful_exit: bool = false,
 
     pub fn create(io: std.Io, allocator: std.mem.Allocator, shell: [:0]const u8, cwd: []const u8, dimensions: platform.Size, termios: platform.c.termios) !*Session {
         const self = try allocator.create(Session);
@@ -35,17 +36,25 @@ pub const Session = struct {
     }
 
     pub fn start(self: *Session, cwd: ?[]const u8) !void {
+        try self.startCommand(&.{ self.shell, "-i" }, cwd orelse self.launch_directory);
+    }
+
+    pub fn startCommand(self: *Session, argv: []const [:0]const u8, cwd: []const u8) !void {
         if (self.pty != null) return;
-        const path = try self.allocator.dupeZ(u8, cwd orelse self.launch_directory);
+        const path = try self.allocator.dupeZ(u8, cwd);
         defer self.allocator.free(path);
-        var pty = try platform.Pty.spawn(self.allocator, &.{ self.shell, "-i" }, path, self.dimensions, &self.termios);
+        var pty = try platform.Pty.spawn(self.allocator, argv, path, self.dimensions, &self.termios);
         errdefer pty.deinit();
         try self.emulator.reset(self.io, self.dimensions.cols, self.dimensions.rows);
         self.pty = pty;
+        self.successful_exit = false;
     }
 
     pub fn end(self: *Session) void {
-        if (self.pty) |*pty| pty.deinit();
+        if (self.pty) |*pty| {
+            pty.deinit();
+            self.successful_exit = if (pty.exit_status) |status| status == 0 else false;
+        }
         self.pty = null;
         self.emulator.consumed(self.emulator.queued().len);
         self.emulator.paste = .inactive;

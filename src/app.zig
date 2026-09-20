@@ -5,6 +5,7 @@ const toolkit = @import("lighthouse-ui");
 const ui = toolkit.screen;
 const input = toolkit.input;
 const Session = @import("terminal/session.zig").Session;
+const Tool = @import("terminal/tool.zig").Tool;
 const Pane = @import("core/pane.zig").Pane;
 const State = @import("app/controller.zig").State;
 const Layout = @import("app/layout.zig").Layout;
@@ -20,6 +21,7 @@ pub const App = struct {
     allocator: std.mem.Allocator,
     console: platform.Console,
     session: *Session,
+    tool: *Tool,
     panes: [2]*Pane,
     state: *State,
     view: *View,
@@ -52,6 +54,10 @@ pub const App = struct {
         const state = try State.create(io, allocator, panes);
         errdefer state.destroy();
         state.attachTerminal(.{ .context = session, .start = startTerminal });
+        const tool = try allocator.create(Tool);
+        errdefer allocator.destroy(tool);
+        tool.* = .{ .io = io, .allocator = allocator, .termios = console.saved, .dimensions = .{ .cols = @intCast(size.width), .rows = @intCast(size.height) } };
+        state.attachTool(.{ .context = tool, .start = Tool.start });
         const view = try View.create(allocator, state, session.emulator);
         errdefer view.destroy();
         try view.resize(size);
@@ -62,6 +68,7 @@ pub const App = struct {
             .allocator = allocator,
             .console = console,
             .session = session,
+            .tool = tool,
             .panes = panes,
             .state = state,
             .view = view,
@@ -83,6 +90,8 @@ pub const App = struct {
         self.state.destroy();
         self.panes[1].destroy();
         self.panes[0].destroy();
+        self.tool.release();
+        self.allocator.destroy(self.tool);
         self.session.destroy();
         // Restore the outer terminal only after the embedded session has ended.
         self.console.deinit();
@@ -103,6 +112,7 @@ pub const App = struct {
     }
 
     fn pollWorkers(self: *App) !void {
+        if (self.state.view().tool == .none) self.tool.release();
         if (try self.state.poll()) self.dirty = true;
     }
 
@@ -118,6 +128,12 @@ pub const App = struct {
 
     fn resize(self: *App) !void {
         const size = screenSize(platform.Console.size());
+        const tool_size: platform.Size = .{ .cols = @intCast(size.width), .rows = @intCast(size.height) };
+        if (!std.meta.eql(self.tool.dimensions, tool_size)) {
+            self.tool.dimensions = tool_size;
+            if (self.tool.session) |session| try session.resize(tool_size);
+            self.dirty = true;
+        }
         const layout = Layout.forState(size, self.state.view().adjustment, self.state.view().zoom, self.state.view().terminal_visible);
         if (std.meta.eql(self.size, size) and std.meta.eql(self.layout, layout)) return;
         self.size = size;
@@ -144,8 +160,9 @@ pub const App = struct {
     /// False means host input closed. Child EOF is handled after its final paint.
     fn pollIo(self: *App) !bool {
         var fds = [_]c.pollfd{
-            .{ .fd = 0, .events = if (self.state.view().focus != .terminal or self.session.emulator.acceptsInput()) c.POLLIN else 0, .revents = 0 },
+            .{ .fd = 0, .events = if (self.hostAcceptsInput()) c.POLLIN else 0, .revents = 0 },
             .{ .fd = if (self.session.pty) |pty| pty.fd else -1, .events = @as(c_short, c.POLLIN) | (if (self.session.emulator.queued().len > 0) @as(c_short, c.POLLOUT) else 0), .revents = 0 },
+            .{ .fd = if (self.tool.session) |session| (if (session.pty) |pty| pty.fd else -1) else -1, .events = @as(c_short, c.POLLIN) | (if (self.tool.session) |session| (if (session.emulator.queued().len > 0) @as(c_short, c.POLLOUT) else 0) else 0), .revents = 0 },
         };
         const ready = c.poll(&fds, fds.len, poll_interval_ms);
         if (ready < 0) {
@@ -159,8 +176,29 @@ pub const App = struct {
         if (self.session.pty != null and fds[1].revents & c.POLLOUT != 0) {
             if (!try self.session.flush()) self.endTerminal();
         }
+        if (self.tool.session) |session| {
+            if (session.pty != null and fds[2].revents & (c.POLLIN | c.POLLHUP | c.POLLERR) != 0) switch (try session.drain()) {
+                .idle => {},
+                .output => self.dirty = true,
+                .ended => self.endTool(session),
+            };
+            if (session.pty != null and fds[2].revents & c.POLLOUT != 0) {
+                if (!try session.flush()) self.endTool(session);
+            }
+        }
         if (fds[0].revents & c.POLLIN != 0 and !try self.readInput()) return false;
         return true;
+    }
+
+    fn hostAcceptsInput(self: *App) bool {
+        if (self.state.view().tool == .running) return self.state.view().tool.running.acceptsInput();
+        return self.state.view().focus != .terminal or self.session.emulator.acceptsInput();
+    }
+
+    fn endTool(self: *App, session: *Session) void {
+        session.end();
+        self.state.toolEnded(session.successful_exit);
+        self.dirty = true;
     }
 
     fn readInput(self: *App) !bool {

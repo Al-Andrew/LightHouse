@@ -4,6 +4,7 @@ const input = @import("lighthouse-ui").input;
 
 pub const Id = enum {
     help,
+    edit_file,
     insert_reference,
     copy,
     move,
@@ -47,6 +48,7 @@ pub const Description = struct {
 
 pub const descriptions = [_]Description{
     .{ .id = .insert_reference, .label = "Insert path", .help = "Insert Cursor reference", .bindings = &.{.{ .byte = input.control('f'), .text = "Ctrl+F" }} },
+    .{ .id = .edit_file, .label = "Edit", .help = "Edit Cursor file", .bindings = &.{.{ .key = .f4, .text = "F4" }} },
     .{ .id = .help, .label = "Help", .help = "Help", .bindings = &.{.{ .key = .f1, .text = "F1" }} },
     .{ .id = .copy, .label = "Copy", .help = "Copy", .bindings = &.{.{ .key = .f5, .text = "F5" }} },
     .{ .id = .move, .label = "RenMov", .help = "Move/rename", .bindings = &.{.{ .key = .f6, .text = "F6" }} },
@@ -97,7 +99,7 @@ pub fn functionCommand(key: input.Key) ?Id {
 pub const help_groups = [_][]const Id{
     &.{ .help, .quit, .switch_pane },
     &.{ .copy, .move, .mkdir },
-    &.{.delete},
+    &.{ .delete, .edit_file },
     &.{ .path, .absolute_path },
     &.{ .refresh, .insert_reference },
     &.{ .toggle_terminal, .focus_terminal, .zoom_terminal },

@@ -154,6 +154,7 @@ pub const Emulator = struct {
 
     fn key(self: *Emulator, ev: *const input.Event) !void {
         self.bottom();
+        if (ev.key == .enter and ev.len == 1 and ev.bytes[0] == 10) return self.queue("\n");
         var key_ev: vt.input.KeyEvent = .{
             .mods = .{ .shift = ev.shift, .alt = ev.alt, .ctrl = ev.ctrl },
             .key = switch (ev.key) {

@@ -35,6 +35,9 @@ pub fn main(init: std.process.Init) !void {
                 "Ctrl+F inserts the Cursor reference into the shell without Enter.\n" ++
                 "Ctrl+L enters a path, Ctrl+R refreshes, . toggles hidden files,\n" ++
                 "s cycles sorting, r reverses it, F1 shows help, q/F10 quits.\n" ++
+                "F4 edits the Cursor file in a separate full-area terminal; F3 is unassigned.\n" ++
+                "Set editor argv in XDG_CONFIG_HOME/lighthouse/config.json (else ~/.config),\n" ++
+                "or set EDITOR with quoted arguments. No shell evaluation or default editor.\n" ++
                 "F5 copies, F6 moves/renames, F7 creates a directory, F8 deletes.\n" ++
                 "+/- resizes the shell, z zooms, Shift+PgUp/PgDn scrolls its history.\n" ++
                 "In shell: all keys except Ctrl+G/Ctrl+J go to the child application.\n");

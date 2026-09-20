@@ -54,6 +54,7 @@ the shell is focused, where function keys pass through to the child.
 | Key | Action |
 | --- | --- |
 | Ctrl+G | Switch focus between the visible shell and last active Pane; leave zoom |
+| F4 | Edit the Cursor file in a separate full-area terminal |
 | Ctrl+F | Insert the Cursor entry’s Provider reference into the shell without Enter |
 | Ctrl+J | Hide/show the shell; start a fresh session if absent |
 | Up / Down / PageUp / PageDown / Home / End | Move the file cursor |
@@ -153,8 +154,8 @@ characters are rendered and clipped at grapheme boundaries. Long path headers
 show their trailing components.
 
 Browsing does not change the shell's working directory, and a shell `cd` does
-not change either pane. Opening regular files in an editor/viewer and explicit
-pane-to-shell directory synchronization are later work.
+not change either pane. F4 editing uses a separate session; explicit pane-to-shell directory
+synchronization and an F3 viewer remain later work.
 
 While the shell is focused, keys such as Tab, Ctrl+C, Ctrl+D, q, and function keys
 are sent to the child application. **Ctrl+G switches focus** and **Ctrl+J hides/shows the terminal**. Bracketed paste is routed as paste, including any shortcut bytes in its
@@ -282,3 +283,27 @@ Hidden sessions are reused and absent sessions are started only after reference
 validation. Resolution, launch and queue failures explain the problem without
 inserting a prefix or moving focus. Jobs/results, modals and tools block insertion.
 Ctrl+F with terminal focus remains normal child input.
+
+### Editor configuration
+
+F4 opens the Cursor's local regular file (or a symlink resolving to one), ignoring
+Marks. Configure `$XDG_CONFIG_HOME/lighthouse/config.json`, or
+`~/.config/lighthouse/config.json` when XDG_CONFIG_HOME is unset/empty:
+
+```json
+{"editor": ["nvim", "--clean"]}
+```
+
+The array is executable plus fixed arguments. Without an `editor` setting,
+`$EDITOR` supplies quoted arguments: single/double quotes and backslash escaping
+are supported, with no variable expansion, substitution or shell evaluation.
+There is no VISUAL or default editor fallback. Invalid explicit settings never
+fall back. Executable names use PATH; relative executable paths use the active
+Pane directory. The absolute Cursor path is appended as one literal argument.
+
+The editor occupies the full application area; all input, including Ctrl+G,
+Ctrl+J, q, function keys and paste, belongs to it. Normal exit refreshes both
+Panes and returns to browsing. An unsuccessful exit retains final output and
+an explanation until any key dismisses it. The persistent shell continues
+independently, preserving its input, working directory and program. Its EOF
+cannot close the editor. F4 is blocked by modals, file jobs and retained results.
