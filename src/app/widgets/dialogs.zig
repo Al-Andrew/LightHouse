@@ -138,3 +138,33 @@ pub fn paintHelp(painter: ui.Painter) void {
     const inside = box.inset(1);
     for (help_lines, 0..) |line, i| inside.label(0, i, line, style);
 }
+
+test "file action dialogs fit tiny windows with Unicode input" {
+    const allocator = std.testing.allocator;
+    var frame = ui.Frame.init(allocator);
+    defer frame.deinit();
+    var editor = try PathInput.init(allocator, "/dest/界");
+    defer editor.deinit();
+    const job = try operations.Job.create(std.testing.io, allocator, .copy, "/source", &.{"file"}, "/target");
+    defer job.destroy();
+    for (1..95) |cols| for (1..10) |rows| {
+        try frame.begin(cols, rows);
+        try paintPathInput(frame.painter(.{ .x = 0, .y = 0, .width = frame.cols, .height = frame.rows }), &editor, .copy, null);
+        if (frame.cursor) |cursor| try std.testing.expect(cursor.x < cols and cursor.y < rows);
+        try paintOperation(frame.painter(.{ .x = 0, .y = 0, .width = frame.cols, .height = frame.rows }), job);
+        try std.testing.expect(frame.cursor == null);
+    };
+}
+
+test "delete confirmation handles multiple selections" {
+    const allocator = std.testing.allocator;
+    var frame = ui.Frame.init(allocator);
+    defer frame.deinit();
+    const names = [_][]const u8{ "a", "b", "c", "d", "e" };
+    for (2..names.len + 1) |count| {
+        const job = try operations.Job.create(std.testing.io, allocator, .delete, "/unused", names[0..count], "");
+        defer job.destroy();
+        try frame.begin(100, 30);
+        try paintDeleteConfirmation(frame.painter(.{ .x = 0, .y = 0, .width = frame.cols, .height = frame.rows }), job);
+    }
+}
