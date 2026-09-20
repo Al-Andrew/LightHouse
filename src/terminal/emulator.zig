@@ -1,8 +1,8 @@
 //! All Ghostty-specific types stay behind this adapter.
 const std = @import("std");
 const vt = @import("ghostty-vt");
-const ui = @import("../ui/screen.zig");
-const input = @import("../ui/input.zig");
+const ui = @import("lighthouse-ui").screen;
+const input = @import("lighthouse-ui").input;
 // The Zig API exposes the DA response type through its callback signature.
 const DeviceAttributes = @typeInfo(std.meta.Child(std.meta.Child(
     @FieldType(vt.TerminalStream.Handler.Effects, "device_attributes"),

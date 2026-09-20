@@ -1,5 +1,5 @@
 //! Application palette, separate from widget behavior and terminal colors.
-const ui = @import("screen.zig");
+const ui = @import("lighthouse-ui").screen;
 
 pub const base: ui.Style = .{};
 pub const accent: ui.Style = .{ .fg = .{ .r = 120, .g = 220, .b = 236 }, .bold = true };

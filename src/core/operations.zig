@@ -23,7 +23,147 @@ pub const Kind = enum {
     }
 };
 
-pub const Job = struct {
+/// Owned request metadata. All slices are borrowed until Job.destroy.
+pub const Request = struct {
+    kind: Kind,
+    sources: []const []const u8,
+    destination: []const u8,
+};
+
+pub const Progress = struct {
+    completed: usize = 0,
+    removed: usize = 0,
+    bytes: u64 = 0,
+};
+
+pub const Failure = struct {
+    err: anyerror,
+    // Launch failures have no filesystem path.
+    path: ?[]const u8,
+};
+
+pub const Result = struct {
+    progress: Progress,
+    failure: ?Failure,
+};
+
+pub const Status = union(enum) {
+    prepared,
+    running: Progress,
+    canceling: Progress,
+    finished: Result,
+
+    pub fn progress(self: Status) Progress {
+        return switch (self) {
+            .prepared => .{},
+            .running, .canceling => |value| value,
+            .finished => |result| result.progress,
+        };
+    }
+};
+
+/// One UI thread owns this job from preparation through result dismissal.
+/// Only poll publishes a finished result; status never collects completion.
+/// Request and failure-path slices remain valid until destroy. Opaque storage
+/// keeps worker synchronization out of the caller's interface.
+pub const Job = opaque {
+    pub fn create(io: std.Io, allocator: std.mem.Allocator, kind: Kind, base: []const u8, names: []const []const u8, target: []const u8) !*Job {
+        if (kind != .delete and target.len == 0) return error.EmptyDestination;
+        if (kind != .mkdir and names.len == 0) return error.NoSelection;
+        const self = try allocator.create(Implementation);
+        errdefer allocator.destroy(self);
+        var arena: std.heap.ArenaAllocator = .init(allocator);
+        errdefer arena.deinit();
+        const owned = arena.allocator();
+        const sources = try owned.alloc([]const u8, names.len);
+        for (names, sources) |name, *source| {
+            // Sources are directory-entry names, never paths or synthetic parents.
+            if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..") or
+                std.mem.indexOfScalar(u8, name, '/') != null or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidSource;
+            source.* = try std.fs.path.join(owned, &.{ base, name });
+        }
+        // Preserve trailing slashes: a missing destination ending in '/' must
+        // not silently become a filename. Relative input is based on the source pane.
+        const destination = if (std.fs.path.isAbsolute(target)) try owned.dupe(u8, target) else try std.fs.path.join(owned, &.{ base, target });
+        self.* = .{ .allocator = allocator, .arena = arena, .io = io, .kind = kind, .sources = sources, .destination = destination };
+        return @ptrCast(self);
+    }
+
+    /// Starts once. Worker-launch errors become results at the next poll;
+    /// AlreadyStarted denotes a caller error and never launches another worker.
+    pub fn start(job: *Job) error{AlreadyStarted}!void {
+        const self: *Implementation = @ptrCast(@alignCast(job));
+        if (self.phase != .prepared) return error.AlreadyStarted;
+        self.phase = .running;
+        self.future = self.io.concurrent(Implementation.work, .{self}) catch |err| {
+            self.failure = err;
+            self.done.store(true, .release);
+            return;
+        };
+    }
+
+    /// Cooperative request, not an outcome. Prepared and finished jobs ignore it.
+    pub fn cancel(job: *Job) void {
+        const self: *Implementation = @ptrCast(@alignCast(job));
+        if (self.phase != .running) return;
+        self.phase = .canceling;
+        self.canceled.store(true, .release);
+    }
+
+    /// Reports completion exactly once, including launch failure. A running
+    /// worker is never awaited until it has published completion.
+    pub fn poll(job: *Job) bool {
+        const self: *Implementation = @ptrCast(@alignCast(job));
+        if (self.phase == .prepared or self.phase == .finished or !self.done.load(.acquire)) return false;
+        if (self.future) |*future| future.await(self.io);
+        self.future = null;
+        self.phase = .finished;
+        return true;
+    }
+
+    pub fn request(job: *const Job) Request {
+        const self: *const Implementation = @ptrCast(@alignCast(job));
+        return .{ .kind = self.kind, .sources = self.sources, .destination = self.destination };
+    }
+
+    /// Live counters are individually safe, not a simultaneous snapshot.
+    /// Finished totals and failure data are stable after poll has joined work.
+    pub fn status(job: *const Job) Status {
+        const self: *const Implementation = @ptrCast(@alignCast(job));
+        const progress: Progress = .{
+            .completed = self.completed.load(.acquire),
+            .removed = self.removed.load(.acquire),
+            .bytes = self.bytes.load(.acquire),
+        };
+        return switch (self.phase) {
+            .prepared => .prepared,
+            .running => .{ .running = progress },
+            .canceling => .{ .canceling = progress },
+            .finished => .{ .finished = .{
+                .progress = progress,
+                .failure = if (self.failure) |err| .{
+                    .err = err,
+                    .path = if (self.failed_path_len > 0) self.failed_path[0..self.failed_path_len] else null,
+                } else null,
+            } },
+        };
+    }
+
+    /// Valid in every state. Cancels and joins outstanding work before freeing
+    /// any storage, so callers do not need to poll during shutdown.
+    pub fn destroy(job: *Job) void {
+        const self: *Implementation = @ptrCast(@alignCast(job));
+        if (self.future) |*future| {
+            self.canceled.store(true, .release);
+            future.cancel(self.io);
+        }
+        const allocator = self.allocator;
+        self.arena.deinit();
+        allocator.destroy(self);
+    }
+};
+
+const Implementation = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     io: std.Io,
@@ -40,69 +180,25 @@ pub const Job = struct {
     failed_path: [std.Io.Dir.max_path_bytes]u8 = undefined,
     failed_path_len: usize = 0,
     future: ?std.Io.Future(void) = null,
-    collected: bool = false,
+    phase: enum { prepared, running, canceling, finished } = .prepared,
 
-    pub fn create(io: std.Io, allocator: std.mem.Allocator, kind: Kind, base: []const u8, names: []const []const u8, target: []const u8) !*Job {
-        if (kind != .delete and target.len == 0) return error.EmptyDestination;
-        if (kind != .mkdir and names.len == 0) return error.NoSelection;
-        const self = try allocator.create(Job);
-        errdefer allocator.destroy(self);
-        var arena: std.heap.ArenaAllocator = .init(allocator);
-        errdefer arena.deinit();
-        const owned = arena.allocator();
-        const sources = try owned.alloc([]const u8, names.len);
-        for (names, sources) |name, *source| {
-            // Sources are directory-entry names, never paths or synthetic parents.
-            if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..") or
-                std.mem.indexOfScalar(u8, name, '/') != null or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidSource;
-            source.* = try std.fs.path.join(owned, &.{ base, name });
-        }
-        // Preserve trailing slashes: a missing destination ending in '/' must
-        // not silently become a filename. Relative input is based on the source pane.
-        const destination = if (std.fs.path.isAbsolute(target)) try owned.dupe(u8, target) else try std.fs.path.join(owned, &.{ base, target });
-        self.* = .{ .allocator = allocator, .arena = arena, .io = io, .kind = kind, .sources = sources, .destination = destination };
-        return self;
-    }
-
-    pub fn start(self: *Job) !void {
-        self.future = try self.io.concurrent(work, .{self});
-    }
-
-    pub fn destroy(self: *Job) void {
-        if (self.future) |*future| {
-            self.canceled.store(true, .release);
-            future.cancel(self.io);
-        }
-        const allocator = self.allocator;
-        self.arena.deinit();
-        allocator.destroy(self);
-    }
-
-    pub fn poll(self: *Job) bool {
-        if (self.collected or !self.done.load(.acquire)) return false;
-        if (self.future) |*future| future.await(self.io);
-        self.future = null;
-        self.collected = true;
-        return true;
-    }
-
-    fn check(self: *Job) !void {
+    fn check(self: *Implementation) !void {
         if (self.canceled.load(.acquire)) return error.Canceled;
     }
 
-    fn pathError(self: *Job, path: []const u8) void {
+    fn pathError(self: *Implementation, path: []const u8) void {
         self.failed_path_len = @min(path.len, self.failed_path.len);
         @memcpy(self.failed_path[0..self.failed_path_len], path[0..self.failed_path_len]);
     }
 
-    fn work(self: *Job) void {
+    fn work(self: *Implementation) void {
         self.execute() catch |err| {
             self.failure = err;
         };
         self.done.store(true, .release);
     }
 
-    fn execute(self: *Job) !void {
+    fn execute(self: *Implementation) !void {
         self.pathError(self.destination);
         try self.check();
         if (self.kind == .mkdir) {
@@ -144,7 +240,7 @@ pub const Job = struct {
         }
     }
 
-    fn deleteNode(self: *Job, parent: Dir, name: []const u8, display_path: []const u8, depth: usize) anyerror!void {
+    fn deleteNode(self: *Implementation, parent: Dir, name: []const u8, display_path: []const u8, depth: usize) anyerror!void {
         self.pathError(display_path);
         try self.check();
         if (depth >= max_recursion_depth) return error.DirectoryTooDeep;
@@ -170,7 +266,7 @@ pub const Job = struct {
         _ = self.removed.fetchAdd(1, .release);
     }
 
-    fn validateTarget(self: *Job, source: []const u8, target: []const u8, directory: bool) !void {
+    fn validateTarget(self: *Implementation, source: []const u8, target: []const u8, directory: bool) !void {
         // Refuse aliases too: resolving the destination parent catches a symlink
         // back into the source directory, not just lexical descendants.
         const parent = std.fs.path.dirname(target) orelse return error.InvalidDestination;
@@ -196,7 +292,7 @@ pub const Job = struct {
         return error.PathAlreadyExists;
     }
 
-    fn copyNode(self: *Job, source: []const u8, target: []const u8, depth: usize) anyerror!void {
+    fn copyNode(self: *Implementation, source: []const u8, target: []const u8, depth: usize) anyerror!void {
         try self.check();
         if (depth >= max_recursion_depth) return error.DirectoryTooDeep;
         self.pathError(source);
@@ -258,8 +354,9 @@ pub const Job = struct {
 
 fn testJob(kind: Kind, base: []const u8, names: []const []const u8, target: []const u8) !*Job {
     const job = try Job.create(std.testing.io, std.testing.allocator, kind, base, names, target);
-    job.work();
-    _ = job.poll();
+    errdefer job.destroy();
+    try job.start();
+    try waitForJob(job);
     return job;
 }
 
@@ -281,8 +378,8 @@ test "recursive copy includes hidden and raw names and preserves symlinks withou
     try tmp.dir.symLink(io, ".", "source/loop", .{});
     const job = try testJob(.copy, base, &.{"source"}, "copied");
     defer job.destroy();
-    try std.testing.expectEqual(null, job.failure);
-    try std.testing.expectEqual(@as(usize, 1), job.completed.load(.acquire));
+    try std.testing.expectEqual(null, job.status().finished.failure);
+    try std.testing.expectEqual(@as(usize, 1), job.status().progress().completed);
     var data: [32]u8 = undefined;
     try std.testing.expectEqualStrings("payload", try tmp.dir.readFile(io, "copied/nested/raw\n\xff", &data));
     try std.testing.expectEqualStrings("hidden", try tmp.dir.readFile(io, "copied/.hidden", &data));
@@ -305,7 +402,7 @@ test "copy and move conflicts preserve existing files and dangling links" {
         for ([_][]const u8{ "existing", "broken", "source" }) |target| {
             const job = try testJob(kind, base, &.{"source"}, target);
             defer job.destroy();
-            try std.testing.expectEqual(error.PathAlreadyExists, job.failure.?);
+            try std.testing.expectEqual(error.PathAlreadyExists, job.status().finished.failure.?.err);
         }
     }
     var data: [32]u8 = undefined;
@@ -326,11 +423,11 @@ test "move supports rename and multi-source destination directories" {
     try tmp.dir.symLink(io, "missing", "b", .{});
     const renamed = try testJob(.move, base, &.{"a"}, "renamed");
     defer renamed.destroy();
-    try std.testing.expectEqual(null, renamed.failure);
+    try std.testing.expectEqual(null, renamed.status().finished.failure);
     const moved = try testJob(.move, base, &.{ "renamed", "b", "folder" }, "dest");
     defer moved.destroy();
-    try std.testing.expectEqual(null, moved.failure);
-    try std.testing.expectEqual(@as(usize, 3), moved.completed.load(.acquire));
+    try std.testing.expectEqual(null, moved.status().finished.failure);
+    try std.testing.expectEqual(@as(usize, 3), moved.status().progress().completed);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "renamed", .{}));
     try std.testing.expectEqual(.sym_link, (try tmp.dir.statFile(io, "dest/b", .{ .follow_symlinks = false })).kind);
     try std.testing.expectEqual(.directory, (try tmp.dir.statFile(io, "dest/folder", .{})).kind);
@@ -348,14 +445,14 @@ test "reject descendants including symlink aliases and ambiguous multi-source de
         for ([_][]const u8{ "source/child/new", "alias/new" }) |target| {
             const job = try testJob(kind, base, &.{"source"}, target);
             defer job.destroy();
-            try std.testing.expectEqual(error.DestinationInsideSource, job.failure.?);
+            try std.testing.expectEqual(error.DestinationInsideSource, job.status().finished.failure.?.err);
         }
         const multiple = try testJob(kind, base, &.{ "source", "alias" }, "missing");
         defer multiple.destroy();
-        try std.testing.expectEqual(error.DestinationMustBeDirectory, multiple.failure.?);
+        try std.testing.expectEqual(error.DestinationMustBeDirectory, multiple.status().finished.failure.?.err);
         const slash = try testJob(kind, base, &.{"source"}, "missing/");
         defer slash.destroy();
-        try std.testing.expectEqual(error.DestinationMustBeDirectory, slash.failure.?);
+        try std.testing.expectEqual(error.DestinationMustBeDirectory, slash.status().finished.failure.?.err);
     }
 }
 
@@ -366,13 +463,13 @@ test "mkdir refuses existing paths and reports missing parents" {
     const base = try testBase(&tmp, &buffer);
     const first = try testJob(.mkdir, base, &.{}, "new folder");
     defer first.destroy();
-    try std.testing.expectEqual(null, first.failure);
+    try std.testing.expectEqual(null, first.status().finished.failure);
     const again = try testJob(.mkdir, base, &.{}, "new folder");
     defer again.destroy();
-    try std.testing.expectEqual(error.PathAlreadyExists, again.failure.?);
+    try std.testing.expectEqual(error.PathAlreadyExists, again.status().finished.failure.?.err);
     const missing = try testJob(.mkdir, base, &.{}, "missing/child");
     defer missing.destroy();
-    try std.testing.expectEqual(error.FileNotFound, missing.failure.?);
+    try std.testing.expectEqual(error.FileNotFound, missing.status().finished.failure.?.err);
 }
 
 test "partial batch failure reports completed items and preserves unprocessed sources" {
@@ -385,8 +482,8 @@ test "partial batch failure reports completed items and preserves unprocessed so
     for ([_][]const u8{ "a", "b", "c", "dest/b" }) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = name });
     const job = try testJob(.move, base, &.{ "a", "b", "c" }, "dest");
     defer job.destroy();
-    try std.testing.expectEqual(error.PathAlreadyExists, job.failure.?);
-    try std.testing.expectEqual(@as(usize, 1), job.completed.load(.acquire));
+    try std.testing.expectEqual(error.PathAlreadyExists, job.status().finished.failure.?.err);
+    try std.testing.expectEqual(@as(usize, 1), job.status().progress().completed);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "a", .{}));
     _ = try tmp.dir.statFile(io, "dest/a", .{});
     _ = try tmp.dir.statFile(io, "b", .{});
@@ -399,26 +496,31 @@ test "canceling an active copy never publishes a partial destination" {
     defer tmp.cleanup();
     var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const base = try testBase(&tmp, &buffer);
-    const source = try tmp.dir.createFile(io, "large", .{});
+    const source = try tmp.dir.createFile(io, "source", .{});
     defer source.close(io);
-    try source.setLength(io, 4 * 1024 * 1024 * 1024);
-    const job = try Job.create(io, std.testing.allocator, .copy, base, &.{"large"}, "destination");
+    const size = 2 * copy_buffer_bytes;
+    try source.setLength(io, size);
+    var gate = TestIoGate.init(.copy);
+    defer gate.threaded.deinit();
+    const job = try Job.create(gate.io(), std.testing.allocator, .copy, base, &.{"source"}, "destination");
     defer job.destroy();
+    defer gate.unblock();
     try job.start();
-    for (0..5000) |_| {
-        if (job.bytes.load(.acquire) > 0 or job.done.load(.acquire)) break;
-        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
-    }
-    try std.testing.expect(job.bytes.load(.acquire) > 0);
-    job.canceled.store(true, .release);
-    for (0..5000) |_| {
-        if (job.poll()) break;
-        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
-    }
-    try std.testing.expect(job.collected);
-    try std.testing.expectEqual(error.Canceled, job.failure.?);
+    try gate.waitUntilEntered();
+    try std.testing.expect(job.status() == .running);
+    try std.testing.expect(job.status().progress().bytes > 0);
+    try std.testing.expect(!job.poll());
+    try std.testing.expectError(error.AlreadyStarted, job.start());
+    job.cancel();
+    job.cancel();
+    try std.testing.expect(job.status() == .canceling);
+    gate.unblock();
+    try waitForJob(job);
+    const result = job.status().finished;
+    try std.testing.expectEqual(error.Canceled, result.failure.?.err);
+    try std.testing.expectEqual(@as(usize, 0), result.progress.completed);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "destination", .{}));
-    try std.testing.expectEqual(@as(u64, 4 * 1024 * 1024 * 1024), (try source.stat(io)).size);
+    try std.testing.expectEqual(@as(u64, size), (try source.stat(io)).size);
 }
 
 test "recursive delete removes raw names and links without touching link targets" {
@@ -437,9 +539,9 @@ test "recursive delete removes raw names and links without touching link targets
     try tmp.dir.symLink(io, "outside", "dirlink", .{});
     const job = try testJob(.delete, base, &.{ "tree", "dirlink" }, "");
     defer job.destroy();
-    try std.testing.expectEqual(null, job.failure);
-    try std.testing.expectEqual(@as(usize, 2), job.completed.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 7), job.removed.load(.acquire));
+    try std.testing.expectEqual(null, job.status().finished.failure);
+    try std.testing.expectEqual(@as(usize, 2), job.status().progress().completed);
+    try std.testing.expectEqual(@as(usize, 7), job.status().progress().removed);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "tree", .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "dirlink", .{ .follow_symlinks = false }));
     var data: [16]u8 = undefined;
@@ -463,10 +565,10 @@ test "delete stops on failure and reports prior removals" {
     try tmp.dir.writeFile(io, .{ .sub_path = "last", .data = "" });
     const job = try testJob(.delete, base, &.{ "first", "missing", "last" }, "");
     defer job.destroy();
-    try std.testing.expectEqual(error.FileNotFound, job.failure.?);
-    try std.testing.expectEqual(@as(usize, 1), job.completed.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 1), job.removed.load(.acquire));
-    try std.testing.expect(std.mem.endsWith(u8, job.failed_path[0..job.failed_path_len], "/missing"));
+    try std.testing.expectEqual(error.FileNotFound, job.status().finished.failure.?.err);
+    try std.testing.expectEqual(@as(usize, 1), job.status().progress().completed);
+    try std.testing.expectEqual(@as(usize, 1), job.status().progress().removed);
+    try std.testing.expect(std.mem.endsWith(u8, job.status().finished.failure.?.path.?, "/missing"));
     _ = try tmp.dir.statFile(io, "last", .{});
 }
 
@@ -477,25 +579,206 @@ test "cancellation interrupts recursive deletion and retains remaining children"
     var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const base = try testBase(&tmp, &buffer);
     try tmp.dir.createDir(io, "tree", .default_dir);
-    for (0..5000) |index| {
-        var name: [32]u8 = undefined;
-        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&name, "tree/{d}", .{index}), .data = "" });
+    for ([_][]const u8{ "tree/a", "tree/b", "tree/c" }) |name| {
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "" });
     }
-    const job = try Job.create(io, std.testing.allocator, .delete, base, &.{"tree"}, "");
+    var gate = TestIoGate.init(.delete);
+    defer gate.threaded.deinit();
+    const job = try Job.create(gate.io(), std.testing.allocator, .delete, base, &.{"tree"}, "");
+    defer job.destroy();
+    defer gate.unblock();
+    try job.start();
+    try gate.waitUntilEntered();
+    try std.testing.expectEqual(@as(usize, 1), job.status().progress().removed);
+    job.cancel();
+    gate.unblock();
+    try waitForJob(job);
+    const result = job.status().finished;
+    try std.testing.expectEqual(error.Canceled, result.failure.?.err);
+    try std.testing.expectEqual(@as(usize, 0), result.progress.completed);
+    // The deletion already in flight may finish after cancellation is requested.
+    try std.testing.expect(result.progress.removed >= 1 and result.progress.removed < 3);
+    const tree = try tmp.dir.openDir(io, "tree", .{ .iterate = true });
+    defer tree.close(io);
+    var iterator = tree.iterate();
+    try std.testing.expect(try iterator.next(io) != null);
+}
+
+fn waitForJob(job: *Job) !void {
+    for (0..5000) |_| {
+        if (job.poll()) return;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    return error.JobTimeout;
+}
+
+// A real filesystem adapter with a gate at a selected I/O call. The copied
+// vtable keeps the Threaded userdata expected by all unchanged callbacks.
+// Construct in stable storage before io(); release the gate before job cleanup.
+const TestIoGate = struct {
+    threaded: std.Io.Threaded,
+    vtable: std.Io.VTable = undefined,
+    mode: enum { copy, delete, mkdir },
+    deletions: usize = 0,
+    entered: std.Io.Event = .unset,
+    released: std.Io.Event = .unset,
+
+    fn init(mode: @FieldType(TestIoGate, "mode")) TestIoGate {
+        return .{ .threaded = .init(std.testing.allocator, .{}), .mode = mode };
+    }
+
+    fn io(self: *TestIoGate) std.Io {
+        const base = self.threaded.io();
+        self.vtable = base.vtable.*;
+        self.vtable.fileReadPositional = read;
+        self.vtable.dirDeleteFile = delete;
+        self.vtable.dirCreateDir = mkdir;
+        return .{ .userdata = base.userdata, .vtable = &self.vtable };
+    }
+
+    fn fromUserdata(userdata: ?*anyopaque) *TestIoGate {
+        const threaded: *std.Io.Threaded = @ptrCast(@alignCast(userdata.?));
+        return @fieldParentPtr("threaded", threaded);
+    }
+
+    fn pause(self: *TestIoGate) std.Io.Cancelable!void {
+        self.entered.set(self.threaded.io());
+        try self.released.wait(self.threaded.io());
+    }
+
+    fn unblock(self: *TestIoGate) void {
+        self.released.set(self.threaded.io());
+    }
+
+    fn waitUntilEntered(self: *TestIoGate) !void {
+        // Time bounds diagnose hangs; the event, not elapsed time, orders work.
+        for (0..5000) |_| {
+            if (self.entered.isSet()) return;
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+        }
+        return error.GateTimeout;
+    }
+
+    fn read(userdata: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+        const self = fromUserdata(userdata);
+        if (self.mode == .copy and offset > 0) try self.pause();
+        const base = self.threaded.io();
+        return base.vtable.fileReadPositional(base.userdata, file, data, offset);
+    }
+
+    fn delete(userdata: ?*anyopaque, dir: Dir, path: []const u8) Dir.DeleteFileError!void {
+        const self = fromUserdata(userdata);
+        self.deletions += 1;
+        if (self.mode == .delete and self.deletions == 2) try self.pause();
+        const base = self.threaded.io();
+        return base.vtable.dirDeleteFile(base.userdata, dir, path);
+    }
+
+    fn mkdir(userdata: ?*anyopaque, dir: Dir, path: []const u8, permissions: Dir.Permissions) Dir.CreateDirError!void {
+        const self = fromUserdata(userdata);
+        const base = self.threaded.io();
+        try base.vtable.dirCreateDir(base.userdata, dir, path, permissions);
+        // Let cancellation race with an operation which has already succeeded.
+        if (self.mode == .mkdir) try self.pause();
+    }
+};
+
+test "prepared deletion owns its request and can be dismissed without work" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base = try testBase(&tmp, &buffer);
+    try tmp.dir.writeFile(io, .{ .sub_path = "keep", .data = "keep" });
+    var name = "keep".*;
+    {
+        const job = try Job.create(io, std.testing.allocator, .delete, base, &.{&name}, "");
+        defer job.destroy();
+        name[0] = 'X';
+        // Prove ownership after the caller also reuses its base-path buffer.
+        @memset(buffer[0..base.len], 0);
+        const request = job.request();
+        try std.testing.expectEqual(Kind.delete, request.kind);
+        try std.testing.expect(std.mem.endsWith(u8, request.sources[0], "/keep"));
+        job.cancel();
+        try std.testing.expect(job.status() == .prepared);
+        try std.testing.expect(!job.poll());
+    }
+    var data: [4]u8 = undefined;
+    try std.testing.expectEqualStrings("keep", try tmp.dir.readFile(io, "keep", &data));
+}
+
+test "launch failure is collected once and status never consumes completion" {
+    const job = try Job.create(std.Io.failing, std.testing.allocator, .mkdir, "/", &.{}, "unused");
     defer job.destroy();
     try job.start();
-    for (0..5000) |_| {
-        if (job.removed.load(.acquire) > 0 or job.done.load(.acquire)) break;
-        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
-    }
-    try std.testing.expect(job.removed.load(.acquire) > 0);
-    job.canceled.store(true, .release);
-    for (0..5000) |_| {
-        if (job.poll()) break;
-        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
-    }
-    try std.testing.expect(job.collected);
-    try std.testing.expectEqual(error.Canceled, job.failure.?);
-    try std.testing.expect(job.removed.load(.acquire) < 5000);
-    _ = try tmp.dir.statFile(io, "tree", .{});
+    try std.testing.expect(job.status() == .running);
+    try std.testing.expect(job.status() == .running);
+    try std.testing.expectError(error.AlreadyStarted, job.start());
+    job.cancel();
+    try std.testing.expect(job.status() == .canceling);
+    try std.testing.expect(job.poll());
+    const result = job.status().finished;
+    try std.testing.expectEqual(error.ConcurrencyUnavailable, result.failure.?.err);
+    try std.testing.expectEqual(null, result.failure.?.path);
+    try std.testing.expectEqual(Progress{}, result.progress);
+    job.cancel();
+    try std.testing.expectEqualDeep(result, job.status().finished);
+    try std.testing.expect(!job.poll());
+    try std.testing.expectError(error.AlreadyStarted, job.start());
+}
+
+test "late cancellation preserves success and finished results remain stable" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base = try testBase(&tmp, &buffer);
+    var gate = TestIoGate.init(.mkdir);
+    defer gate.threaded.deinit();
+    const job = try Job.create(gate.io(), std.testing.allocator, .mkdir, base, &.{}, "created");
+    defer job.destroy();
+    defer gate.unblock();
+    try job.start();
+    try gate.waitUntilEntered();
+    _ = try tmp.dir.statFile(io, "created", .{});
+    job.cancel();
+    try std.testing.expect(job.status() == .canceling);
+    gate.unblock();
+    try waitForJob(job);
+    const result = job.status().finished;
+    try std.testing.expectEqual(null, result.failure);
+    try std.testing.expectEqual(@as(usize, 1), result.progress.completed);
+    job.cancel();
+    try std.testing.expectEqualDeep(result, job.status().finished);
+    try std.testing.expect(!job.poll());
+}
+
+test "destroy joins an active copy and removes its unpublished destination" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base = try testBase(&tmp, &buffer);
+    const source = try tmp.dir.createFile(io, "source", .{});
+    defer source.close(io);
+    try source.setLength(io, 2 * copy_buffer_bytes);
+    var gate = TestIoGate.init(.copy);
+    defer gate.threaded.deinit();
+    const job = try Job.create(gate.io(), std.testing.allocator, .copy, base, &.{"source"}, "destination");
+    var destroyed = false;
+    defer if (!destroyed) job.destroy();
+    defer gate.unblock();
+    try job.start();
+    try gate.waitUntilEntered();
+    // destroy's Future.cancel must wake the cancelable gate and join the worker.
+    job.destroy();
+    destroyed = true;
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "destination", .{}));
+    try std.testing.expectEqual(@as(u64, 2 * copy_buffer_bytes), (try source.stat(io)).size);
+    const dir = try tmp.dir.openDir(io, ".", .{ .iterate = true });
+    defer dir.close(io);
+    var iterator = dir.iterate();
+    try std.testing.expectEqualStrings("source", (try iterator.next(io)).?.name);
+    try std.testing.expect(try iterator.next(io) == null);
 }

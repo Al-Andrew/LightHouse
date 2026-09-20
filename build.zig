@@ -12,12 +12,22 @@ pub fn build(b: *std.Build) void {
         .optimize = if (optimize == .Debug and !ghostty_debug) .ReleaseSafe else optimize,
         .@"vt-features" = "-kitty-graphics",
     });
+    const toolkit = b.addModule("lighthouse-ui", .{
+        .root_source_file = b.path("src/ui/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") }},
+    });
     const core = b.addModule("LightHouse", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{.{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") }},
+        .imports = &.{
+            .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
+            .{ .name = "lighthouse-ui", .module = toolkit },
+        },
     });
     const exe = b.addExecutable(.{
         .name = "lighthouse",
@@ -34,7 +44,12 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run.addArgs(args);
     b.step("run", "Run LightHouse in the current terminal").dependOn(&run.step);
     const tests = b.addTest(.{ .root_module = core });
-    b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(tests).step);
+    const ui_tests = b.addTest(.{ .root_module = toolkit });
+    const check_ui = b.addRunArtifact(ui_tests);
+    const test_step = b.step("test", "Run application and UI library unit tests");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
+    test_step.dependOn(&check_ui.step);
+    b.step("test-ui", "Test the UI library independently of the application").dependOn(&check_ui.step);
     const integration_step = b.step("test-integration", "Run Linux PTY integration checks (requires Python 3)");
     for ([_][]const u8{ "tests/pty_smoke.py", "tests/browsing.py", "tests/operations.py" }) |script| {
         const integration = b.addSystemCommand(&.{ "python3", "-u" });

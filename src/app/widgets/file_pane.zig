@@ -1,8 +1,58 @@
-//! Rendering only; directory I/O and navigation live in core/Pane.
+//! File-pane presentation and bindings; directory state and I/O live in core/Pane.
 const std = @import("std");
-const ui = @import("screen.zig");
-const theme = @import("theme.zig");
-const Pane = @import("../core/pane.zig").Pane;
+const ui = @import("lighthouse-ui").screen;
+const theme = @import("../theme.zig");
+const Pane = @import("../../core/pane.zig").Pane;
+const toolkit = @import("lighthouse-ui");
+
+/// The widget borrows its domain pane. The application owns the pane's lifetime.
+pub const FilePane = struct {
+    pane: *Pane,
+
+    pub fn layout(self: *FilePane, _: *toolkit.Widget, size: toolkit.Size) void {
+        self.pane.setViewportRows(visibleRows(size.height));
+    }
+
+    pub fn paint(self: *FilePane, node: *toolkit.Widget, painter: ui.Painter) !void {
+        try paintListing(painter, self.pane.view(), node.focused());
+    }
+
+    pub fn event(self: *FilePane, _: *toolkit.Widget, ev: *const toolkit.Event) !bool {
+        return handleEvent(self.pane, ev);
+    }
+};
+
+/// Pane-local bindings. Unhandled commands bubble to the application widget.
+pub fn handleEvent(pane: *Pane, ev: *const toolkit.Event) !bool {
+    if (ev.kind != .key) return false;
+    switch (ev.key) {
+        .up => pane.move(.{ .by = -1 }, ev.shift),
+        .down => pane.move(.{ .by = 1 }, ev.shift),
+        .home => pane.move(.first, ev.shift),
+        .end => pane.move(.last, ev.shift),
+        .enter, .right => try pane.enter(),
+        .backspace, .left => try pane.parent(),
+        .insert => {
+            pane.toggleSelection();
+            pane.move(.{ .by = 1 }, false);
+        },
+        .page_up => if (!ev.shift) pane.move(.page_up, false) else return false,
+        .page_down => if (!ev.shift) pane.move(.page_down, false) else return false,
+        .escape => pane.cancelNavigation(),
+        .text => {
+            if (ev.len != 1) return false;
+            switch (ev.bytes[0]) {
+                ' ' => pane.toggleSelection(),
+                '.' => try pane.changeListing(.toggle_hidden),
+                's' => try pane.changeListing(.cycle_sort),
+                'r' => try pane.changeListing(.reverse),
+                else => return false,
+            }
+        },
+        else => return false,
+    }
+    return true;
+}
 
 // Borders plus the column header and status row.
 const reserved_rows = 4;
@@ -19,7 +69,7 @@ pub fn visibleRows(height: usize) usize {
     return height -| reserved_rows;
 }
 
-pub fn paint(painter: ui.Painter, pane: *Pane, focused: bool) !void {
+fn paintListing(painter: ui.Painter, view: Pane.View, focused: bool) !void {
     const base = theme.base;
     const accent = theme.accent;
     const muted = theme.muted;
@@ -28,7 +78,7 @@ pub fn paint(painter: ui.Painter, pane: *Pane, focused: bool) !void {
     const h = painter.rect.height;
     painter.border(if (focused) accent else base);
     const inside = painter.inset(1);
-    const title = try std.fmt.allocPrint(allocator, " {s} ", .{pane.path()});
+    const title = try std.fmt.allocPrint(allocator, " {s} ", .{view.path});
     try painter.child(.{ .x = 2, .y = 0, .width = w -| 4, .height = 1 }).textEnd(title, if (focused) accent else base);
     if (h < 5 or w < 8) return;
     const width = inside.rect.width;
@@ -40,19 +90,16 @@ pub fn paint(painter: ui.Painter, pane: *Pane, focused: bool) !void {
     if (with_size) inside.label(size_x, 0, "Size", muted);
     if (with_date) inside.label(width - date_column_width, 0, "Modified", muted);
     const rows = visibleRows(h);
-    pane.ensureVisible(rows);
     for (0..rows) |row_index| {
-        const index = pane.scroll + row_index;
-        if (index >= pane.count()) break;
-        const parent = pane.hasParent() and index == 0;
-        const entry = if (parent) null else &pane.entries()[index - @intFromBool(pane.hasParent())];
+        const item_row = view.row(row_index) orelse break;
+        const entry = item_row.entry;
         var style = base;
         if (entry) |item| {
             if (item.directory) style.fg = accent.fg;
             if (item.kind == .sym_link) style.fg = theme.symlink;
             if (item.selected) style.fg = theme.marked;
         }
-        if (index == pane.cursor) {
+        if (item_row.focused) {
             style.bg = if (focused) theme.selection else theme.inactive_selection;
             style.bold = focused;
         }
@@ -76,17 +123,17 @@ pub fn paint(painter: ui.Painter, pane: *Pane, focused: bool) !void {
         }
     }
     const status = inside.child(.{ .x = 0, .y = h - 3, .width = width, .height = 1 });
-    if (pane.failure) |err| {
-        try status.text(0, 0, try std.fmt.allocPrint(allocator, "{s}: {s}", .{ errorText(err), pane.failed_path orelse "" }), theme.failure);
-    } else if (pane.busy()) {
-        status.label(0, 0, "Loading...", accent);
-    } else {
-        const options = if (pane.snapshot) |snapshot| snapshot.options else pane.options;
-        const summary = try std.fmt.allocPrint(allocator, "{d} items | {d} marked | {s}{s}{s}", .{
-            pane.entries().len,                       pane.selectedCount(),                    @tagName(options.sort),
-            if (options.reverse) " desc" else " asc", if (options.hidden) " | hidden" else "",
-        });
-        status.label(0, 0, summary, muted);
+    switch (view.status) {
+        .failed => |failure| try status.text(0, 0, try std.fmt.allocPrint(allocator, "{s}: {s}", .{ errorText(failure.err), failure.path orelse "" }), theme.failure),
+        .loading => status.label(0, 0, "Loading...", accent),
+        .ready => {
+            const options = view.options;
+            const summary = try std.fmt.allocPrint(allocator, "{d} items | {d} marked | {s}{s}{s}", .{
+                view.entries.len,                         view.marked_count,                       @tagName(options.sort),
+                if (options.reverse) " desc" else " asc", if (options.hidden) " | hidden" else "",
+            });
+            status.label(0, 0, summary, muted);
+        },
     }
 }
 

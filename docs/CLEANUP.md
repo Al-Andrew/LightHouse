@@ -16,6 +16,19 @@ build script, and Python integration suites before further feature work.
 - **Composition:** shared dialog framing and painter insets provide reusable UI
   operations; the path editor owns its rendering and caret placement. Styles
   remain caller-supplied, with the application palette in `ui/theme.zig`.
+- **File-job lifecycle:** an opaque `Job` owns preparation, launch failure,
+  cancellation, worker collection, and result lifetime. Only polling publishes
+  completion, once; status reads are observational. Application code owns
+  confirmation, presentation, and pane refresh without accessing worker atomics.
+  Cancellation requests do not overwrite an operation's actual outcome.
+- **Pane ownership:** an opaque `Pane` owns cursor movement, marking, viewport
+  maintenance, listing-option changes, and source selection. Painting consumes
+  a read-only view with parent rows already mapped. Layout supplies the visible
+  row count; navigation and scan publication keep the cursor visible even when
+  painting is skipped. Requested options survive cancellation or failure while
+  displayed options describe the last published listing. Borrowed views and
+  source iterators are consumed before the next pane mutation; file jobs still
+  copy their requests into owned storage.
 
 ## Repetition and library helpers
 
@@ -52,9 +65,11 @@ build script, and Python integration suites before further feature work.
   pending requests and transfer snapshots while operations report partial
   progress. A generic worker framework would currently obscure those different
   ownership and cancellation rules.
-- Keep the retained widget tree and Observer/signals work in the existing plan;
-  this cleanup supplies small reusable painting primitives without defining the
-  future widget or plugin API prematurely.
+- The retained widget foundation is now a separate `lighthouse-ui` build module.
+  It owns tree lifetime, focus/modal routing, layout, invalidation, and clipped
+  painting; file panes, terminal bindings, dialogs, and theme live in the app.
+  See [UI.md](UI.md) for its interface and lifetime rules. Observer/signals and
+  the plugin ABI remain in the plan.
 
 ## Verification
 
@@ -62,3 +77,9 @@ Run `zig build test`, `zig build test-integration`, `zig build fmt-check`,
 `ruff check tests`, and `ruff format --check tests`. Unit coverage includes tiny
 dialogs, wide glyph clipping, modal cleanup, and editor caret positioning; PTY
 checks exercise browsing, file operations, and persistent shell behavior.
+File-job tests use the caller's lifecycle interface. Launch failure uses
+`std.Io.failing`; cancellation tests gate real filesystem calls through a test
+I/O adapter, so ordering does not depend on large files or directory trees.
+Pane tests use its caller-facing interface and cover requested versus displayed
+options during canceled, failed, and superseded scans; viewport maintenance
+without painting; and source selection after sorting, hiding, and refresh.

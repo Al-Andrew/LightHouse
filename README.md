@@ -4,8 +4,10 @@ A Zig TUI file manager in development: dual panes, a handmade UI toolkit, an
 integrated libghostty terminal, and native shared-library plugins.
 
 The current build provides **keyboard-driven dual-pane browsing**, copy, move/rename,
-folder creation, deletion, and a persistent terminal. Further file actions, the retained
-widget API, and native plugin loading remain in [the plan](docs/PLAN.md).
+folder creation, deletion, and a persistent terminal. Its retained UI foundation is
+an independent build module, with file-manager widgets composed in the app.
+Further file actions, additional widgets, signals/slots, and native plugin loading
+remain in [the plan](docs/PLAN.md).
 
 ## Run
 
@@ -93,6 +95,9 @@ older scans. A failed read preserves the last good location and listing and show
 the error in that pane. Refresh and sorting preserve visible marks and the cursor
 by name; navigation to a different directory resets marks. Hiding an entry clears
 its mark. Refresh is explicit; filesystem watching is not implemented yet.
+Canceled or failed scans retain the requested sorting and hidden-file settings
+for the next scan. The displayed listing keeps its previous settings until a
+scan succeeds; cycling sort again advances from the requested setting.
 
 Hold Shift while using Up/Down to toggle the current item's mark before moving:
 unmarked items become marked, and marked items become unmarked. Shift+Home/End
@@ -167,16 +172,28 @@ Pane controls still work after Ctrl+G. Enlarging the window restores both panes.
 - `src/terminal/emulator.zig`: Ghostty stream/state, colors and graphemes, protocol
   replies, scrollback, and mode-aware key encoding.
 - `src/core/directory.zig`: provider-neutral snapshots and local directory scans.
-- `src/core/pane.zig`: independent navigation, cursor/marks, and concurrent scans.
+- `src/core/pane.zig`: opaque ownership of navigation, cursor/marks, viewport,
+  listing options, source selection, and concurrent scans; read-only views for painting.
 - `src/core/operations.zig`: owned background copy, move/rename, mkdir, and delete jobs.
-- `src/ui/file_pane.zig`: directory table, cursor, metadata, and status rendering.
+- `src/ui/widget.zig`: owned widget trees, focus, modal input routing, invalidation,
+  layout/paint traversal, and deferred removal.
+- `src/ui/layout.zig`: reusable horizontal/vertical boxes and centered geometry.
+- `src/app/widgets/file_pane.zig`: pane bindings, viewport layout, directory table,
+  cursor, metadata, and status rendering.
 - `src/ui/text.zig`: safe filesystem text and grapheme layout using Ghostty's
   existing Unicode support.
-- `src/ui/path_input.zig`: owned single-line path editor and caret rendering.
+- `src/ui/text_input.zig`: reusable single-line editor and caret rendering.
 - `src/ui/dialog.zig`: centered, clipped dialog framing.
-- `src/ui/theme.zig`: named application palette shared by panes and dialogs.
-- `src/ui/key_bar.zig`: function-key slots and action availability styling.
-- `src/app.zig`: layout, focus routing, owned modal state, and a poll-based event loop.
+- `src/app/theme.zig`: named application palette shared by panes and dialogs.
+- `src/app/widgets/`: application terminal, function-key bar, and file-action dialogs.
+- `src/app/view.zig`: retained widget composition and application focus projection.
+- `src/app/controller.zig`: application commands and owned modal/job workflows.
+- `src/app/layout.zig`: file-manager geometry and compact-window policy.
+- `src/app.zig`: startup, terminal I/O, worker polling, and frame output.
+
+The [UI library guide](docs/UI.md) describes widget ownership, callbacks, layout,
+focus, and app composition. Import the `lighthouse-ui` build module to use the
+toolkit without importing the file manager.
 
 The [cleanup review](docs/CLEANUP.md) records the extracted helpers and the
 design-pattern decisions for the current implementation.
@@ -198,6 +215,7 @@ references into Ghostty state that may be invalidated by the next read.
 
 ```sh
 zig build test
+zig build test-ui
 zig build test-integration
 zig build fmt-check
 ```
@@ -230,7 +248,8 @@ errors, partial completion, and stale sources.
 
 - Linux only. The process boundary will need a ConPTY implementation for Windows.
 - Overwrite/merge handling, cross-filesystem moves, editor/viewer launching,
-  directory synchronization, widgets/signals, and native plugins are not implemented yet.
+  directory synchronization, the broader widget set/signals, and native plugins
+  are not implemented yet.
 - Browsing is keyboard-driven; mouse interaction, search/filtering, automatic
   refresh, and persistent navigation history are later work.
 - Mouse routing, clipboard integration, image protocols, and enhanced host

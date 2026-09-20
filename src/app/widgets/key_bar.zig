@@ -1,8 +1,18 @@
 //! Far-style function-key slots. Unassigned keys keep an empty label.
-const ui = @import("screen.zig");
-const theme = @import("theme.zig");
+const ui = @import("lighthouse-ui").screen;
+const theme = @import("../theme.zig");
+const toolkit = @import("lighthouse-ui");
+const State = @import("../controller.zig").State;
 
-pub fn paint(painter: ui.Painter, pane_active: bool) void {
+pub const KeyBar = struct {
+    state: *const State,
+
+    pub fn paint(self: *KeyBar, _: *toolkit.Widget, painter: ui.Painter) !void {
+        paintActions(painter, self.state.focus != .terminal and self.state.modal == .none and self.state.operation == null);
+    }
+};
+
+fn paintActions(painter: ui.Painter, pane_active: bool) void {
     const actions = [_]struct { key: []const u8, label: []const u8 = "" }{
         .{ .key = "1", .label = "Help" },
         .{ .key = "2" },

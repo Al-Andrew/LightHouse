@@ -9,8 +9,12 @@ cancellation. F5 copies, F6 moves/renames within a filesystem, and F7 creates a
 folder. F8 confirms permanent recursive deletion without following symlinks.
 Jobs refuse conflicts and report partial completion; overwrite/skip prompts,
 cross-filesystem moves, and external tools remain pending.
-The retained widget/plugin vertical slice
-(milestone 2), mouse interaction, and the remaining milestone 3 work are pending.
+The retained widget foundation now exists as the independent `lighthouse-ui`
+build module: parent ownership, measurement/layout/paint callbacks, focus,
+modal input routing, clipped composition, invalidation, and deferred removal.
+Application widgets live under `src/app/widgets/`; see [UI.md](UI.md).
+Signals/slots and the plugin portion of milestone 2, mouse interaction, and the
+remaining milestone 3 work are pending.
 
 Milestone 1 provides a pinned Ghostty dependency, a handmade cell renderer,
 persistent shell/PTY, focus switching, resizable and zoomable terminal area,
