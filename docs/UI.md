@@ -28,7 +28,24 @@ App root                       application layout and global bindings
 `src/app/view.zig` builds this tree once and projects application focus and modal
 state into it. `src/app/controller.zig` owns application commands and file-action
 workflows. `src/app/layout.zig` chooses the two-pane/terminal geometry.
-`src/app.zig` owns startup, background polling, terminal I/O, and frame output.
+`src/app.zig` defines `App`, which owns startup, background polling, terminal I/O,
+and frame output through an explicit lifecycle:
+
+```zig
+var app = try lighthouse.App.init(io, allocator, shell);
+defer app.deinit();
+try app.run();
+```
+
+Initialization rolls back acquired resources on failure. Controller state has a
+stable heap address because widgets borrow it; the `App` value can be returned
+from initialization without invalidating those pointers. `run` coordinates
+worker polling, input timeout, resize, rendering, and terminal I/O through private
+methods. `deinit` releases the view, joins background work, ends the embedded
+session, and restores the outer terminal. The executable performs this cleanup
+before reporting runtime errors. Each successful initialization owns one session
+and requires exactly one `deinit`.
+
 The palette belongs to `src/app/theme.zig`.
 
 ## Defining a widget

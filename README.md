@@ -189,7 +189,8 @@ Pane controls still work after Ctrl+G. Enlarging the window restores both panes.
 - `src/app/view.zig`: retained widget composition and application focus projection.
 - `src/app/controller.zig`: application commands and owned modal/job workflows.
 - `src/app/layout.zig`: file-manager geometry and compact-window policy.
-- `src/app.zig`: startup, terminal I/O, worker polling, and frame output.
+- `src/app.zig`: the owning `App` lifecycle (`init`, `deinit`, `run`), with private
+  methods for worker polling, input, resizing, terminal I/O, and frame output.
 
 The [UI library guide](docs/UI.md) describes widget ownership, callbacks, layout,
 focus, and app composition. Import the `lighthouse-ui` build module to use the

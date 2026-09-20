@@ -4,7 +4,7 @@ const lighthouse = @import("LightHouse");
 // std.log's policy belongs to the executable, including logs from dependencies.
 // A terminal used by the compositor must never receive out-of-band log writes:
 // even one newline can scroll it and invalidate the saved frame. Explicit
-// startup/runtime errors below are reported after run() restores the console.
+// startup/runtime errors below are reported after App cleanup restores the console.
 // Preserve diagnostics when stderr is redirected (e.g. 2>lighthouse.log).
 pub const std_options: std.Options = .{ .logFn = log };
 
@@ -44,8 +44,16 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(2);
         }
     }
-    lighthouse.run(init.io, init.gpa, shell) catch |err| {
+    runApplication(init.io, init.gpa, shell) catch |err| {
         std.debug.print("LightHouse: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
+}
+
+// Keep the lifetime inside an error-returning scope so deinit runs before the
+// caller reports an error and exits the process.
+fn runApplication(io: std.Io, allocator: std.mem.Allocator, shell: [:0]const u8) !void {
+    var app = try lighthouse.App.init(io, allocator, shell);
+    defer app.deinit();
+    try app.run();
 }

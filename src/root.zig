@@ -6,7 +6,7 @@ pub const dialog = ui.dialog;
 pub const PathInput = ui.TextInput;
 pub const Emulator = @import("terminal/emulator.zig").Emulator;
 pub const Pane = @import("core/pane.zig").Pane;
-pub const run = @import("app.zig").run;
+pub const App = @import("app.zig").App;
 
 test {
     _ = @import("terminal/emulator.zig");
