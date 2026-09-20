@@ -11,6 +11,7 @@ const Layout = @import("layout.zig").Layout;
 const dialogs = @import("widgets/dialogs.zig");
 const paintOperation = dialogs.paintOperation;
 const commands = @import("commands.zig");
+const Editor = @import("editor.zig").Command;
 
 pub const Focus = enum { left, right, terminal };
 
@@ -65,8 +66,25 @@ pub const State = opaque {
         editor: struct { input: *const PathInput, action: ?operations.Kind },
         confirm_delete: *const operations.Job,
     };
+    pub const ToolView = union(enum) {
+        none,
+        running: *Emulator,
+        failed: *Emulator,
+        pub fn emulator(self: ToolView) ?*Emulator {
+            return switch (self) {
+                .none => null,
+                .running, .failed => |value| value,
+            };
+        }
+    };
+    pub const ToolHost = struct {
+        context: *anyopaque,
+        start: *const fn (*anyopaque, []const [:0]const u8, []const u8) anyerror!*Emulator,
+    };
+
     pub const Observation = struct {
         focus: Focus,
+        tool: ToolView,
         adjustment: i32,
         zoom: bool,
         terminal_visible: bool,
@@ -99,6 +117,7 @@ pub const State = opaque {
         const self: *const Implementation = @ptrCast(@alignCast(state));
         return .{
             .focus = self.focus,
+            .tool = self.tool,
             .adjustment = self.adjustment,
             .zoom = self.zoom,
             .terminal_visible = self.terminal_visible,
@@ -157,6 +176,31 @@ pub const State = opaque {
     /// Closes an editor/confirmation, requests job cancellation, or releases its result.
     pub fn dismiss(state: *State) void {
         state.implementation().dismiss();
+    }
+
+    pub fn attachTool(state: *State, host: ToolHost) void {
+        state.implementation().tool_host = host;
+    }
+
+    pub fn toolEnded(state: *State, success: bool) void {
+        const self = state.implementation();
+        const emulator = self.tool.emulator() orelse return;
+        self.tool = if (success) .none else .{ .failed = emulator };
+        self.focus = self.last_pane;
+        self.tool_refresh = true;
+        self.force_redraw = true;
+    }
+
+    pub fn toolEvent(state: *State, ev: *const input.Event) !void {
+        const self = state.implementation();
+        switch (self.tool) {
+            .none => {},
+            .running => |emulator| try emulator.event(ev),
+            .failed => if (ev.kind == .key) {
+                self.tool = .none;
+                self.force_redraw = true;
+            },
+        }
     }
 
     pub const TerminalHost = struct {
@@ -221,6 +265,13 @@ pub const State = opaque {
         const self = state.implementation();
         var changed = false;
         var failure: ?anyerror = null;
+        if (self.tool_refresh) {
+            self.tool_refresh = false;
+            for (self.panes) |pane| pane.refresh() catch |err| {
+                if (failure == null) failure = err;
+            };
+            changed = true;
+        }
         if (self.operation) |job| {
             if (job.poll()) {
                 for (self.panes) |pane| pane.refresh() catch |err| {
@@ -259,7 +310,14 @@ const Implementation = struct {
     force_redraw: bool = true,
     panes: [2]*Pane,
     modal: Modal = .none,
+    tool: State.ToolView = .none,
+    tool_host: ?State.ToolHost = null,
+    tool_refresh: bool = false,
     operation: ?*operations.Job = null,
+
+    fn foregroundBusy(self: *const Implementation) bool {
+        return self.modal != .none or self.operation != null or self.tool != .none;
+    }
 
     fn activePane(self: *const Implementation) *Pane {
         return self.panes[if (self.last_pane == .right) @as(usize, 1) else 0];
@@ -277,7 +335,7 @@ const Implementation = struct {
     }
 
     fn openPath(self: *Implementation, absolute: bool) !void {
-        if (self.modal != .none or self.operation != null) return error.WorkflowBusy;
+        if (self.foregroundBusy()) return error.WorkflowBusy;
         const pane = self.activePane();
         const initial = if (absolute) try pane.rootInput(self.allocator) else try self.allocator.dupe(u8, pane.location().locator);
         defer self.allocator.free(initial);
@@ -289,7 +347,7 @@ const Implementation = struct {
     }
 
     fn openAction(self: *Implementation, kind: operations.Kind) !void {
-        if (self.modal != .none or self.operation != null) return error.WorkflowBusy;
+        if (self.foregroundBusy()) return error.WorkflowBusy;
         if (kind == .delete) return self.openDelete();
         const pane = self.activePane();
         if (!self.actionAvailable(kind)) return;
@@ -323,7 +381,7 @@ const Implementation = struct {
     }
 
     fn openDelete(self: *Implementation) !void {
-        if (self.modal != .none or self.operation != null) return error.WorkflowBusy;
+        if (self.foregroundBusy()) return error.WorkflowBusy;
         const pane = self.activePane();
         if (!self.actionAvailable(.delete)) return;
         // Own the exact names shown in the confirmation, independent of scans.
@@ -394,7 +452,7 @@ const Implementation = struct {
     }
 
     fn toggleTerminal(self: *Implementation) void {
-        if (self.modal != .none or self.operation != null or !self.terminal_visible or !self.terminal_exists) return;
+        if (self.foregroundBusy() or !self.terminal_visible or !self.terminal_exists) return;
         if (self.focus == .terminal) {
             self.focus = self.last_pane;
             self.zoom = false;
@@ -414,7 +472,7 @@ const Implementation = struct {
     }
 
     fn showTerminal(self: *Implementation) void {
-        if (self.modal != .none or self.operation != null) return;
+        if (self.foregroundBusy()) return;
         self.ensureTerminal() catch |err| {
             self.modal = .{ .notice = @errorName(err) };
             return;
@@ -446,8 +504,25 @@ const Implementation = struct {
         self.focus = .terminal;
     }
 
+    fn editFile(self: *Implementation) !void {
+        const pane = self.activePane();
+        const entry = pane.view().focused() orelse return error.IneligibleEditorEntry;
+        const cwd = pane.provider().localPath(pane.location().locator) catch return error.IneligibleEditorEntry;
+        const working_directory = std.Io.Dir.openDirAbsolute(self.io, cwd, .{}) catch return error.WorkingDirectoryUnavailable;
+        working_directory.close(self.io);
+        const file = try std.fs.path.join(self.allocator, &.{ cwd, entry.name });
+        defer self.allocator.free(file);
+        const stat = std.Io.Dir.cwd().statFile(self.io, file, .{}) catch return error.IneligibleEditorEntry;
+        if (stat.kind != .file) return error.IneligibleEditorEntry;
+        var command = try Editor.load(self.io, self.allocator, cwd, file);
+        defer command.deinit();
+        const host = self.tool_host orelse return error.ToolLaunchUnavailable;
+        const emulator = try host.start(host.context, command.argv, cwd);
+        self.tool = .{ .running = emulator };
+    }
+
     fn available(self: *const Implementation, id: commands.Id) bool {
-        if (self.modal != .none) return false;
+        if (self.modal != .none or self.tool != .none) return false;
         if (self.operation != null) return id == .quit;
         if (id == .toggle_terminal) return self.terminal_visible and self.terminal_exists;
         if (id == .visibility_terminal) return true;
@@ -464,6 +539,16 @@ const Implementation = struct {
     fn invoke(self: *Implementation, id: commands.Id, emulator: *Emulator) !bool {
         if (!self.available(id)) return false;
         switch (id) {
+            .edit_file => self.editFile() catch |err| {
+                self.modal = .{ .notice = switch (err) {
+                    error.IneligibleEditorEntry => "Choose a local regular file with the Cursor.",
+                    error.EditorNotConfigured => "Configure editor argv in lighthouse/config.json or set EDITOR.",
+                    error.InvalidEditorConfiguration => "Invalid editor configuration in lighthouse/config.json.",
+                    error.InvalidEditorArguments => "Invalid quoted arguments in EDITOR.",
+                    error.EditorNotExecutable => "Configured editor executable is missing or inaccessible.",
+                    else => @errorName(err),
+                } };
+            },
             .insert_reference => self.insertReference(emulator) catch |err| {
                 self.modal = .{ .notice = @errorName(err) };
             },
@@ -926,6 +1011,22 @@ test "Path insertion validates quotes and admits a complete reference before tak
     try state.openAction(.mkdir); // unavailable Provider leaves no workflow
     try std.testing.expect(try state.invoke(.help, emulator));
     try std.testing.expect(!try state.invoke(.insert_reference, emulator));
+}
+
+test "F4 direct invocation rejects Parent row without launching an external tool" {
+    const left = try Pane.create(std.testing.io, std.testing.allocator, "/tmp", .{});
+    defer left.destroy();
+    const right = try Pane.create(std.testing.io, std.testing.allocator, "/tmp", .{});
+    defer right.destroy();
+    const state = try State.create(std.testing.io, std.testing.allocator, .{ left, right });
+    defer state.destroy();
+    const emulator = try Emulator.create(std.testing.io, std.testing.allocator, 80, 8);
+    defer emulator.destroy();
+    _ = try state.invoke(.edit_file, emulator);
+    try std.testing.expectEqualStrings("Choose a local regular file with the Cursor.", state.view().modal.notice);
+    try std.testing.expectEqual(.left, state.view().focus);
+    try std.testing.expect(state.view().tool == .none);
+    try std.testing.expect(commands.functionCommand(.f3) == null);
 }
 
 test "Path insertion workflow preserves queue and Pane focus on allocation and backpressure errors" {

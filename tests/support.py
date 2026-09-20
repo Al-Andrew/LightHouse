@@ -70,7 +70,15 @@ class Screen:
 
 
 class App:
-    def __init__(self, shell="/bin/sh", cols=100, rows=30, stderr=None, cwd=None):
+    def __init__(
+        self,
+        shell="/bin/sh",
+        cols=100,
+        rows=30,
+        stderr=None,
+        cwd=None,
+        env_overrides=None,
+    ):
         self.master, self.slave = os.openpty()
         self.saved = termios.tcgetattr(self.slave)
         self.screen = Screen(cols, rows)
@@ -83,6 +91,8 @@ class App:
             TERM="xterm-256color",
             LC_ALL="C.UTF-8",
         )
+        if env_overrides:
+            env.update(env_overrides)
         self.proc = subprocess.Popen(
             [str(BINARY), "--shell", shell],
             stdin=self.slave,

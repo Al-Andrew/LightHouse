@@ -159,3 +159,10 @@ Persistent shell existence, visibility and focus now have independent lifetimes.
 Runtime sessions start through a process boundary safe after workers exist.
 Ctrl+J, shell EOF/restart and retained-job input blocking are covered by controller,
 View and real PTY checks. Path insertion and F4 can use the same session owner.
+
+## Delivered external editor (#23)
+
+F4 opens a configured terminal editor in a separate full-area session. JSON argv
+or quoted EDITOR configuration launches directly, with literal file arguments.
+Deterministic PTY fixtures exercise input, resizing, shell independence, normal
+and failed exit, configuration, eligibility and child cleanup. F3 remains open.

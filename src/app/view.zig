@@ -58,6 +58,7 @@ pub const View = struct {
     }
 
     pub fn event(self: *View, ev: *const ui.Event) !void {
+        if (self.state.view().tool != .none) return self.state.toolEvent(ev);
         try self.sync();
         // LF must reach visibility policy before a Pane consumes Enter. Modal
         // input retains LF-as-Enter, and paste events never resolve a binding.
@@ -73,6 +74,18 @@ pub const View = struct {
 
     pub fn paint(self: *View, frame: *ui.Frame, available: ui.Size) !void {
         const size = Layout.boundedSize(available);
+        if (self.state.view().tool.emulator()) |emulator| {
+            try frame.begin(size.width, size.height);
+            const painter = frame.painter(.{ .x = 0, .y = 0, .width = size.width, .height = size.height });
+            try emulator.paint(painter, self.state.view().tool == .running);
+            if (self.state.view().tool == .failed) {
+                const row = painter.child(.{ .x = 0, .y = size.height - 1, .width = size.width, .height = 1 });
+                row.fill(@import("theme.zig").dialog);
+                row.label(0, 0, "Editor exited unsuccessfully. Any key returns to Panes.", @import("theme.zig").dialog);
+                frame.cursor = null;
+            }
+            return;
+        }
         try self.sync();
         try self.resize(size);
         try frame.begin(size.width, size.height);
@@ -349,6 +362,7 @@ test "command presentation and direct invocation recheck sources modal focus and
     try std.testing.expect(view.modal.focused());
     try std.testing.expect(!try state.invoke(.visibility_terminal, emulator));
     try std.testing.expect(!try state.invoke(.insert_reference, emulator));
+    try std.testing.expect(!try state.invoke(.edit_file, emulator));
     state.toggleTerminal();
     try std.testing.expect(state.view().focus != .terminal);
     try feed(view, &decoder, "\x07");

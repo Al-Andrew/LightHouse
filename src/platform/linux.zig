@@ -96,6 +96,7 @@ pub const Pty = struct {
     fd: c_int,
     pid: c.pid_t,
     reaped: bool = false,
+    exit_status: ?c_int = null,
 
     /// All allocations/environment preparation happen in the parent. The forked
     /// child uses only async-signal-safe operations before execve, so runtime
@@ -179,6 +180,7 @@ pub const Pty = struct {
         if (!self.reaped) {
             var status: c_int = 0;
             self.reaped = c.waitpid(self.pid, &status, c.WNOHANG) == self.pid;
+            if (self.reaped) self.exit_status = status;
         }
         return self.reaped;
     }
@@ -206,5 +208,6 @@ pub const Pty = struct {
         var status: c_int = 0;
         while (c.waitpid(self.pid, &status, 0) < 0 and errno() == c.EINTR) {}
         self.reaped = true;
+        self.exit_status = status;
     }
 };
