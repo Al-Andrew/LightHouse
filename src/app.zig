@@ -11,7 +11,6 @@ const Layout = @import("app/layout.zig").Layout;
 const View = @import("app/view.zig").View;
 const poll_interval_ms = 40;
 const read_buffer_bytes = 4 * 1024;
-const pty_reads_per_turn = 4;
 
 /// Owns one interactive application session. After a successful init, call
 /// deinit exactly once, including when run fails. The view borrows heap-owned
@@ -187,22 +186,10 @@ pub const App = struct {
     }
 
     fn readPty(self: *App) !void {
-        // Bound each batch so a noisy child cannot starve input or repaint.
-        var bytes: [read_buffer_bytes]u8 = undefined;
-        for (0..pty_reads_per_turn) |_| {
-            if (platform.shouldStop()) break;
-            const count = c.read(self.session.pty.?.fd, &bytes, bytes.len);
-            if (count > 0) {
-                try self.session.emulator.feed(bytes[0..@intCast(count)]);
-                self.dirty = true;
-            } else {
-                if (count == 0 or platform.errno() == c.EIO) {
-                    self.endTerminal();
-                    break;
-                }
-                if (platform.errno() == c.EAGAIN or platform.errno() == c.EINTR) break;
-                return error.PtyReadFailed;
-            }
+        switch (try self.session.drain()) {
+            .idle => {},
+            .output => self.dirty = true,
+            .ended => self.endTerminal(),
         }
     }
 };

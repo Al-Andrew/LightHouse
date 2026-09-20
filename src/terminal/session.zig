@@ -16,7 +16,9 @@ pub const Session = struct {
     pub fn create(io: std.Io, allocator: std.mem.Allocator, shell: [:0]const u8, cwd: []const u8, dimensions: platform.Size, termios: platform.c.termios) !*Session {
         const self = try allocator.create(Session);
         errdefer allocator.destroy(self);
-        const owned_shell = try allocator.dupeZ(u8, shell);
+        const absolute_shell = try std.fs.path.resolve(allocator, &.{ cwd, shell });
+        defer allocator.free(absolute_shell);
+        const owned_shell = try allocator.dupeZ(u8, absolute_shell);
         errdefer allocator.free(owned_shell);
         const owned_cwd = try allocator.dupeZ(u8, cwd);
         errdefer allocator.free(owned_cwd);
@@ -53,6 +55,27 @@ pub const Session = struct {
         self.dimensions = dimensions;
         try self.emulator.resize(dimensions.cols, dimensions.rows);
         if (self.pty) |*pty| try pty.resize(dimensions);
+    }
+
+    pub const Drain = enum { idle, output, ended };
+
+    /// Bound each batch so a noisy child cannot starve host input or repaint.
+    pub fn drain(self: *Session) !Drain {
+        const pty = self.pty orelse return .ended;
+        var result: Drain = .idle;
+        var bytes: [4096]u8 = undefined;
+        for (0..4) |_| {
+            const count = platform.c.read(pty.fd, &bytes, bytes.len);
+            if (count > 0) {
+                try self.emulator.feed(bytes[0..@intCast(count)]);
+                result = .output;
+            } else {
+                if (count == 0 or platform.errno() == platform.c.EIO) return .ended;
+                if (platform.errno() == platform.c.EAGAIN or platform.errno() == platform.c.EINTR) break;
+                return error.PtyReadFailed;
+            }
+        }
+        return result;
     }
 
     /// False reports child EOF, including writes after the child has closed.
