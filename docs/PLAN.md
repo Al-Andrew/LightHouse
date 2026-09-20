@@ -16,6 +16,11 @@ Application widgets live under `src/app/widgets/`; see [UI.md](UI.md).
 Signals/slots and the plugin portion of milestone 2, mouse interaction, and the
 remaining milestone 3 work are pending.
 
+The next feature designs are recorded in [FEATURE-DESIGN.md](FEATURE-DESIGN.md):
+a configured F4 editor, Provider-defined Ctrl+F Path insertion, independent
+terminal visibility/session lifetime, and copy/move conflict and error prompts.
+These designs are agreed; the features are not implemented yet.
+
 Milestone 1 provides a pinned Ghostty dependency, a handmade cell renderer,
 persistent shell/PTY, focus switching, resizable and zoomable terminal area,
 scrollback, conventional keyboard input, and bracketed paste. Automated checks
@@ -34,7 +39,7 @@ pass remains open.
 - libghostty for terminal emulation.
 - Native shared-library plugins supporting full application extensions, including custom widgets. Linux plugins are `.so` files; later Windows/macOS builds use `.dll`/`.dylib` files.
 
-- One independent persistent shell, with an explicit shortcut to synchronize it to the active pane's directory.
+- One independent persistent shell. Ctrl+G changes focus; Ctrl+J hides/shows the terminal and starts a new session when needed. Shell EOF does not exit LightHouse. Ctrl+F inserts the Provider-defined reference for the Cursor entry, creating/showing the terminal as needed; automatic directory synchronization is deferred.
 - Dependencies limited to Zig's standard library, OS/libc APIs, libghostty, and narrowly justified helpers such as Unicode support.
 - First usable release includes browsing, selection, copy, move, rename, delete, and directory creation; editing and viewing initially launch external programs.
 
@@ -79,7 +84,13 @@ Input path: host terminal input → application focus routing → terminal input
 
 Support resize/reflow, scrollback, alternate screens, Unicode, paste, cursor state, and mouse routing. Scope advertised terminal capabilities to what the complete integration can support. Advanced image protocols are outside the initial milestone.
 
-When the terminal has focus, forward application keys to the child except for a documented, configurable focus-escape binding. Test interactive applications as well as shell prompts. File-pane navigation must not inject commands into a running foreground program; directory synchronization needs a defined idle-shell mechanism or an explicitly submitted command.
+When the persistent terminal has focus, forward application keys to the child
+except for documented focus and visibility controls. Test interactive programs
+as well as shell prompts. Pane navigation must not inject commands into a running
+program. Ctrl+F is an explicit insertion action without command submission;
+automatic directory synchronization is deferred. File jobs block terminal
+interaction until result dismissal while shell execution and output collection
+continue. F4 tools use a separate full-area session whose keys go to the tool.
 
 ### File-manager core
 

@@ -34,7 +34,8 @@ The marked entries in a pane, or its cursor entry when nothing is marked.
 
 **Provider**:
 The authority for interpreting locations and listing their entries. Providers
-can differ in navigation rules and the file actions they support.
+can differ in navigation rules, supported file actions, and the representation
+of an entry offered for Path insertion.
 
 **Location**:
 A place identified by its provider and that provider's locator. Its displayed
@@ -47,3 +48,24 @@ provider.
 **Operation availability**:
 Whether a file action has sources when required, the relevant locations support
 its reads and writes, and an executor supports their combination.
+
+**Path insertion**:
+An explicit action that inserts a Provider-defined representation of a Pane's
+Cursor entry into the persistent terminal's input without submitting it.
+
+**External tool session**:
+A temporary terminal session for a file tool opened from a Pane, separate from
+the persistent terminal and occupying the full application area until it exits.
+
+**Persistent terminal session**:
+The shell session used by LightHouse's integrated terminal, independent of Pane
+navigation and external tools. Its exit ends that session rather than LightHouse;
+a later explicit action can start a new session.
+
+**Directory merge**:
+A copy or move that combines source entries with an existing destination
+directory, preserving destination entries absent from the source.
+
+**Destination conflict**:
+An existing destination entry that requires a choice before a copy or move
+can proceed with the corresponding source entry.
