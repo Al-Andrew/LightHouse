@@ -118,8 +118,37 @@ and destination bytes; it retains no pane or provider borrows and changes neithe
 pane. The controller owns the job through confirmation, launch, completion and
 result dismissal, and refreshes both panes when it collects completion. Delete
 confirmation rechecks availability before starting its prepared job. Unsupported
-entry points do not open an editor/confirmation; support lost during an open
-workflow returns `UnsupportedOperation` and keeps its payload for dismissal or
-correction. Preparation-interface tests cover provider contexts, capability
+entry points do not open an editor/confirmation. Direct `State.submit` and
+`State.confirmDelete` calls return `UnsupportedOperation` when support is lost
+during an open workflow, keeping its payload for dismissal or correction. Preparation-interface tests cover provider contexts, capability
 changes, destination spelling and request ownership; controller and View tests
 cover the workflow lifetime and routing.
+
+## Workflow recovery policy
+
+`State.modalEvent`, reached through `View.event`, owns recovery for an editor's
+submission or delete confirmation. It catches only this explicit rejection set:
+
+- `UnknownLocation`, `UnknownChild`, and `InvalidLocation`: the Provider does not
+  recognize the requested Location. `InvalidLocation` is the general contract
+  for an adapter's invalid locator/input; the opaque test adapter currently uses
+  `UnknownLocation` and `UnknownChild`.
+- `UnsupportedOperation`: current sources, Provider capabilities, or the executor
+  no longer support the requested action, including its edited destination.
+
+The modal retains its input or prepared delete job and publishes a typed
+`State.view().rejection`. The explanation is painted beside that payload. No job
+starts, and synchronous resolution rejection leaves the Pane's last good
+Location and listing unchanged. Further editor input clears the explanation;
+Enter retries with current input and capabilities. Escape dismisses either
+workflow; `n` also dismisses delete confirmation. Paste cannot confirm or dismiss
+a deletion. Dismissal or successful submission releases the rejection with its
+owning modal, so it cannot leak into a later workflow.
+
+This is an application event policy, not a change to Provider or Pane error
+semantics. Direct `State.submit`, `State.confirmDelete`, and `Pane.request` calls
+still return synchronous errors. Every error outside the allowlist propagates
+through `View.event`, including `OutOfMemory`, `Canceled`, lifecycle failures,
+and transport failures; they are not presented as correctable input. Asynchronous
+scan failures remain Pane status, and started-job failures remain job results.
+New Provider error names require an explicit recovery-policy decision.

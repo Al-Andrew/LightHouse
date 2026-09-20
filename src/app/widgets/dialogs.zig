@@ -10,23 +10,24 @@ const path_dialog_width = 84;
 const job_dialog_width = 90;
 const help_dialog_width = 66;
 const delete_preview_items = 4;
+const Rejection = @import("../controller.zig").Rejection;
 const Size = @import("lighthouse-ui").Size;
 
-pub fn editorSize(action: ?operations.Kind) Size {
-    return .{ .width = path_dialog_width, .height = if (action != null) 6 else 4 };
+pub fn editorSize(action: ?operations.Kind, rejection: ?Rejection) Size {
+    return .{ .width = path_dialog_width, .height = @as(usize, if (action != null) 6 else 4) + @intFromBool(rejection != null) };
 }
 
-pub fn deleteSize(job: *const operations.Job) Size {
+pub fn deleteSize(job: *const operations.Job, rejection: ?Rejection) Size {
     const shown: usize = @min(delete_preview_items, job.request().sources.len);
-    return .{ .width = job_dialog_width, .height = shown + 6 };
+    return .{ .width = job_dialog_width, .height = shown + 6 + @intFromBool(rejection != null) };
 }
 
 pub const operation_size: Size = .{ .width = job_dialog_width, .height = 8 };
 pub const help_size: Size = .{ .width = help_dialog_width, .height = help_lines.len + commands.help_groups.len + 3 };
 
-pub fn paintPathInput(painter: ui.Painter, editor: *const PathInput, action: ?operations.Kind, pane: ?*const Pane) !void {
+pub fn paintPathInput(painter: ui.Painter, editor: *const PathInput, action: ?operations.Kind, pane: ?*const Pane, rejection: ?Rejection) !void {
     const style = theme.dialog;
-    const size = editorSize(action);
+    const size = editorSize(action, rejection);
     const box = dialog.beginIn(painter, size.width, size.height, style);
     const width = box.rect.width;
     const height = box.rect.height;
@@ -34,6 +35,7 @@ pub fn paintPathInput(painter: ui.Painter, editor: *const PathInput, action: ?op
     box.child(.{ .x = 2, .y = 0, .width = width - 4, .height = 1 }).label(0, 0, if (action) |kind| kind.title() else " Go to directory ", style);
     const field = box.child(.{ .x = 1, .y = 1, .width = width - 2, .height = 1 });
     try editor.paint(field, .{ .bg = if (editor.select_all) theme.selection else theme.base.bg });
+    if (rejection) |reason| box.child(.{ .x = 1, .y = size.height - 2, .width = width - 2, .height = 1 }).label(0, 0, reason.message(), style);
     const allocator = painter.frame.arena.allocator();
     if (action) |kind| {
         if (height > 3) if (pane) |p| {
@@ -51,12 +53,12 @@ pub fn paintPathInput(painter: ui.Painter, editor: *const PathInput, action: ?op
     } else if (height > 3) box.child(.{ .x = 1, .y = 2, .width = width - 2, .height = 1 }).label(0, 0, "Enter open  |  Esc cancel  |  Ctrl+U clear", style);
 }
 
-pub fn paintDeleteConfirmation(painter: ui.Painter, job: *const operations.Job) !void {
+pub fn paintDeleteConfirmation(painter: ui.Painter, job: *const operations.Job, rejection: ?Rejection) !void {
     const request = job.request();
     const shown: usize = @min(delete_preview_items, request.sources.len);
     const style = theme.destructive_dialog;
     // Two warning rows, source previews, overflow hint, controls, and borders.
-    const size = deleteSize(job);
+    const size = deleteSize(job, rejection);
     const box = dialog.beginIn(painter, size.width, size.height, style);
     const inside = box.inset(1);
     const summary = try std.fmt.allocPrint(painter.frame.arena.allocator(), "Permanently delete {d} item(s)?", .{request.sources.len});
@@ -65,6 +67,7 @@ pub fn paintDeleteConfirmation(painter: ui.Painter, job: *const operations.Job) 
     for (request.sources[0..shown], 0..) |source, i| try inside.child(.{ .x = 0, .y = i + 2, .width = inside.rect.width, .height = 1 }).textEnd(source, style);
     if (request.sources.len > shown) inside.label(0, shown + 2, "...and the other marked entries", style);
     inside.label(0, shown + 3, "Enter delete  |  Esc / n cancel", style);
+    if (rejection != null) inside.label(0, shown + 4, "Delete unavailable. Retry or press Esc / n to cancel.", style);
 }
 
 pub fn paintOperation(painter: ui.Painter, job: *const operations.Job) !void {
@@ -163,7 +166,7 @@ test "file action dialogs fit tiny windows with Unicode input" {
     defer job.destroy();
     for (1..95) |cols| for (1..10) |rows| {
         try frame.begin(cols, rows);
-        try paintPathInput(frame.painter(.{ .x = 0, .y = 0, .width = frame.cols, .height = frame.rows }), &editor, .copy, null);
+        try paintPathInput(frame.painter(.{ .x = 0, .y = 0, .width = frame.cols, .height = frame.rows }), &editor, .copy, null, .invalid_location);
         if (frame.cursor) |cursor| try std.testing.expect(cursor.x < cols and cursor.y < rows);
         try paintOperation(frame.painter(.{ .x = 0, .y = 0, .width = frame.cols, .height = frame.rows }), job);
         try std.testing.expect(frame.cursor == null);
@@ -179,6 +182,6 @@ test "delete confirmation handles multiple selections" {
         const job = try operations.Job.create(std.testing.io, allocator, .delete, "/unused", names[0..count], "");
         defer job.destroy();
         try frame.begin(100, 30);
-        try paintDeleteConfirmation(frame.painter(.{ .x = 0, .y = 0, .width = frame.cols, .height = frame.rows }), job);
+        try paintDeleteConfirmation(frame.painter(.{ .x = 0, .y = 0, .width = frame.cols, .height = frame.rows }), job, .unsupported_operation);
     }
 }
