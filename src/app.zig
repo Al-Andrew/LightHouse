@@ -139,7 +139,7 @@ pub const App = struct {
     }
 
     fn render(self: *App) !void {
-        if (!self.dirty and !self.view.tree.dirty) return;
+        if (!self.dirty and !self.view.tree.needsPaint()) return;
         try self.view.paint(&self.current, self.size);
         self.output.clearRetainingCapacity();
         try ui.encode(&self.output.writer, &self.current, if (self.state.view().force_redraw) null else &self.previous);
