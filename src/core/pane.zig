@@ -2,6 +2,7 @@
 //! supersede pending work; the UI never waits for a scan during navigation.
 const std = @import("std");
 const directory = @import("directory.zig");
+const FilterJob = @import("filter.zig").Job;
 
 const Job = struct {
     path: []const u8,
@@ -33,7 +34,8 @@ const Job = struct {
 /// mutating call or destroy; callers must copy names that need to live longer.
 /// Drawing only consumes View values and never normalizes navigation state.
 pub const Pane = opaque {
-    pub const Config = struct { provider: directory.Provider = directory.local };
+    pub const Config = struct { provider: directory.Provider = directory.local, filter_executable: []const u8 = "fzf" };
+    pub const Filter = struct { active: bool, query: []const u8, loading: bool, failure: ?anyerror };
     pub const Movement = union(enum) { by: isize, first, last, page_up, page_down };
     pub const ListingChange = enum { toggle_hidden, cycle_sort, reverse };
     pub const Status = union(enum) {
@@ -61,6 +63,7 @@ pub const Pane = opaque {
         requested_options: directory.Options,
         options: directory.Options,
         status: Status,
+        filter: Filter,
 
         pub fn referenceRowCount(self: View) usize {
             return 1 + @as(usize, @intFromBool(self.has_parent));
@@ -116,6 +119,7 @@ pub const Pane = opaque {
             .allocator = allocator,
             .initial_path = try allocator.dupe(u8, start_path),
             .provider = config.provider,
+            .filter_executable = config.filter_executable,
         };
         return @ptrCast(self);
     }
@@ -131,6 +135,7 @@ pub const Pane = opaque {
         const self = pane.read();
         return .{
             .path = self.provider.display(self.provider.context, self.path()),
+            .filter = .{ .active = self.filter_active, .query = self.filter_query, .loading = self.filter_pending or self.filter_job != null, .failure = self.filter_failure },
             .has_parent = self.hasParent(),
             .marks = self.marks,
             .entries = self.entries(),
@@ -250,7 +255,25 @@ pub const Pane = opaque {
         pane.implementation().cancelNavigation();
     }
     pub fn poll(pane: *Pane) !bool {
-        return pane.implementation().poll();
+        const self = pane.implementation();
+        const scanned = try self.poll();
+        return try self.pollFilter() or scanned;
+    }
+
+    pub fn setFilter(pane: *Pane, query: []const u8) !void {
+        const self = pane.implementation();
+        self.filter_active = true;
+        if (std.mem.eql(u8, query, self.filter_query)) return;
+        const owned = try self.allocator.dupe(u8, query);
+        self.allocator.free(self.filter_query);
+        self.filter_query = owned;
+        @memset(self.marks, false);
+        self.marked_count = 0;
+        try self.requestFilter();
+    }
+    pub fn closeFilter(pane: *Pane) !void {
+        try pane.setFilter("");
+        pane.implementation().filter_active = false;
     }
 
     fn implementation(pane: *Pane) *Implementation {
@@ -275,10 +298,24 @@ const Implementation = struct {
     viewport_rows: usize = 0,
     marked_count: usize = 0,
     marks: []bool = &.{},
+    filter_executable: []const u8 = "fzf",
+    filter_active: bool = false,
+    filter_query: []const u8 = &.{},
+    filter_entries: ?[]directory.Entry = null,
+    filter_job: ?*FilterJob = null,
+    filter_pending: bool = false,
+    filter_failure: ?anyerror = null,
     failure: ?anyerror = null,
     failed_path: ?[]const u8 = null,
 
     fn deinit(self: *Implementation) void {
+        if (self.filter_job) |job| {
+            job.canceled.store(true, .release);
+            job.future.?.await(self.io);
+            job.destroy();
+        }
+        self.allocator.free(self.filter_query);
+        if (self.filter_entries) |entries_| self.allocator.free(entries_);
         if (self.job) |job| {
             job.canceled.store(true, .release);
             job.future.?.cancel(self.io);
@@ -303,7 +340,7 @@ const Implementation = struct {
         return 1 + @as(usize, @intFromBool(self.hasParent()));
     }
     fn entries(self: *const Implementation) []directory.Entry {
-        return if (self.snapshot) |snapshot| snapshot.entries else &.{};
+        return self.filter_entries orelse if (self.snapshot) |snapshot| snapshot.entries else &.{};
     }
     fn count(self: *const Implementation) usize {
         return self.entries().len + self.referenceRowCount();
@@ -423,6 +460,14 @@ const Implementation = struct {
                     if (next_marks[i]) self.marked_count += 1;
                     if (std.mem.eql(u8, entry.name, wanted)) next_cursor = i + reference_offset;
                 }
+                if (self.filter_job) |filter_job| filter_job.canceled.store(true, .release);
+                if (self.filter_entries) |filtered| self.allocator.free(filtered);
+                self.filter_entries = null;
+                if (!same_path) {
+                    self.filter_active = false;
+                    self.allocator.free(self.filter_query);
+                    self.filter_query = &.{};
+                }
                 if (self.snapshot) |*old| old.deinit();
                 self.allocator.free(self.marks);
                 self.marks = next_marks;
@@ -431,6 +476,7 @@ const Implementation = struct {
                 self.cursor = next_cursor;
                 if (!same_path) self.scroll = 0;
                 self.ensureVisible();
+                try self.requestFilter();
             } else {
                 self.failure = job.failure orelse error.ReadFailed;
                 self.failed_path = try self.allocator.dupe(u8, self.provider.display(self.provider.context, job.path));
@@ -438,6 +484,87 @@ const Implementation = struct {
             }
         }
         return true;
+    }
+    fn requestFilter(self: *Implementation) !void {
+        if (self.filter_job) |job| job.canceled.store(true, .release);
+        self.filter_failure = null;
+        self.filter_pending = self.filter_query.len > 0;
+        if (!self.filter_pending) {
+            const all = if (self.snapshot) |snapshot| snapshot.entries else &.{};
+            try self.publishFilter(all, false);
+        }
+        self.launchFilter();
+    }
+    fn launchFilter(self: *Implementation) void {
+        if (self.filter_job != null or !self.filter_pending) return;
+        self.filter_pending = false;
+        const all = if (self.snapshot) |snapshot| snapshot.entries else &.{};
+        const job = FilterJob.create(self.filter_query, all, self.filter_executable) catch |err| {
+            self.filter_failure = err;
+            return;
+        };
+        job.future = self.io.concurrent(FilterJob.work, .{job}) catch |err| {
+            job.destroy();
+            self.filter_failure = err;
+            return;
+        };
+        self.filter_job = job;
+    }
+    fn pollFilter(self: *Implementation) !bool {
+        const job = self.filter_job orelse return false;
+        if (!job.done.load(.acquire)) return false;
+        job.future.?.await(self.io);
+        self.filter_job = null;
+        defer job.destroy();
+        defer self.launchFilter();
+        if (job.canceled.load(.acquire)) return true;
+        if (job.result) |result| {
+            var matches: std.StringHashMap(void) = .init(self.allocator);
+            defer matches.deinit();
+            var names = std.mem.splitScalar(u8, result, 0);
+            while (names.next()) |name| if (name.len > 0) {
+                try matches.put(name, {});
+            };
+            var filtered: std.ArrayList(directory.Entry) = .empty;
+            defer filtered.deinit(self.allocator);
+            const all = if (self.snapshot) |snapshot| snapshot.entries else &.{};
+            for (all) |entry| if (matches.contains(entry.name)) {
+                try filtered.append(self.allocator, entry);
+            };
+            if (filtered.items.len != matches.count()) {
+                self.filter_failure = error.FzfFailed;
+                return true;
+            }
+            try self.publishFilter(filtered.items, true);
+        } else self.filter_failure = job.failure orelse error.FzfFailed;
+        return true;
+    }
+    fn publishFilter(self: *Implementation, next: []const directory.Entry, filtered: bool) !void {
+        const owned = if (filtered) try self.allocator.dupe(directory.Entry, next) else null;
+        errdefer if (owned) |items| self.allocator.free(items);
+        const marks = try self.allocator.alloc(bool, next.len);
+        var selected: std.StringHashMap(void) = .init(self.allocator);
+        defer selected.deinit();
+        errdefer self.allocator.free(marks);
+        for (self.entries(), self.marks) |entry, marked| if (marked) {
+            try selected.put(entry.name, {});
+        };
+        const wanted = if (self.focused()) |entry| entry.name else null;
+        var cursor = self.cursor;
+        self.marked_count = 0;
+        for (next, 0..) |entry, i| {
+            marks[i] = selected.contains(entry.name);
+            if (marks[i]) self.marked_count += 1;
+            if (wanted) |name| if (std.mem.eql(u8, name, entry.name)) {
+                cursor = i + self.referenceRowCount();
+            };
+        }
+        if (self.filter_entries) |items| self.allocator.free(items);
+        self.filter_entries = owned;
+        self.allocator.free(self.marks);
+        self.marks = marks;
+        self.cursor = cursor;
+        self.ensureVisible();
     }
     fn refresh(self: *Implementation) !void {
         try self.request(self.path(), null);
@@ -999,4 +1126,171 @@ test "reference rows retain Cursor identity across listing changes and scroll wi
     try std.testing.expectEqual(Pane.RowKind.current, pane.view().row(0).?.kind);
     try pane.enter();
     try std.testing.expect(pane.view().status == .ready);
+}
+
+test "filter keeps Pane order clears every mark and preserves the visible Cursor" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "alpha", "alphabet", "beta" }) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "" });
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buffer);
+    const pane = try Pane.create(io, std.testing.allocator, buffer[0..len], .{});
+    defer pane.destroy();
+    try pane.refresh();
+    try waitForScan(pane);
+    pane.move(.last, false);
+    pane.toggleSelection();
+    pane.move(.{ .by = -1 }, false);
+    pane.toggleSelection();
+    try pane.setFilter("aa");
+    try std.testing.expectEqual(@as(usize, 0), pane.view().marked_count);
+    try waitForFilter(pane);
+    try std.testing.expectEqual(@as(usize, 2), pane.view().entries.len);
+    try std.testing.expectEqualStrings("alpha", pane.view().entries[0].name);
+    try std.testing.expectEqualStrings("alphabet", pane.view().focused().?.name);
+    pane.toggleSelection();
+    try pane.setFilter("aa");
+    try std.testing.expectEqual(@as(usize, 1), pane.view().marked_count);
+    try pane.closeFilter();
+    try std.testing.expectEqual(@as(usize, 3), pane.view().entries.len);
+    try std.testing.expectEqual(@as(usize, 0), pane.view().marked_count);
+}
+
+fn waitForFilter(pane: *Pane) !void {
+    for (0..5000) |_| {
+        _ = try pane.poll();
+        if (!pane.view().filter.loading and pane.view().status != .loading) {
+            if (pane.view().filter.failure) |err| return err;
+            return;
+        }
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    return error.FilterTimeout;
+}
+
+test "filter honors fzf smart case extended syntax normalization and unusual names" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "Alpha", "alpha", "café", "name\nbreak", "--filter" }) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "" });
+    try tmp.dir.createDir(io, "alpha-dir", .default_dir);
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buffer);
+    const pane = try Pane.create(io, std.testing.allocator, buffer[0..len], .{});
+    defer pane.destroy();
+    try pane.refresh();
+    try waitForScan(pane);
+    const queries = [_][]const u8{ "Al", "^alpha !dir", "cafe", "nbk", "--filter", "zzzz" };
+    const expected = [_][]const []const u8{ &.{"Alpha"}, &.{ "Alpha", "alpha" }, &.{"café"}, &.{"name\nbreak"}, &.{"--filter"}, &.{} };
+    for (queries, expected) |query, names| {
+        try pane.setFilter(query);
+        try waitForFilter(pane);
+        try std.testing.expectEqual(names.len, pane.view().entries.len);
+        for (names, pane.view().entries) |name, entry| try std.testing.expectEqualStrings(name, entry.name);
+        try std.testing.expect(pane.view().has_parent);
+    }
+    try pane.setFilter("alpha");
+    try waitForFilter(pane);
+    try std.testing.expectEqualStrings("alpha-dir", pane.view().entries[0].name);
+    try pane.changeListing(.reverse);
+    try waitForFilter(pane);
+    try std.testing.expectEqualStrings("alpha-dir", pane.view().entries[0].name);
+    try std.testing.expectEqualStrings("alpha", pane.view().entries[1].name);
+    try std.testing.expectEqualStrings("Alpha", pane.view().entries[2].name);
+}
+
+test "filter survives refresh hidden options and failed navigation and clears on new Location" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ ".alpha", "alpha", "beta" }) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "" });
+    try tmp.dir.createDir(io, "child", .default_dir);
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buffer);
+    const pane = try Pane.create(io, std.testing.allocator, buffer[0..len], .{});
+    defer pane.destroy();
+    pane.setViewportRows(1);
+    try pane.refresh();
+    try waitForScan(pane);
+    try pane.setFilter("alpha");
+    try waitForFilter(pane);
+    pane.move(.last, false);
+    pane.toggleSelection();
+    try pane.changeListing(.toggle_hidden);
+    try waitForFilter(pane);
+    try std.testing.expectEqual(@as(usize, 2), pane.view().entries.len);
+    try std.testing.expectEqualStrings("alpha", pane.view().focused().?.name);
+    try expectSources(pane, &.{"alpha"});
+    try pane.refresh();
+    try waitForFilter(pane);
+    try expectSources(pane, &.{"alpha"});
+    try pane.request("missing");
+    try waitForFilter(pane);
+    try std.testing.expect(pane.view().status == .failed);
+    try std.testing.expectEqualStrings("alpha", pane.view().filter.query);
+    try expectSources(pane, &.{"alpha"});
+    try pane.setFilter("none");
+    try waitForFilter(pane);
+    try std.testing.expectEqual(@as(usize, 0), pane.view().entries.len);
+    try std.testing.expect(pane.view().row(0).?.entry == null);
+    try expectSources(pane, &.{});
+    try pane.request("child");
+    try waitForFilter(pane);
+    try std.testing.expect(!pane.view().filter.active);
+    try std.testing.expectEqualStrings("", pane.view().filter.query);
+}
+
+test "missing and failing fzf retain usable listings and closing recovers browsing" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "alpha", .data = "" });
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buffer);
+    for ([_][]const u8{ "/nonexistent/lighthouse-fzf", "/bin/sh" }, [_]anyerror{ error.FzfNotFound, error.FzfFailed }) |executable, expected| {
+        const pane = try Pane.create(io, std.testing.allocator, buffer[0..len], .{ .filter_executable = executable });
+        defer pane.destroy();
+        try pane.refresh();
+        try waitForScan(pane);
+        try pane.setFilter("alpha");
+        try std.testing.expectError(expected, waitForFilter(pane));
+        try std.testing.expectEqualStrings("alpha", pane.view().entries[0].name);
+        pane.move(.last, false);
+        try expectSources(pane, &.{"alpha"});
+        try pane.closeFilter();
+        try std.testing.expect(pane.view().filter.failure == null);
+        try std.testing.expect(!pane.view().filter.active);
+        try expectSources(pane, &.{"alpha"});
+    }
+}
+
+test "superseded filter results never replace the latest query or listing" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "alpha", "beta" }) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "" });
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buffer);
+    const pane = try Pane.create(io, std.testing.allocator, buffer[0..len], .{});
+    defer pane.destroy();
+    try pane.refresh();
+    try waitForScan(pane);
+    for (0..20) |_| {
+        try pane.setFilter("alpha");
+        try pane.setFilter("beta");
+    }
+    try waitForFilter(pane);
+    try std.testing.expectEqual(@as(usize, 1), pane.view().entries.len);
+    try std.testing.expectEqualStrings("beta", pane.view().entries[0].name);
+    try pane.setFilter("alpha");
+    try tmp.dir.deleteFile(io, "alpha");
+    try pane.refresh();
+    try waitForFilter(pane);
+    try std.testing.expectEqual(@as(usize, 0), pane.view().entries.len);
+    try pane.setFilter("beta");
+    try pane.closeFilter();
+    try waitForFilter(pane);
+    try std.testing.expectEqualStrings("beta", pane.view().entries[0].name);
+    try std.testing.expect(!pane.view().filter.active);
 }

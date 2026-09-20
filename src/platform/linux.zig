@@ -10,6 +10,7 @@ pub const c = @cImport({
     @cInclude("termios.h");
     @cInclude("sys/ioctl.h");
     @cInclude("sys/wait.h");
+    @cInclude("sys/mman.h");
     @cInclude("pty.h");
     @cInclude("fcntl.h");
     @cInclude("poll.h");
