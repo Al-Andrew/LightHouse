@@ -111,7 +111,9 @@ def shell_exit():
     try:
         app.start()
         app.send("\x07exit\r")
-        wait(app, lambda: not Path(f"/proc/{app.shell_pid}").exists(), "shell not reaped")
+        wait(
+            app, lambda: not Path(f"/proc/{app.shell_pid}").exists(), "shell not reaped"
+        )
         assert app.proc.poll() is None, "shell EOF exited LightHouse"
         app.expect("Name")
         app.send("\n")
@@ -133,7 +135,9 @@ def terminal_lifetime():
         app = App(cwd=root)
         try:
             app.start()
-            app.send("\x07LH_KEEP=kept; sleep 0.2; printf hidden > " + str(report) + "\r")
+            app.send(
+                "\x07LH_KEEP=kept; sleep 0.2; printf hidden > " + str(report) + "\r"
+            )
             app.send("\n")
             app.pump(0.1)
             assert "LH_PROMPT>" not in app.screen.text()
@@ -187,7 +191,11 @@ def relative_shell_and_queued_exit():
             # Queue input while the exiting shell cannot consume it. It must
             # never reach the replacement, nor prevent host input after EOF.
             app.send("\x1b[200~" + "OLD_INPUT" * 1000 + "\x1b[201~")
-            wait(app, lambda: not Path(f"/proc/{app.shell_pid}").exists(), "old child not reaped")
+            wait(
+                app,
+                lambda: not Path(f"/proc/{app.shell_pid}").exists(),
+                "old child not reaped",
+            )
             app.send("\n")
             app.expect("LH_PROMPT>")
             assert "OLD_INPUT" not in app.screen.text()
