@@ -25,6 +25,10 @@ pub fn deleteSize(job: *const operations.Job, rejection: ?Rejection) Size {
 }
 
 pub const operation_size: Size = .{ .width = job_dialog_width, .height = 10 };
+
+pub fn operationSize(job: *const operations.Job) Size {
+    return if (job.status() == .waiting) .{ .width = job_dialog_width, .height = 22 } else operation_size;
+}
 pub const help_size: Size = .{ .width = help_dialog_width, .height = help_lines.len + commands.help_groups.len + 3 };
 
 pub fn paintPathInput(painter: ui.Painter, editor: *const PathInput, action: ?operations.Kind, pane: ?*const Pane, rejection: ?Rejection) !void {
@@ -58,6 +62,7 @@ pub fn paintPathInput(painter: ui.Painter, editor: *const PathInput, action: ?op
 
 const Control = struct {
     label: []const u8,
+    mnemonic: bool = false,
 
     fn width(self: Control) usize {
         return (std.unicode.utf8CountCodepoints(self.label) catch unreachable) + 2;
@@ -88,6 +93,11 @@ fn paintControls(painter: ui.Painter, controls: []const Control) !void {
         const button = painter.child(.{ .x = x, .y = y, .width = control.width(), .height = 1 });
         button.fill(theme.dialog_control);
         try button.text(1, 0, control.label, theme.dialog_control);
+        if (control.mnemonic) {
+            var mnemonic = theme.dialog_control;
+            mnemonic.underline = true;
+            button.label(1, 0, control.label[0..1], mnemonic);
+        }
         x += control.width() + 3;
     }
 }
@@ -162,6 +172,7 @@ pub fn paintDeleteConfirmation(painter: ui.Painter, job: *const operations.Job, 
 }
 
 pub fn paintOperation(painter: ui.Painter, job: *const operations.Job) !void {
+    if (job.status() == .waiting) return paintProblem(painter, job);
     const style = theme.dialog;
     const box = dialog.beginIn(painter, operation_size.width, operation_size.height, style);
     const inside = box.inset(1);
@@ -177,15 +188,7 @@ pub fn paintOperation(painter: ui.Painter, job: *const operations.Job) !void {
         if (request.kind == .delete) "entries deleted" else "bytes copied",
     });
     inside.label(0, 1, summary, style);
-    if (status == .waiting) {
-        const prompt = status.waiting.prompt;
-        const title = if (prompt.err) |err| try std.fmt.allocPrint(allocator, "{s}: {s}", .{ @tagName(prompt.stage), operationError(err) }) else if (prompt.conflict == .mismatch) "Type mismatch: directory replacement is not allowed" else "Destination conflict";
-        inside.label(0, 2, title, style);
-        try inside.child(.{ .x = 0, .y = 3, .width = inside.rect.width, .height = 1 }).textEnd(prompt.source, style);
-        try inside.child(.{ .x = 0, .y = 4, .width = inside.rect.width, .height = 1 }).textEnd(prompt.destination, style);
-        inside.label(0, 5, if (prompt.err != null) "r Retry | s Skip | c / Esc Cancel job" else if (prompt.conflict == .mismatch) "s Skip | c / Esc Cancel job" else "o Overwrite | s Skip | c / Esc Cancel job", style);
-        inside.label(0, 7, "F10 quit | Terminal input blocked", style);
-    } else if (status == .finished) {
+    if (status == .finished) {
         const result = status.finished;
         inside.label(0, 2, if (result.failure) |failure| operationError(failure.err) else if (progress.skipped > 0 or progress.errors > 0 or progress.incomplete > 0) "Partial" else "Completed", style);
         if (result.failure) |failure| {
@@ -276,10 +279,96 @@ test "delete confirmation handles multiple selections" {
     }
 }
 
+const conflict_controls = [_]Control{ .{ .label = "Overwrite", .mnemonic = true }, .{ .label = "Skip", .mnemonic = true }, .{ .label = "Cancel job (Esc)", .mnemonic = true }, .{ .label = "F10 Quit" } };
+const error_controls = [_]Control{ .{ .label = "Retry", .mnemonic = true }, .{ .label = "Skip", .mnemonic = true }, .{ .label = "Cancel job (Esc)", .mnemonic = true }, .{ .label = "F10 Quit" } };
+const mismatch_controls = [_]Control{ .{ .label = "Skip", .mnemonic = true }, .{ .label = "Cancel job (Esc)", .mnemonic = true }, .{ .label = "F10 Quit" } };
+
+const ProblemLayout = struct {
+    inside: ui.Painter,
+    body: ui.Painter,
+    policy_y: usize,
+    footer_y: usize,
+    controls: []const Control,
+
+    fn init(painter: ui.Painter, job: *const operations.Job) ProblemLayout {
+        const size = operationSize(job);
+        const box = painter.child(@import("lighthouse-ui").layout.centered(
+            .{ .width = painter.rect.width, .height = painter.rect.height },
+            size,
+        ));
+        const inside = paddedContent(box);
+        const prompt = job.status().waiting.prompt;
+        const controls: []const Control = if (prompt.err != null) &error_controls else if (prompt.conflict == .mismatch) &mismatch_controls else &conflict_controls;
+        const footer_rows = controlRows(inside.rect.width, controls);
+        // Reserve the footer first; shorter windows drop optional detail rows.
+        const footer_y = inside.rect.height -| (footer_rows + 1);
+        const policy_y = footer_y -| 3;
+        return .{
+            .inside = inside,
+            .body = inside.child(.{ .x = 0, .y = 0, .width = inside.rect.width, .height = policy_y }),
+            .policy_y = policy_y,
+            .footer_y = footer_y,
+            .controls = controls,
+        };
+    }
+};
+
+fn paintProblem(painter: ui.Painter, job: *const operations.Job) !void {
+    const size = operationSize(job);
+    _ = dialog.beginIn(painter, size.width, size.height, theme.problem_dialog);
+    const layout = ProblemLayout.init(painter, job);
+    const content = layout.body;
+    const prompt = job.status().waiting.prompt;
+    const progress = job.status().progress();
+    const request = job.request();
+    const allocator = painter.frame.arena.allocator();
+    const spacious = content.rect.height >= 12;
+    var row: usize = 0;
+    if (content.rect.height >= 2) {
+        content.label(0, row, request.kind.title(), theme.problem_heading);
+        row += 1;
+    }
+    if (content.rect.height >= 7) {
+        const summary = try std.fmt.allocPrint(allocator, "{d}/{d} items complete | {d} bytes copied", .{ progress.completed, request.sources.len, progress.bytes });
+        content.label(0, row, summary, theme.problem_dialog);
+        row += if (spacious) @as(usize, 2) else 1;
+    }
+    const heading = if (prompt.err) |err| operationError(err) else if (prompt.conflict == .mismatch) "Type mismatch" else "Destination conflict";
+    contentRow(content, row).fill(theme.problem_heading);
+    content.label(0, row, heading, theme.problem_heading);
+    row += if (spacious) @as(usize, 2) else 1;
+    const inline_paths = content.rect.height < 7;
+    row = try paintProblemPath(content, row, "Source path", prompt.source, inline_paths);
+    if (spacious) row += 1;
+    _ = try paintProblemPath(content, row, "Destination path", prompt.destination, inline_paths);
+    const footer = layout.inside.child(.{ .x = 0, .y = layout.footer_y, .width = layout.inside.rect.width, .height = layout.inside.rect.height -| layout.footer_y });
+    try paintControls(footer, layout.controls);
+    const blocked_y = controlRows(layout.inside.rect.width, layout.controls);
+    footer.label(0, blocked_y, "Terminal input blocked", theme.problem_dialog);
+}
+
+fn paintProblemPath(content: ui.Painter, row: usize, label: []const u8, path: []const u8, inline_value: bool) !usize {
+    if (path.len == 0) return row;
+    const rows: usize = if (inline_value) 1 else 2;
+    if (row + rows > content.rect.height) return row;
+    content.label(0, row, label, theme.problem_dialog);
+    if (inline_value) {
+        content.label(label.len, row, ":", theme.problem_dialog);
+        try content.child(.{ .x = label.len + 2, .y = row, .width = content.rect.width -| (label.len + 2), .height = 1 }).textEnd(path, theme.problem_path);
+    } else {
+        try contentRow(content, row + 1).textEnd(path, theme.problem_path);
+    }
+    return row + rows;
+}
+
 pub fn paintDecisionPolicy(painter: ui.Painter, job: *const operations.Job, checked: bool) void {
     if (job.status() != .waiting) return;
-    const box = painter.child(.{ .x = 1, .y = 1, .width = painter.rect.width -| 2, .height = painter.rect.height -| 2 });
-    box.label(0, 6, if (job.status().waiting.prompt.err != null) (if (checked) "[x] Skip all errors of this kind (Space toggles)" else "[ ] Skip all errors of this kind (Space toggles)") else (if (checked) "[x] Apply to all matching conflicts (Space toggles)" else "[ ] Apply to all matching conflicts (Space toggles)"), theme.dialog);
+    const layout = ProblemLayout.init(painter, job);
+    const policy = layout.inside.child(.{ .x = 0, .y = layout.policy_y, .width = layout.inside.rect.width, .height = layout.footer_y -| layout.policy_y });
+    policy.label(0, 0, if (checked) "[x]" else "[ ]", theme.dialog_control);
+    policy.label(4, 0, if (job.status().waiting.prompt.err != null) "Skip all errors of this kind" else "Apply to all matching conflicts", theme.problem_dialog);
+    policy.label(0, 1, " Space ", theme.dialog_control);
+    policy.label(8, 1, "Toggle", theme.problem_dialog);
 }
 
 fn renderedRow(frame: *const ui.Frame, needle: []const u8) ?usize {
@@ -311,6 +400,51 @@ test "copy and move editors separate destination input validation and shortcut f
             try std.testing.expect(renderedRow(&frame, "Esc — Cancel") != null);
             try std.testing.expect(renderedRow(&frame, "Ctrl+U — Clear") != null);
             try std.testing.expect(renderedRow(&frame, "Existing folder:") == null);
+        }
+    }
+}
+
+test "problem dialogs label paths highlight policy and underline valid decisions" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    try tmp.dir.createDir(io, "dest", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "source-界", .data = "new" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "dest/source-界", .data = "old" });
+    const job = try operations.Job.create(io, std.testing.allocator, .copy, base, &.{"source-界"}, "dest");
+    defer job.destroy();
+    try job.start();
+    for (0..5000) |_| {
+        if (job.status() == .waiting) break;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(job.status() == .waiting);
+    var frame = ui.Frame.init(std.testing.allocator);
+    defer frame.deinit();
+    for ([_]Size{ .{ .width = 100, .height = 30 }, .{ .width = 40, .height = 16 }, .{ .width = 40, .height = 12 } }) |size| {
+        for ([_]bool{ false, true }) |checked| {
+            try frame.begin(size.width, size.height);
+            const painter = frame.painter(.{ .x = 0, .y = 0, .width = size.width, .height = size.height });
+            try paintOperation(painter, job);
+            paintDecisionPolicy(painter, job, checked);
+            try std.testing.expect(renderedRow(&frame, "Source path") != null);
+            try std.testing.expect(renderedRow(&frame, "Destination path") != null);
+            try std.testing.expect(renderedRow(&frame, "Destination conflict") != null);
+            try std.testing.expect(renderedRow(&frame, if (checked) "[x] Apply to all matching conflicts" else "[ ] Apply to all matching conflicts") != null);
+            try std.testing.expect(renderedRow(&frame, "Space") != null);
+            try std.testing.expect(renderedRow(&frame, "Esc") != null);
+            try std.testing.expect(renderedRow(&frame, "F10") != null);
+            const problem_row = renderedRow(&frame, "Destination conflict").?;
+            const problem_cell = frame.cells[problem_row * frame.cols + frame.cols / 2];
+            try std.testing.expect(problem_cell.style.bg.r > problem_cell.style.bg.g);
+            var underlined: std.ArrayList(u8) = .empty;
+            defer underlined.deinit(std.testing.allocator);
+            for (frame.cells) |cell| {
+                if (cell.style.underline) try underlined.appendSlice(std.testing.allocator, cell.text);
+            }
+            try std.testing.expectEqualStrings("OSC", underlined.items);
         }
     }
 }

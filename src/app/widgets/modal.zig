@@ -13,7 +13,7 @@ pub const Modal = struct {
             .help => dialogs.help_size,
             .notice => .{ .width = 80, .height = 4 },
             .confirm_delete => |job| dialogs.deleteSize(job, self.state.view().rejection),
-            .none => dialogs.operation_size,
+            .none => if (self.state.view().operation) |job| dialogs.operationSize(job) else dialogs.operation_size,
         };
     }
 

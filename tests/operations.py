@@ -349,10 +349,76 @@ def merge_decisions():
             app.close()
 
 
+def problem_dialogs():
+    for action in (F5, F6):
+        for problem in ("conflict", "mismatch", "error"):
+            with tempfile.TemporaryDirectory(prefix="lh-problem-") as directory:
+                root = Path(directory) / ("long-界-path-" * 10)
+                root.mkdir()
+                source, dest = root / "source-界", root / "destination"
+                source.write_text("new")
+                dest.mkdir()
+                if problem == "mismatch":
+                    (dest / source.name).mkdir()
+                elif problem == "conflict":
+                    (dest / source.name).write_text("old")
+                app = App(cols=100, rows=30, cwd=root)
+                try:
+                    app.start()
+                    app.send("\x1b[F" + action)
+                    app.expect("Destination path")
+                    if problem == "error":
+                        source.unlink()
+                    submit(app, dest)
+                    heading = {"conflict": "Destination conflict", "mismatch": "Type mismatch", "error": "Not found"}[problem]
+                    app.expect(heading)
+                    policy = "Skip all errors of this kind" if problem == "error" else "Apply to all matching conflicts"
+                    for cols, rows in ((100, 30), (40, 16), (40, 12)):
+                        if (cols, rows) != (app.screen.cols, app.screen.rows):
+                            app.resize(cols, rows)
+                            app.pump(0.1)
+                        for text in (heading, "Source path", "Destination path", "source-界", "[ ] " + policy, "Space", "Cancel job (Esc)", "F10 Quit", "Terminal input blocked"):
+                            app.expect(text)
+                        app.send(" ")
+                        app.expect("[x] " + policy)
+                        app.send(" ")
+                        app.expect("[ ] " + policy)
+                    if problem == "mismatch":
+                        assert "Overwrite" not in app.screen.text()
+                        assert "Retry" not in app.screen.text()
+                        app.send("or")
+                        app.pump(0.1)
+                        app.expect(heading)
+                        app.send("s")
+                        app.expect("Partial")
+                        assert source.read_text() == "new"
+                        assert (dest / source.name).is_dir()
+                        app.send("\r")
+                    elif problem == "error":
+                        assert "Overwrite" not in app.screen.text()
+                        app.expect("Retry")
+                        source.write_text("restored")
+                        app.send("r")
+                        completed(app)
+                        assert (dest / source.name).read_text() == "restored"
+                    else:
+                        assert "Retry" not in app.screen.text()
+                        app.expect("Overwrite")
+                        app.send("\x1b")
+                        app.expect("Canceled")
+                        assert (dest / source.name).read_text() == "old"
+                        app.send("\r")
+                    app.send("q")
+                    app.finished()
+                finally:
+                    app.close()
+
+
 if __name__ == "__main__":
     for test in [
         file_actions,
         merge_decisions,
+        problem_dialogs,
         partial_copy,
         cross_filesystem_move,
         delete_actions,
