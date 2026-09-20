@@ -1,3 +1,4 @@
+//! Owns application workflows and focus policy; widgets own scoped input routing.
 const std = @import("std");
 const c = @import("../platform/linux.zig").c;
 const toolkit = @import("lighthouse-ui");
@@ -9,9 +10,7 @@ const Pane = @import("../core/pane.zig").Pane;
 const operations = @import("../core/operations.zig");
 const Layout = @import("layout.zig").Layout;
 const dialogs = @import("widgets/dialogs.zig");
-const paintPathInput = dialogs.paintPathInput;
 const paintOperation = dialogs.paintOperation;
-const paintDeleteConfirmation = dialogs.paintDeleteConfirmation;
 
 pub const Focus = enum { left, right, terminal };
 // A tagged state owns exactly one modal payload. An action cannot outlive its
@@ -585,4 +584,29 @@ test "allocation failures release controller editor and prepared job ownership" 
     try panes.init("/");
     defer panes.deinit();
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocateWorkflow, .{panes.panes});
+}
+
+test "completion attempts the other pane refresh even when the first cannot allocate" {
+    var left_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var scans = [_]std.atomic.Value(usize){ .init(0), .init(0) };
+    const left = try Pane.create(std.testing.io, left_allocator.allocator(), "/", .{ .provider = .{ .context = &scans[0], .scan = TestPanes.scan } });
+    defer left.destroy();
+    const right = try Pane.create(std.testing.io, std.testing.allocator, "/", .{ .provider = .{ .context = &scans[1], .scan = TestPanes.scan } });
+    defer right.destroy();
+    const state = try State.create(std.Io.failing, std.testing.allocator, .{ left, right });
+    defer state.destroy();
+    try state.openAction(.mkdir);
+    try state.submit("unused");
+    left_allocator.fail_index = left_allocator.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, state.poll());
+    try std.testing.expect(state.view().operation.?.status() == .finished);
+    left_allocator.fail_index = std.math.maxInt(usize);
+    try settle(state);
+    try std.testing.expectEqual(@as(usize, 0), scans[0].load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), scans[1].load(.acquire));
+    try std.testing.expect(!try state.poll());
+    state.dismiss();
+    try std.testing.expect(!try state.poll());
+    try std.testing.expectEqual(@as(usize, 0), scans[0].load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), scans[1].load(.acquire));
 }
