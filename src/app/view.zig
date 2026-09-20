@@ -358,3 +358,44 @@ fn expectFrameText(frame: *const ui.Frame, expected: []const u8) !void {
     }
     return error.MissingFrameText;
 }
+
+test "View retains path aliases terminal geometry and job quit text binding" {
+    const Pane = @import("../core/pane.zig").Pane;
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const left = try Pane.create(io, allocator, "/tmp", .{});
+    defer left.destroy();
+    const right = try Pane.create(io, allocator, "/", .{});
+    defer right.destroy();
+    const emulator = try Emulator.create(io, allocator, 80, 8);
+    defer emulator.destroy();
+    const state = try State.create(std.Io.failing, allocator, .{ left, right });
+    defer state.destroy();
+    const view = try View.create(allocator, state, emulator);
+    defer view.destroy();
+    var decoder: ui.input.Decoder = .{};
+    try feed(view, &decoder, "\x0c");
+    try std.testing.expectEqualStrings("/tmp", state.view().modal.editor.input.text());
+    try view.event(&.{ .key = .escape });
+    try feed(view, &decoder, "/");
+    try std.testing.expectEqualStrings("/", state.view().modal.editor.input.text());
+    try std.testing.expect(!state.view().modal.editor.input.select_all);
+    try view.event(&.{ .key = .escape });
+    try feed(view, &decoder, "++-");
+    try std.testing.expectEqual(@as(i32, 1), state.view().adjustment);
+    try feed(view, &decoder, "z");
+    try std.testing.expect(state.view().zoom);
+    try std.testing.expect(view.terminal.focused());
+    try std.testing.expect(!try state.invoke(.grow_terminal, emulator));
+    try feed(view, &decoder, "\x07");
+    try std.testing.expect(!state.view().zoom);
+    try std.testing.expect(view.panes[0].focused());
+    // Extra key modifiers retain their existing matching behavior.
+    try view.event(&.{ .key = .f7, .shift = true, .alt = true, .ctrl = true });
+    try std.testing.expect(state.view().modal.editor.action == .mkdir);
+    try state.submit("unused");
+    try feed(view, &decoder, "t"); // Only Ctrl+G may switch focus in the job scope.
+    try std.testing.expect(view.modal.focused());
+    try feed(view, &decoder, "q");
+    try std.testing.expect(state.view().quit);
+}
