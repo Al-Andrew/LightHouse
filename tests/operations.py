@@ -6,7 +6,7 @@ import signal
 import tempfile
 from pathlib import Path
 
-from support import App, go, in_pane, submit
+from support import App, go, in_pane, submit, wait
 
 F5, F6, F7, F8 = "\x1b[15~", "\x1b[17~", "\x1b[18~", "\x1b[19~"
 
@@ -61,9 +61,11 @@ def file_actions():
             # A conflict must not replace the modified destination.
             (dest / "a.txt").write_text("keep")
             app.send(F5 + "\r")
-            app.expect("Destination already exists")
+            app.expect("Destination conflict")
             assert (dest / "a.txt").read_text() == "keep"
             assert (source / "a.txt").read_text() == "alpha"
+            app.send(" s")  # Skip all ordinary conflicts for this job.
+            app.expect("Partial")
             app.send("\r")
             # Clear marks, rename a single file relative to the source pane.
             app.send("\x1b[H\x1b[B\x1b[B\x1b[2~\x1b[2~\x1b[A" + F6)
@@ -127,6 +129,8 @@ def partial_copy():
             assert (root / "tree" / "pipe").exists()
             assert (root / "copy").is_dir()
             assert not (root / "copy" / "pipe").exists()
+            app.send("s")
+            app.expect("Partial")
             app.send("\rq")
             app.finished()
         finally:
@@ -156,6 +160,8 @@ def cross_filesystem_move():
             app.expect("Moves between filesystems are not supported yet")
             assert (root / "source").read_text() == "preserve me"
             assert list(Path(destination).iterdir()) == []
+            app.send("s")
+            app.expect("Partial")
             app.send("\rq")
             app.finished()
         finally:
@@ -296,9 +302,57 @@ def shift_marked_actions():
                 app.close()
 
 
+def merge_decisions():
+    with tempfile.TemporaryDirectory(prefix="lh-merge-") as directory:
+        root = Path(directory) / ("long-directory-" * 8)
+        root.mkdir()
+        source, dest = root / "source", root / "dest"
+        source.mkdir()
+        dest.mkdir()
+        (source / "a").write_text("replacement")
+        (dest / "a").write_text("old")
+        app = App(cols=140, cwd=source)
+        try:
+            app.start()
+            in_pane(app, 0, "1 items")
+            app.send("\x07sleep 0.2; printf BACKGROUND_; printf FINISHED\r\x07")
+            app.send("\x1b[B" + F5)
+            submit(app, dest)
+            app.expect("Destination conflict")
+            app.expect("[ ] Apply to all")
+            app.expect("source/a")
+            app.expect("dest/a")
+            app.expect("BACKGROUND_FINISHED")
+            app.send("\x07\n\x06\x1bOS")
+            app.pump(0.1)
+            app.expect("Destination conflict")
+            assert "Editor" not in app.screen.text()
+            # Changes while the prompt is open require fresh unchecked consent.
+            (dest / "a").write_text("changed during prompt")
+            app.send(" o")
+            app.expect("[ ] Apply to all")
+            app.expect("Destination conflict")
+            assert (dest / "a").read_text() == "changed during prompt"
+            os.kill(app.shell_pid, signal.SIGHUP)
+            wait(
+                app,
+                lambda: not Path(f"/proc/{app.shell_pid}").exists(),
+                "shell EOF while waiting",
+            )
+            app.expect("Destination conflict")
+            app.send("o")
+            completed(app)
+            assert (dest / "a").read_text() == "replacement"
+            app.send("q")
+            app.finished()
+        finally:
+            app.close()
+
+
 if __name__ == "__main__":
     for test in [
         file_actions,
+        merge_decisions,
         partial_copy,
         cross_filesystem_move,
         delete_actions,

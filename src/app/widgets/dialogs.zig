@@ -23,7 +23,7 @@ pub fn deleteSize(job: *const operations.Job, rejection: ?Rejection) Size {
     return .{ .width = job_dialog_width, .height = shown + 6 + @intFromBool(rejection != null) };
 }
 
-pub const operation_size: Size = .{ .width = job_dialog_width, .height = 8 };
+pub const operation_size: Size = .{ .width = job_dialog_width, .height = 10 };
 pub const help_size: Size = .{ .width = help_dialog_width, .height = help_lines.len + commands.help_groups.len + 3 };
 
 pub fn paintPathInput(painter: ui.Painter, editor: *const PathInput, action: ?operations.Kind, pane: ?*const Pane, rejection: ?Rejection) !void {
@@ -42,7 +42,7 @@ pub fn paintPathInput(painter: ui.Painter, editor: *const PathInput, action: ?op
         if (height > 3) if (pane) |p| {
             var sources = p.sources();
             const summary = if (kind == .mkdir) "Create one folder; its parent must exist." else if (p.view().marked_count > 0)
-                try std.fmt.allocPrint(allocator, "{d} marked items. Existing destinations are refused.", .{sources.count})
+                try std.fmt.allocPrint(allocator, "{d} marked items. Conflicts ask for a decision.", .{sources.count})
             else if (sources.next()) |name|
                 try std.fmt.allocPrint(allocator, "Source: {s}", .{name})
             else
@@ -87,16 +87,26 @@ pub fn paintOperation(painter: ui.Painter, job: *const operations.Job) !void {
         if (request.kind == .delete) "entries deleted" else "bytes copied",
     });
     inside.label(0, 1, summary, style);
-    if (status == .finished) {
+    if (status == .waiting) {
+        const prompt = status.waiting.prompt;
+        const title = if (prompt.err) |err| try std.fmt.allocPrint(allocator, "{s}: {s}", .{ @tagName(prompt.stage), operationError(err) }) else if (prompt.conflict == .mismatch) "Type mismatch: directory replacement is not allowed" else "Destination conflict";
+        inside.label(0, 2, title, style);
+        try inside.child(.{ .x = 0, .y = 3, .width = inside.rect.width, .height = 1 }).textEnd(prompt.source, style);
+        try inside.child(.{ .x = 0, .y = 4, .width = inside.rect.width, .height = 1 }).textEnd(prompt.destination, style);
+        inside.label(0, 5, if (prompt.err != null) "r Retry | s Skip | c / Esc Cancel job" else if (prompt.conflict == .mismatch) "s Skip | c / Esc Cancel job" else "o Overwrite | s Skip | c / Esc Cancel job", style);
+        inside.label(0, 7, "F10 quit | Terminal input blocked", style);
+    } else if (status == .finished) {
         const result = status.finished;
-        inside.label(0, 2, if (result.failure) |failure| operationError(failure.err) else "Completed", style);
+        inside.label(0, 2, if (result.failure) |failure| operationError(failure.err) else if (progress.skipped > 0 or progress.errors > 0 or progress.incomplete > 0) "Partial" else "Completed", style);
         if (result.failure) |failure| {
             if (failure.path) |path| try inside.text(0, 3, path, style);
             inside.label(0, 4, if (request.kind == .copy) "Completed copies remain; unfinished folders may be partial." else if (request.kind == .delete) "Deleted entries stay deleted; folders may be partly removed." else "Completed actions remain; remaining items were not processed.", style);
         }
         inside.label(0, 5, "Enter / Esc close", style);
+        const details = try std.fmt.allocPrint(allocator, "{d} transferred | {d} skipped | {d} errors | {d} incomplete folders", .{ progress.transferred, progress.skipped, progress.errors, progress.incomplete });
+        inside.label(0, 6, details, style);
     } else {
-        inside.label(0, 2, if (status == .canceling) "Canceling..." else if (request.kind == .delete) "Deleting..." else "Working... Existing destinations are never replaced.", style);
+        inside.label(0, 2, if (status == .canceling) "Canceling..." else if (request.kind == .delete) "Deleting..." else "Working... Completed actions are retained.", style);
         inside.label(0, 5, "Esc cancel  |  F10 quit", style);
     }
 }
@@ -174,4 +184,10 @@ test "delete confirmation handles multiple selections" {
         try frame.begin(100, 30);
         try paintDeleteConfirmation(frame.painter(.{ .x = 0, .y = 0, .width = frame.cols, .height = frame.rows }), job, .unsupported_operation);
     }
+}
+
+pub fn paintDecisionPolicy(painter: ui.Painter, job: *const operations.Job, checked: bool) void {
+    if (job.status() != .waiting) return;
+    const box = painter.child(.{ .x = 1, .y = 1, .width = painter.rect.width -| 2, .height = painter.rect.height -| 2 });
+    box.label(0, 6, if (job.status().waiting.prompt.err != null) (if (checked) "[x] Skip all errors of this kind (Space toggles)" else "[ ] Skip all errors of this kind (Space toggles)") else (if (checked) "[x] Apply to all matching conflicts (Space toggles)" else "[ ] Apply to all matching conflicts (Space toggles)"), theme.dialog);
 }

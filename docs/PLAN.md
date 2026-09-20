@@ -7,8 +7,9 @@ panes, concurrent directory scans, marking, sorting, hidden-file toggling,
 refresh, path entry, keyboard help, and background file jobs with progress and
 cancellation. F5 copies, F6 moves/renames within a filesystem, and F7 creates a
 folder. F8 confirms permanent recursive deletion without following symlinks.
-Jobs refuse conflicts and report partial completion; overwrite/skip prompts,
-cross-filesystem moves, and external tools remain pending.
+Copy/move jobs merge directories, offer conflict and error decisions, and report
+partial completion. F4 opens a configured editor in a separate terminal session.
+Cross-filesystem moves remain pending.
 The retained widget foundation now exists as the independent `lighthouse-ui`
 build module: parent ownership, measurement/layout/paint callbacks, focus,
 modal input routing, clipped composition, invalidation, and deferred removal.
@@ -166,3 +167,12 @@ F4 opens a configured terminal editor in a separate full-area session. JSON argv
 or quoted EDITOR configuration launches directly, with literal file arguments.
 Deterministic PTY fixtures exercise input, resizing, shell independence, normal
 and failed exit, configuration, eligibility and child cleanup. F3 remains open.
+
+## Delivered copy/move recovery (#24)
+
+Directory merge, explicit overwrite/skip/cancel decisions and per-entry
+retry/skip/cancel now share one retained Job workflow. Policies separate regular
+files, symlinks and mismatches and reset per job. Controlled I/O checks cover
+transfer, traversal, finalization and move cleanup; PTY checks cover fresh consent,
+checkbox defaults and terminal blocking through result dismissal. Cross-filesystem
+moves and recursive destination replacement remain unsupported.

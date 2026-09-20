@@ -313,3 +313,23 @@ retires that session. Tool EOF refreshes both Panes exactly once; successful
 exit returns immediately, while failure retains the emulator output until
 acknowledgement. Host shutdown releases/reaps both sessions before restoring
 the console. Configuration and argument syntax are documented in README.
+
+## Copy/move decisions
+
+One retained Job owns execution, decision waiting, cancellation and the result.
+Waiting is observable through `Job.status().waiting`; status and paint never
+advance it. Widgets send `State.decideOperation`/modal key decisions. The
+controller owns an initially unchecked policy checkbox per prompt ID. `o`, `s`,
+`c` choose overwrite/skip/cancel; errors use `r`, `s`, `c`. Space toggles Apply to
+all or Skip all errors of this kind. Retry and Cancel are never remembered.
+
+Prompts identify source, destination and failed stage. Regular conflicts, symlink
+conflicts and directory mismatches use separate policies; mismatches cannot
+replace directories. The worker rechecks observed entries after consent and
+before publication. Directory traversal/finalization and merged-move cleanup
+remain explicit stages, so retry cannot replay completed children or file data.
+
+Every waiting/running/canceling/finished Job blocks terminal interaction, including
+Ctrl+G, Ctrl+J, Ctrl+F and F4 direct invocation. Output continues draining; shell EOF
+leaves the prompt intact. Escape requests cancellation; F10 explicitly quits.
+Completion still refreshes both Panes once; only dismissal releases the result.

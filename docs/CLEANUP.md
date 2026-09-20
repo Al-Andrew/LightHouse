@@ -94,3 +94,18 @@ I/O adapter, so ordering does not depend on large files or directory trees.
 Pane tests use its caller-facing interface and cover requested versus displayed
 options during canceled, failed, and superseded scans; viewport maintenance
 without painting; and source selection after sorting, hiding, and refresh.
+
+## Copy/move recovery ownership (#24)
+
+The Job owns decision synchronization and per-job conflict/error policy. A worker
+publishes an immutable prompt before waiting on an event; decisions, cancellation
+and shutdown wake it. Paths come from owned request/child storage and are released
+exactly once after the worker stops using them. UI observation does not wake work.
+The controller owns interaction and checkbox state; widgets only observe/send.
+
+Traversal records processed child names before continuing, so retrying enumeration
+cannot replay successful or skipped children. File finalization/publication and
+merged-move cleanup retry within their own stage. Atomic-file preparation retains
+the previous destination until complete publication. Completed byte totals exclude
+attempts; results distinguish top-level completion, entry transfers, skips, errors
+and incomplete directories. Delete/mkdir behavior remains unchanged.

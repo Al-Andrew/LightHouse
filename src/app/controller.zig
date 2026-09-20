@@ -93,6 +93,7 @@ pub const State = opaque {
         force_redraw: bool,
         modal: ModalView,
         operation: ?*const operations.Job,
+        decision_all: bool,
         rejection: ?Rejection,
 
         pub fn modalVisible(self: Observation) bool {
@@ -132,6 +133,7 @@ pub const State = opaque {
                 .confirm_delete => |confirmation| .{ .confirm_delete = confirmation.job },
             },
             .operation = self.operation,
+            .decision_all = if (self.operation) |job| (job.status() == .waiting and job.status().waiting.prompt.id == self.decision_id and self.decision_all) else false,
             .rejection = switch (self.modal) {
                 .editor => |editor| editor.rejection,
                 .confirm_delete => |confirmation| confirmation.rejection,
@@ -174,6 +176,12 @@ pub const State = opaque {
     }
 
     /// Closes an editor/confirmation, requests job cancellation, or releases its result.
+    pub fn decideOperation(state: *State, choice: operations.Choice, remember: bool) bool {
+        const self = state.implementation();
+        const job = self.operation orelse return false;
+        return job.decide(choice, remember);
+    }
+
     pub fn dismiss(state: *State) void {
         state.implementation().dismiss();
     }
@@ -314,6 +322,8 @@ const Implementation = struct {
     tool_host: ?State.ToolHost = null,
     tool_refresh: bool = false,
     operation: ?*operations.Job = null,
+    decision_id: usize = 0,
+    decision_all: bool = false,
 
     fn foregroundBusy(self: *const Implementation) bool {
         return self.modal != .none or self.operation != null or self.tool != .none;
@@ -378,6 +388,8 @@ const Implementation = struct {
         // This ownership transfer happens once; launch failures stay in the job.
         job.start() catch unreachable;
         self.operation = job;
+        self.decision_id = 0;
+        self.decision_all = false;
     }
 
     fn openDelete(self: *Implementation) !void {
@@ -404,6 +416,8 @@ const Implementation = struct {
             if (job.status() == .finished) {
                 job.destroy();
                 self.operation = null;
+                self.decision_id = 0;
+                self.decision_all = false;
             } else job.cancel();
         }
     }
@@ -441,6 +455,35 @@ const Implementation = struct {
             .none => {},
         }
         if (ev.kind != .key) return;
+        if (self.operation) |job| if (job.status() == .waiting) {
+            const prompt = job.status().waiting.prompt;
+            if (self.decision_id != prompt.id) {
+                self.decision_id = prompt.id;
+                self.decision_all = false;
+            }
+            if (ev.key == .escape) {
+                job.cancel();
+                return;
+            }
+            if (ev.key == .text and ev.len == 1) {
+                const choice: ?operations.Choice = switch (ev.bytes[0]) {
+                    'o' => .overwrite,
+                    'r' => .retry,
+                    's' => .skip,
+                    'c' => .cancel,
+                    ' ' => blk: {
+                        self.decision_all = !self.decision_all;
+                        break :blk null;
+                    },
+                    else => null,
+                };
+                if (choice) |value| {
+                    _ = job.decide(value, self.decision_all);
+                    return;
+                }
+                if (ev.bytes[0] == ' ') return;
+            }
+        };
         if (commands.resolve(ev)) |id| {
             // Availability admits only job quit and Ctrl+G in this scope.
             _ = try self.invoke(id, emulator);
@@ -1059,4 +1102,68 @@ test "Path insertion workflow preserves queue and Pane focus on allocation and b
     try std.testing.expectEqualStrings("TerminalInputBackpressure", state.view().modal.notice);
     try std.testing.expectEqualStrings("existing", emulator.queued());
     try std.testing.expectEqual(.left, state.view().focus);
+}
+
+test "waiting file decisions block every terminal route through retained result dismissal" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    try tmp.dir.createDir(io, "dest", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "source", .data = "source" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "dest/source", .data = "keep" });
+    var panes: TestPanes = .{};
+    try panes.init(path);
+    defer panes.deinit();
+    const state = try State.create(io, std.testing.allocator, panes.panes);
+    defer state.destroy();
+    const emulator = try Emulator.create(io, std.testing.allocator, 80, 8);
+    defer emulator.destroy();
+    for (panes.panes) |pane| try pane.refresh();
+    try settle(state);
+    state.activePane().move(.last, false);
+    try state.openAction(.copy);
+    try state.submit("dest");
+    for (0..5000) |_| {
+        _ = try state.poll();
+        if (state.view().operation.?.status() == .waiting) break;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(state.view().operation.?.status() == .waiting);
+    try std.testing.expect(!state.view().decision_all);
+    state.terminalEnded();
+    const routes = [_]commands.Id{ .toggle_terminal, .visibility_terminal, .focus_terminal, .zoom_terminal, .insert_reference, .edit_file, .history_up, .grow_terminal };
+    for (routes) |id| try std.testing.expect(!try state.invoke(id, emulator));
+    state.toggleTerminal();
+    try std.testing.expectEqual(.left, state.view().focus);
+    const prompt = state.view().operation.?.status().waiting.prompt;
+    for (0..3) |_| {
+        _ = state.view();
+        _ = try state.poll();
+        try std.testing.expectEqual(prompt.id, state.view().operation.?.status().waiting.prompt.id);
+    }
+    try panes.expectScans(1);
+    var decoder: input.Decoder = .{};
+    const space = decoder.feed(' ').?;
+    try state.modalEvent(emulator, &space);
+    try std.testing.expect(state.view().decision_all);
+    try std.testing.expect(state.decideOperation(.skip, true));
+    try settle(state);
+    try panes.expectScans(2);
+    try std.testing.expectEqual(@as(usize, 1), state.view().operation.?.status().progress().skipped);
+    for (routes) |id| try std.testing.expect(!try state.invoke(id, emulator));
+    state.dismiss();
+    try std.testing.expect(state.available(.visibility_terminal));
+    try state.openAction(.copy);
+    try state.submit("dest");
+    for (0..5000) |_| {
+        _ = try state.poll();
+        if (state.view().operation.?.status() == .waiting) break;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(state.view().operation.?.status() == .waiting);
+    try std.testing.expect(!state.view().decision_all);
+    try std.testing.expect(state.decideOperation(.skip, false));
+    try settle(state);
 }
