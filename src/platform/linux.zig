@@ -47,8 +47,6 @@ pub fn writeAll(fd: c_int, bytes: []const u8) !void {
 
 pub const Console = struct {
     const fallback_size: Size = .{ .cols = 80, .rows = 24 };
-    pub const max_columns = 1000;
-    pub const max_rows = 500;
     saved: c.termios,
     old_signals: [signals.len]std.posix.Sigaction,
     const signals = [_]std.posix.SIG{ .TERM, .HUP, .INT, .PIPE };
@@ -88,8 +86,7 @@ pub const Console = struct {
     pub fn size() Size {
         var ws: c.winsize = std.mem.zeroes(c.winsize);
         if (c.ioctl(1, c.TIOCGWINSZ, &ws) != 0) return fallback_size;
-        // Bound allocations even with nonsensical terminal geometry.
-        return .{ .cols = std.math.clamp(ws.ws_col, 1, max_columns), .rows = std.math.clamp(ws.ws_row, 1, max_rows) };
+        return .{ .cols = ws.ws_col, .rows = ws.ws_row };
     }
 };
 

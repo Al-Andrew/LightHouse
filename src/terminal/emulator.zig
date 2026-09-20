@@ -16,6 +16,7 @@ pub const Emulator = struct {
     pending: std.ArrayList(u8) = .empty,
     pending_offset: usize = 0,
     failed: bool = false,
+    paste: enum { inactive, plain, bracketed } = .inactive,
     const max_pending_bytes = 1024 * 1024;
     // Reserve half the queue for encoded keys, paste framing, and VT replies.
     const input_high_water_bytes = max_pending_bytes / 2;
@@ -75,7 +76,7 @@ pub const Emulator = struct {
     pub fn resize(self: *Emulator, cols: u16, rows: u16) !void {
         try self.terminal.resize(self.allocator, .{ .cols = cols, .rows = rows });
     }
-    pub fn queue(self: *Emulator, bytes: []const u8) !void {
+    fn queue(self: *Emulator, bytes: []const u8) !void {
         if (self.pending_offset > 0) {
             const remaining = self.pending.items.len - self.pending_offset;
             std.mem.copyForwards(u8, self.pending.items[0..remaining], self.pending.items[self.pending_offset..]);
@@ -99,21 +100,40 @@ pub const Emulator = struct {
             self.pending_offset = 0;
         }
     }
-    pub fn bracketedPaste(self: *const Emulator) bool {
-        return self.terminal.modes.get(.bracketed_paste);
+    /// Encodes terminal input; application focus policy belongs to the caller.
+    /// Capture paste mode once so a child mode change cannot unbalance framing.
+    pub fn event(self: *Emulator, ev: *const input.Event) !void {
+        switch (ev.kind) {
+            .paste_start => {
+                self.paste = if (self.terminal.modes.get(.bracketed_paste)) .bracketed else .plain;
+                self.bottom();
+                if (self.paste == .bracketed) try self.queue(input.paste_start);
+            },
+            .paste_byte => if (self.paste != .inactive) try self.queue(ev.text()),
+            .paste_end => {
+                if (self.paste == .bracketed) try self.queue(input.paste_end);
+                self.paste = .inactive;
+            },
+            .key => try self.key(ev),
+        }
     }
-    pub fn scroll(self: *Emulator, delta: isize) void {
+
+    pub fn scrollPage(self: *Emulator, direction: enum { up, down }) void {
+        const rows: isize = self.terminal.rows;
+        self.scroll(if (direction == .up) -rows else rows);
+    }
+    fn scroll(self: *Emulator, delta: isize) void {
         self.terminal.scrollViewport(.{ .delta = delta });
     }
-    pub fn bottom(self: *Emulator) void {
+    fn bottom(self: *Emulator) void {
         self.terminal.scrollViewport(.bottom);
     }
 
-    pub fn key(self: *Emulator, event: *const input.Event) !void {
+    fn key(self: *Emulator, ev: *const input.Event) !void {
         self.bottom();
-        var key_event: vt.input.KeyEvent = .{
-            .mods = .{ .shift = event.shift, .alt = event.alt, .ctrl = event.ctrl },
-            .key = switch (event.key) {
+        var key_ev: vt.input.KeyEvent = .{
+            .mods = .{ .shift = ev.shift, .alt = ev.alt, .ctrl = ev.ctrl },
+            .key = switch (ev.key) {
                 .up => .arrow_up,
                 .down => .arrow_down,
                 .left => .arrow_left,
@@ -122,21 +142,21 @@ pub const Emulator = struct {
                 inline else => |tag| @field(vt.input.Key, @tagName(tag)),
             },
         };
-        if (event.key == .unknown) return;
-        if (event.key == .text) {
-            const text = if (event.alt and event.len > 1 and event.bytes[0] == 0x1b) event.text()[1..] else event.text();
+        if (ev.key == .unknown) return;
+        if (ev.key == .text) {
+            const text = if (ev.alt and ev.len > 1 and ev.bytes[0] == 0x1b) ev.text()[1..] else ev.text();
             if (text.len == 1 and text[0] >= 1 and text[0] <= 26) {
-                key_event.mods.ctrl = true;
-                key_event.unshifted_codepoint = 'a' + text[0] - 1;
-                key_event.key = @enumFromInt(@intFromEnum(vt.input.Key.key_a) + text[0] - 1);
+                key_ev.mods.ctrl = true;
+                key_ev.unshifted_codepoint = 'a' + text[0] - 1;
+                key_ev.key = @enumFromInt(@intFromEnum(vt.input.Key.key_a) + text[0] - 1);
             } else {
-                key_event.utf8 = text;
-                key_event.unshifted_codepoint = std.unicode.utf8Decode(text) catch 0;
+                key_ev.utf8 = text;
+                key_ev.unshifted_codepoint = std.unicode.utf8Decode(text) catch 0;
             }
         }
         var storage: [encoded_key_bytes]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&storage);
-        try vt.input.encodeKey(&writer, key_event, .fromTerminal(&self.terminal));
+        try vt.input.encodeKey(&writer, key_ev, .fromTerminal(&self.terminal));
         try self.queue(writer.buffered());
     }
 
@@ -225,10 +245,82 @@ test "arrow encoding follows the child terminal mode" {
     const emulator = try Emulator.create(std.testing.io, std.testing.allocator, 20, 4);
     defer emulator.destroy();
     const event: input.Event = .{ .key = .up };
-    try emulator.key(&event);
+    try emulator.event(&event);
     try std.testing.expectEqualStrings("\x1b[A", emulator.queued());
     emulator.consumed(emulator.queued().len);
-    try emulator.feed("\x1b[?1h");
-    try emulator.key(&event);
+    try emulator.feed("\x1b[?1049h\x1b[?1h");
+    try emulator.event(&event);
     try std.testing.expectEqualStrings("\x1bOA", emulator.queued());
+}
+
+test "fragmented paste captures mode at start and preserves control bytes" {
+    const emulator = try Emulator.create(std.testing.io, std.testing.allocator, 20, 4);
+    defer emulator.destroy();
+    for ([_]bool{ false, true }) |bracketed| {
+        try emulator.feed(if (bracketed) "\x1b[?2004h" else "\x1b[?2004l");
+        var decoder: input.Decoder = .{};
+        for ("\x1b[200~q\x07") |byte| if (decoder.feed(byte)) |ev| try emulator.event(&ev);
+        // Child output can arrive between any two host input fragments.
+        try emulator.feed(if (bracketed) "\x1b[?2004l" else "\x1b[?2004h");
+        for ("\n界\x1b[201~") |byte| if (decoder.feed(byte)) |ev| try emulator.event(&ev);
+        try std.testing.expectEqualStrings(if (bracketed) "\x1b[200~q\x07\n界\x1b[201~" else "q\x07\n界", emulator.queued());
+        emulator.consumed(emulator.queued().len);
+        // Orphan payload/end events do not inject data or extra framing.
+        var orphan: input.Event = .{ .kind = .paste_byte, .len = 1 };
+        orphan.bytes[0] = 'x';
+        try emulator.event(&orphan);
+        try emulator.event(&.{ .kind = .paste_end });
+        try std.testing.expectEqualStrings("", emulator.queued());
+    }
+    var decoder: input.Decoder = .{};
+    for ("q\x03\x07") |byte| if (decoder.feed(byte)) |ev| try emulator.event(&ev);
+    try std.testing.expectEqualStrings("q\x03\x07", emulator.queued());
+}
+
+test "terminal input backpressure leaves room for framing and VT replies" {
+    const emulator = try Emulator.create(std.testing.io, std.testing.allocator, 20, 4);
+    defer emulator.destroy();
+    try emulator.feed("\x1b[?2004h");
+    try emulator.event(&.{ .kind = .paste_start });
+    var byte: input.Event = .{ .kind = .paste_byte, .len = 1 };
+    byte.bytes[0] = 'x';
+    while (emulator.acceptsInput()) try emulator.event(&byte);
+    const payload_length = emulator.queued().len;
+    try std.testing.expectEqual(Emulator.input_high_water_bytes, payload_length);
+    try emulator.feed("\x1b[6n");
+    try emulator.event(&.{ .kind = .paste_end });
+    try std.testing.expectEqualStrings("\x1b[1;1R\x1b[201~", emulator.queued()[payload_length..]);
+    emulator.consumed(100);
+    try emulator.event(&.{ .key = .enter });
+    try std.testing.expect(emulator.acceptsInput());
+    const overflow = try std.testing.allocator.alloc(u8, Emulator.max_pending_bytes);
+    defer std.testing.allocator.free(overflow);
+    try std.testing.expectError(error.TerminalInputBackpressure, emulator.queue(overflow));
+}
+
+test "page scrolling uses resized height and input returns to the bottom" {
+    const emulator = try Emulator.create(std.testing.io, std.testing.allocator, 20, 4);
+    defer emulator.destroy();
+    try emulator.feed("0\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8\r\n9");
+    try emulator.resize(20, 3);
+    var frame = ui.Frame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.begin(20, 3);
+    const rect: ui.Rect = .{ .x = 0, .y = 0, .width = 20, .height = 3 };
+    try emulator.paint(frame.painter(rect), true);
+    try std.testing.expectEqualStrings("7", frame.cells[0].text);
+    emulator.scrollPage(.up);
+    try emulator.paint(frame.painter(rect), true);
+    try std.testing.expectEqualStrings("4", frame.cells[0].text);
+    emulator.scrollPage(.down);
+    try emulator.paint(frame.painter(rect), true);
+    try std.testing.expectEqualStrings("7", frame.cells[0].text);
+    emulator.scrollPage(.up);
+    try emulator.event(&.{ .key = .enter });
+    try emulator.paint(frame.painter(rect), true);
+    try std.testing.expectEqualStrings("7", frame.cells[0].text);
+    emulator.scrollPage(.up);
+    try emulator.event(&.{ .kind = .paste_start });
+    try emulator.paint(frame.painter(rect), true);
+    try std.testing.expectEqualStrings("7", frame.cells[0].text);
 }
