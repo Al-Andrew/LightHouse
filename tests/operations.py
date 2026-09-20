@@ -2,6 +2,7 @@
 """File actions through the real TUI, exclusively in disposable directories."""
 
 import os
+import signal
 import tempfile
 from pathlib import Path
 
@@ -90,6 +91,10 @@ def file_actions():
             app.expect("Not found")
             app.send("\x07\n")
             app.pump(0.1)
+            app.expect("Not found")
+            os.kill(app.shell_pid, signal.SIGHUP)
+            app.pump(0.3)
+            assert app.proc.poll() is None
             app.expect("Not found")
             app.send("\r")
             # Refresh both panes after mkdir when they show the same directory.

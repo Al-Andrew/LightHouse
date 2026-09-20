@@ -639,6 +639,9 @@ fn checkCanceledWorkflow(shutdown: bool) !void {
     try std.testing.expectEqual(@as(usize, 2), state.view().modal.confirm_delete.request().sources.len);
     try state.confirmDelete();
     try gate.wait();
+    state.terminalEnded();
+    try std.testing.expect(!state.view().quit);
+    try std.testing.expect(state.view().operation.?.status() == .running);
     if (shutdown) {
         state.destroy();
         destroyed = true;

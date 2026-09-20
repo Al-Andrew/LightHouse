@@ -9,7 +9,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from support import App, wait, go
+from support import App, wait, go, in_pane
 
 
 def shell_and_resize():
@@ -164,8 +164,35 @@ def terminal_lifetime():
             app.send("\r")
             assert app.proc.poll() is None
             go(app, root)
+            in_pane(app, 0, "output")
             app.send("t")
             app.expect("LH_PROMPT>")
+            app.send("\x07q")
+            app.finished()
+        finally:
+            app.close()
+
+
+def relative_shell_and_queued_exit():
+    with tempfile.TemporaryDirectory(prefix="lh-shell-") as directory:
+        root = Path(directory)
+        (root / "shell").symlink_to("/bin/sh")
+        (root / "sub").mkdir()
+        app = App(shell="./shell", cwd=root)
+        try:
+            app.start()
+            go(app, root / "sub")
+            app.expect("0 items")
+            app.send("\x07sleep 0.1; exit\r")
+            # Queue input while the exiting shell cannot consume it. It must
+            # never reach the replacement, nor prevent host input after EOF.
+            app.send("\x1b[200~" + "OLD_INPUT" * 1000 + "\x1b[201~")
+            wait(app, lambda: not Path(f"/proc/{app.shell_pid}").exists(), "old child not reaped")
+            app.send("\n")
+            app.expect("LH_PROMPT>")
+            assert "OLD_INPUT" not in app.screen.text()
+            app.send("printf '<%s>\\n' CLEAN\r")
+            app.expect("<CLEAN>")
             app.send("\x07q")
             app.finished()
         finally:
@@ -336,6 +363,7 @@ if __name__ == "__main__":
         geometry_and_fragmented_paste,
         shell_exit,
         terminal_lifetime,
+        relative_shell_and_queued_exit,
         signal_under_load,
         failed_start,
         stubborn_foreground,
