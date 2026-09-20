@@ -443,37 +443,27 @@ const Implementation = struct {
             self.clearError();
             if (job.result) |snapshot| {
                 const same_path = directory.Location.eql(self.provider.location(self.path()), self.provider.location(snapshot.locator));
-                const old_name = if (self.focused()) |entry| entry.name else if (self.cursor == 0) "." else "..";
-                const wanted = job.hint orelse if (same_path) old_name else ".";
-                // Preserve marked entries by exact name, independent of sorting.
-                var selected: std.StringHashMap(void) = .init(self.allocator);
-                defer selected.deinit();
-                if (same_path) for (self.entries(), self.marks) |entry, marked| {
-                    if (marked) try selected.put(entry.name, {});
-                };
+                // Keep only previously visible names until matching the refreshed
+                // snapshot succeeds. Copy entries from the new snapshot so their
+                // names remain valid when the old snapshot is released.
                 const reference_offset: usize = 1 + @as(usize, @intFromBool(self.provider.show_root_parent or self.provider.has_parent(self.provider.context, snapshot.locator)));
-                const next_marks = try self.allocator.alloc(bool, snapshot.entries.len);
-                var next_cursor: usize = if (same_path) @min(self.cursor, (snapshot.entries.len + reference_offset) -| 1) else 0;
-                self.marked_count = 0;
-                for (snapshot.entries, 0..) |entry, i| {
-                    next_marks[i] = selected.contains(entry.name);
-                    if (next_marks[i]) self.marked_count += 1;
-                    if (std.mem.eql(u8, entry.name, wanted)) next_cursor = i + reference_offset;
-                }
+                const filtered = retained: {
+                    const entries_ = if (same_path and self.filter_query.len > 0) try self.retainVisible(snapshot.entries) else null;
+                    errdefer if (entries_) |items| self.allocator.free(items);
+                    try self.reconcile(entries_ orelse snapshot.entries, same_path, job.hint, reference_offset);
+                    break :retained entries_;
+                };
                 if (self.filter_job) |filter_job| filter_job.canceled.store(true, .release);
-                if (self.filter_entries) |filtered| self.allocator.free(filtered);
-                self.filter_entries = null;
+                if (self.filter_entries) |old| self.allocator.free(old);
+                self.filter_entries = filtered;
                 if (!same_path) {
                     self.filter_active = false;
                     self.allocator.free(self.filter_query);
                     self.filter_query = &.{};
                 }
                 if (self.snapshot) |*old| old.deinit();
-                self.allocator.free(self.marks);
-                self.marks = next_marks;
                 self.snapshot = snapshot;
                 job.result = null;
-                self.cursor = next_cursor;
                 if (!same_path) self.scroll = 0;
                 self.ensureVisible();
                 try self.requestFilter();
@@ -542,29 +532,45 @@ const Implementation = struct {
     fn publishFilter(self: *Implementation, next: []const directory.Entry, filtered: bool) !void {
         const owned = if (filtered) try self.allocator.dupe(directory.Entry, next) else null;
         errdefer if (owned) |items| self.allocator.free(items);
-        const marks = try self.allocator.alloc(bool, next.len);
-        var selected: std.StringHashMap(void) = .init(self.allocator);
-        defer selected.deinit();
-        errdefer self.allocator.free(marks);
-        for (self.entries(), self.marks) |entry, marked| if (marked) {
-            try selected.put(entry.name, {});
-        };
-        const wanted = if (self.focused()) |entry| entry.name else null;
-        var cursor = self.cursor;
-        self.marked_count = 0;
-        for (next, 0..) |entry, i| {
-            marks[i] = selected.contains(entry.name);
-            if (marks[i]) self.marked_count += 1;
-            if (wanted) |name| if (std.mem.eql(u8, name, entry.name)) {
-                cursor = i + self.referenceRowCount();
-            };
-        }
+        try self.reconcile(next, true, null, self.referenceRowCount());
         if (self.filter_entries) |items| self.allocator.free(items);
         self.filter_entries = owned;
+        self.ensureVisible();
+    }
+    fn retainVisible(self: *Implementation, next: []const directory.Entry) ![]directory.Entry {
+        var visible: std.StringHashMap(void) = .init(self.allocator);
+        defer visible.deinit();
+        for (self.entries()) |entry| try visible.put(entry.name, {});
+        var retained: std.ArrayList(directory.Entry) = .empty;
+        defer retained.deinit(self.allocator);
+        for (next) |entry| if (visible.contains(entry.name)) {
+            try retained.append(self.allocator, entry);
+        };
+        return retained.toOwnedSlice(self.allocator);
+    }
+    /// Reconcile Cursor and Marks by exact name before releasing the old listing.
+    fn reconcile(self: *Implementation, next: []const directory.Entry, same_path: bool, hint: ?[]const u8, reference_offset: usize) !void {
+        const marks = try self.allocator.alloc(bool, next.len);
+        errdefer self.allocator.free(marks);
+        var selected: std.StringHashMap(void) = .init(self.allocator);
+        defer selected.deinit();
+        if (same_path) for (self.entries(), self.marks) |entry, marked| {
+            if (marked) try selected.put(entry.name, {});
+        };
+        const wanted = hint orelse if (same_path) (if (self.focused()) |entry| entry.name else null) else null;
+        var cursor = if (same_path) self.cursor else 0;
+        var marked_count: usize = 0;
+        for (next, 0..) |entry, i| {
+            marks[i] = selected.contains(entry.name);
+            if (marks[i]) marked_count += 1;
+            if (wanted) |name| if (std.mem.eql(u8, name, entry.name)) {
+                cursor = i + reference_offset;
+            };
+        }
         self.allocator.free(self.marks);
         self.marks = marks;
-        self.cursor = cursor;
-        self.ensureVisible();
+        self.marked_count = marked_count;
+        self.cursor = @min(cursor, (next.len + reference_offset) -| 1);
     }
     fn refresh(self: *Implementation) !void {
         try self.request(self.path(), null);
@@ -1263,6 +1269,26 @@ test "missing and failing fzf retain usable listings and closing recovers browsi
         try std.testing.expect(!pane.view().filter.active);
         try expectSources(pane, &.{"alpha"});
     }
+}
+
+test "filter before the initial scan cannot expose unmatched sources on failure" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "beta", .data = "" });
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buffer);
+    const pane = try Pane.create(io, std.testing.allocator, buffer[0..len], .{ .filter_executable = "/bin/sh" });
+    defer pane.destroy();
+    try pane.setFilter("alpha");
+    try pane.refresh();
+    try std.testing.expectError(error.FzfFailed, waitForFilter(pane));
+    try std.testing.expectEqualStrings("alpha", pane.view().filter.query);
+    try std.testing.expectEqual(@as(usize, 0), pane.view().entries.len);
+    pane.move(.last, false);
+    try expectSources(pane, &.{});
+    try pane.closeFilter();
+    try std.testing.expectEqualStrings("beta", pane.view().entries[0].name);
 }
 
 test "superseded filter results never replace the latest query or listing" {

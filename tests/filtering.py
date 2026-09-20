@@ -118,7 +118,100 @@ def cancellation_and_failures():
             app.close()
 
 
+def refresh_keeps_filtered_sources():
+    fzf = shutil.which("fzf")
+    assert fzf, "install fzf to run filtering tests"
+    with tempfile.TemporaryDirectory(prefix="lh-filter-refresh-") as directory:
+        root = Path(directory)
+        listing = root / "listing"
+        listing.mkdir()
+        for name in ("alpha", "beta"):
+            (listing / name).touch()
+        gate, started, fail = root / "gate", root / "started", root / "fail"
+        executable = root / "fzf"
+        executable.write_text(
+            "#!/bin/sh\n"
+            f'if [ -e "{gate}" ]; then\n'
+            f'  echo started > "{started}"\n'
+            f'  while [ -e "{gate}" ]; do /bin/sleep 0.02; done\n'
+            "fi\n"
+            f'if [ -e "{fail}" ]; then exit 2; fi\n'
+            f'exec "{fzf}" "$@"\n'
+        )
+        executable.chmod(0o755)
+        app = App(cols=160, rows=30, cwd=listing, env_overrides={"PATH": str(root)})
+        try:
+            app.start()
+            in_pane(app, 0, "2 items")
+            app.send("/alpha\r")
+            in_pane(app, 0, "1 items")
+            for failing in (False, True):
+                gate.touch()
+                if failing:
+                    fail.touch()
+                else:
+                    (listing / "alphabet").touch()
+                app.send("\x12")
+                wait(app, started.exists, "refresh fzf did not start")
+                in_pane(app, 0, "Filtering...")
+                assert "beta" not in pane_text(app, 0), pane_text(app, 0)
+                # End must still select a matching source while fzf is pending.
+                app.send("\x1b[F\x1b[19~")
+                app.expect("Permanently delete 1 item(s)?")
+                app.expect(str(listing / ("alphabet" if failing else "alpha")))
+                assert str(listing / "beta") not in app.screen.text()
+                app.send("\x1b")
+                app.pump(0.1)
+                gate.unlink()
+                if failing:
+                    in_pane(app, 0, "fzf failed")
+                    assert "beta" not in pane_text(app, 0)
+                    # Marks also remain confined to the retained filtered listing.
+                    app.send("\x1b[H\x1b[1;2F\x1b[19~")
+                    app.expect("Permanently delete 2 item(s)?")
+                    assert str(listing / "beta") not in app.screen.text()
+                    app.send("\x1b")
+                    app.pump(0.1)
+                else:
+                    in_pane(app, 0, "2 items")
+                    in_pane(app, 0, "alphabet")
+                started.unlink()
+            fail.unlink()
+            app.send("/\x15absent\r")
+            in_pane(app, 0, "No matches")
+            (listing / ".beta").touch()
+            # An empty filtered listing must remain empty through every kind of
+            # refresh, including failures and changes to sorting/hidden entries.
+            for trigger in ("\x12", "r", "s", "."):
+                gate.touch()
+                fail.touch()
+                app.send(trigger)
+                wait(app, started.exists, "listing-change fzf did not start")
+                in_pane(app, 0, "Filtering...")
+                for pending in (True, False):
+                    if not pending:
+                        gate.unlink()
+                        in_pane(app, 0, "fzf failed")
+                    assert "beta" not in pane_text(app, 0)
+                    assert "alpha" not in pane_text(app, 0)
+                    app.send("\x1b[F\x1b[19~")
+                    app.pump(0.1)
+                    assert "Permanently delete" not in app.screen.text()
+                started.unlink()
+                fail.unlink()
+            app.send("\x1b")
+            in_pane(app, 0, "4 items")
+            app.send("q")
+            app.finished()
+        finally:
+            app.close()
+
+
 if __name__ == "__main__":
-    for test in (live_filter, cancellation_and_failures):
+    for test in (
+        live_filter,
+        cancellation_and_failures,
+        refresh_keeps_filtered_sources,
+    ):
         test()
         print(f"PASS {test.__name__}")
