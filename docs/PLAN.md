@@ -16,10 +16,9 @@ Application widgets live under `src/app/widgets/`; see [UI.md](UI.md).
 Signals/slots and the plugin portion of milestone 2, mouse interaction, and the
 remaining milestone 3 work are pending.
 
-The next feature designs are recorded in [FEATURE-DESIGN.md](FEATURE-DESIGN.md):
-a configured F4 editor, Provider-defined Ctrl+F Path insertion, independent
-terminal visibility/session lifetime, and copy/move conflict and error prompts.
-These designs are agreed; the features are not implemented yet.
+The agreed feature designs are recorded in [FEATURE-DESIGN.md](FEATURE-DESIGN.md).
+Delivery status for terminal lifetime, Path insertion, external editing, and
+copy/move decisions is recorded in the issue-specific sections below.
 
 Milestone 1 provides a pinned Ghostty dependency, a handmade cell renderer,
 persistent shell/PTY, focus switching, resizable and zoomable terminal area,
