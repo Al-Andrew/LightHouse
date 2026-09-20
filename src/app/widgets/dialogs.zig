@@ -325,7 +325,7 @@ fn paintProblem(painter: ui.Painter, job: *const operations.Job) !void {
     const spacious = content.rect.height >= 12;
     var row: usize = 0;
     if (content.rect.height >= 2) {
-        content.label(0, row, request.kind.title(), theme.problem_heading);
+        paintProblemTitle(contentRow(content, row), request.kind, prompt);
         row += 1;
     }
     if (content.rect.height >= 7) {
@@ -345,6 +345,24 @@ fn paintProblem(painter: ui.Painter, job: *const operations.Job) !void {
     try paintControls(footer, layout.controls);
     const blocked_y = controlRows(layout.inside.rect.width, layout.controls);
     footer.label(0, blocked_y, "Terminal input blocked", theme.problem_dialog);
+}
+
+fn paintProblemTitle(painter: ui.Painter, kind: operations.Kind, prompt: operations.Prompt) void {
+    const title = kind.title();
+    painter.label(0, 0, title, theme.problem_heading);
+    if (prompt.err == null) return;
+    // Share the title row so short dialogs retain both paths and all controls.
+    const stage = switch (prompt.stage) {
+        .inspect => "Inspection",
+        .transfer => "Transfer",
+        .traversal => "Enumeration",
+        .file_finalization => "File finalization",
+        .publication => "Publication",
+        .directory_finalization => "Folder finalization",
+        .move_cleanup => "Source cleanup",
+    };
+    painter.label(title.len, 0, " | ", theme.problem_heading);
+    painter.label(title.len + 3, 0, stage, theme.problem_heading);
 }
 
 fn paintProblemPath(content: ui.Painter, row: usize, label: []const u8, path: []const u8, inline_value: bool) !usize {
@@ -446,5 +464,68 @@ test "problem dialogs label paths highlight policy and underline valid decisions
             }
             try std.testing.expectEqualStrings("OSC", underlined.items);
         }
+    }
+}
+
+test "error dialogs retain the failed stage in constrained layouts" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    try tmp.dir.createDir(io, "dest", .default_dir);
+    for ([_]operations.Kind{ .copy, .move }) |kind| {
+        const job = try operations.Job.create(io, std.testing.allocator, kind, base, &.{"missing-界"}, "dest");
+        defer job.destroy();
+        try job.start();
+        for (0..5000) |_| {
+            if (job.status() == .waiting) break;
+            try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+        }
+        try std.testing.expect(job.status() == .waiting);
+        try std.testing.expectEqual(.inspect, job.status().waiting.prompt.stage);
+        var frame = ui.Frame.init(std.testing.allocator);
+        defer frame.deinit();
+        for ([_]Size{ .{ .width = 100, .height = 30 }, .{ .width = 40, .height = 16 }, .{ .width = 40, .height = 12 } }) |size| {
+            try frame.begin(size.width, size.height);
+            const painter = frame.painter(.{ .x = 0, .y = 0, .width = size.width, .height = size.height });
+            try paintOperation(painter, job);
+            paintDecisionPolicy(painter, job, false);
+            const stage_row = renderedRow(&frame, "Inspection") orelse return error.MissingFailedStage;
+            const error_row = renderedRow(&frame, "Not found") orelse return error.MissingError;
+            const source_row = renderedRow(&frame, "Source path") orelse return error.MissingSource;
+            const destination_row = renderedRow(&frame, "Destination path") orelse return error.MissingDestination;
+            const policy_row = renderedRow(&frame, "Skip all errors of this kind") orelse return error.MissingPolicy;
+            const actions_row = renderedRow(&frame, "Retry") orelse return error.MissingRetry;
+            try std.testing.expect(stage_row < error_row and error_row < source_row and source_row < destination_row and destination_row < policy_row and policy_row < actions_row);
+            try std.testing.expect(renderedRow(&frame, kind.title()) != null);
+            try std.testing.expect(renderedRow(&frame, "Terminal input blocked") != null);
+        }
+    }
+}
+
+test "error titles keep every failed stage readable at narrow widths" {
+    const cases = .{
+        .{ operations.Stage.inspect, "Inspection" },
+        .{ operations.Stage.transfer, "Transfer" },
+        .{ operations.Stage.traversal, "Enumeration" },
+        .{ operations.Stage.file_finalization, "File finalization" },
+        .{ operations.Stage.publication, "Publication" },
+        .{ operations.Stage.directory_finalization, "Folder finalization" },
+        .{ operations.Stage.move_cleanup, "Source cleanup" },
+    };
+    var frame = ui.Frame.init(std.testing.allocator);
+    defer frame.deinit();
+    inline for (cases) |case| {
+        // The longest operation title and stage must fit the narrow body.
+        try frame.begin(36, 1);
+        paintProblemTitle(frame.painter(.{ .x = 0, .y = 0, .width = 36, .height = 1 }), .move, .{
+            .id = 1,
+            .source = "/source",
+            .destination = "/destination",
+            .stage = case[0],
+            .err = error.PermissionDenied,
+        });
+        try std.testing.expect(renderedRow(&frame, "Move / Rename | " ++ case[1]) != null);
     }
 }

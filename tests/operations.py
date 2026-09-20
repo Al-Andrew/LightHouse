@@ -397,6 +397,8 @@ def problem_dialogs():
                             "Terminal input blocked",
                         ):
                             app.expect(text)
+                        if problem == "error":
+                            app.expect("Inspection")
                         app.send(" ")
                         app.expect("[x] " + policy)
                         app.send(" ")
