@@ -58,8 +58,8 @@ the shell is focused, where function keys pass through to the child.
 | Ctrl+F | Insert the Cursor entry’s Provider reference into the shell without Enter |
 | Ctrl+J | Hide/show the shell; start a fresh session if absent |
 | Up / Down / PageUp / PageDown / Home / End | Move the file cursor |
-| Enter / Right | Enter a directory or directory symlink |
-| Backspace / Left | Go to the parent and focus the directory just left |
+| Enter / Right / Ctrl+PageDown | Enter a directory or directory symlink |
+| Backspace / Left / Ctrl+PageUp | Go to the parent and focus the directory just left |
 | Tab | Switch file pane |
 | Space / Insert | Toggle a mark / toggle a mark and advance |
 | Shift+Up / Shift+Down | Toggle the current mark and move |

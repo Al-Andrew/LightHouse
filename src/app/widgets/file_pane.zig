@@ -39,11 +39,13 @@ const Binding = struct {
     text: []const u8,
     action: Action,
     shift: enum { ignore, mark, bubble } = .ignore,
+    ctrl: ?bool = null,
 
     fn matches(self: Binding, ev: *const toolkit.Event) bool {
-        // Alt/Ctrl and extra Shift historically remain accepted, including on
-        // text bindings. Only shifted page keys are excluded from this scope.
+        // Page keys distinguish Ctrl navigation from ordinary movement;
+        // shifted pages continue to bubble to terminal history.
         return ev.key == self.key and !(ev.shift and self.shift == .bubble) and
+            (if (self.ctrl) |ctrl| ev.ctrl == ctrl else true) and
             (if (self.byte) |byte| ev.len == 1 and ev.bytes[0] == byte else true);
     }
 };
@@ -54,16 +56,18 @@ const descriptions = [_]Description{
         .{ .key = .down, .text = "Down", .action = .{ .move = .{ .by = 1 } }, .shift = .mark },
         .{ .key = .home, .text = "Home", .action = .{ .move = .first }, .shift = .mark },
         .{ .key = .end, .text = "End", .action = .{ .move = .last }, .shift = .mark },
-        .{ .key = .page_up, .text = "PgUp", .action = .{ .move = .page_up }, .shift = .bubble },
-        .{ .key = .page_down, .text = "PgDn", .action = .{ .move = .page_down }, .shift = .bubble },
+        .{ .key = .page_up, .text = "PgUp", .action = .{ .move = .page_up }, .shift = .bubble, .ctrl = false },
+        .{ .key = .page_down, .text = "PgDn", .action = .{ .move = .page_down }, .shift = .bubble, .ctrl = false },
     } },
     .{ .help = "Enter directory", .bindings = &.{
         .{ .key = .enter, .text = "Enter", .action = .enter },
         .{ .key = .right, .text = "Right", .action = .enter },
+        .{ .key = .page_down, .text = "Ctrl+PgDn", .action = .enter, .shift = .bubble, .ctrl = true },
     } },
     .{ .help = "Parent directory", .bindings = &.{
         .{ .key = .backspace, .text = "Backspace", .action = .parent },
         .{ .key = .left, .text = "Left", .action = .parent },
+        .{ .key = .page_up, .text = "Ctrl+PgUp", .action = .parent, .shift = .bubble, .ctrl = true },
     } },
     .{ .help = "Toggle mark", .bindings = &.{.{ .byte = ' ', .text = "Space", .action = .mark }} },
     .{ .help = "Mark and advance", .bindings = &.{.{ .key = .insert, .text = "Insert", .action = .mark_advance }} },

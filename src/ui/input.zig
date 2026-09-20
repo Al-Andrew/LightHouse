@@ -205,3 +205,14 @@ test "Alt Unicode and CSI survive delayed reads" {
     _ = decoder.feed('2');
     try std.testing.expect(decoder.feed('A').?.shift);
 }
+
+test "modified page keys retain navigation and history modifiers" {
+    for ([_][]const u8{ "\x1b[5;5~", "\x1b[6;5~", "\x1b[5;2~", "\x1b[6~" }, [_]Key{ .page_up, .page_down, .page_up, .page_down }, [_]bool{ true, true, false, false }, [_]bool{ false, false, true, false }) |sequence, key, ctrl, shift| {
+        var decoder: Decoder = .{};
+        var event: ?Event = null;
+        for (sequence) |byte| event = decoder.feed(byte);
+        try std.testing.expectEqual(key, event.?.key);
+        try std.testing.expectEqual(ctrl, event.?.ctrl);
+        try std.testing.expectEqual(shift, event.?.shift);
+    }
+}
