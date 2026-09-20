@@ -34,7 +34,7 @@ pub const View = struct {
         self.terminal = try self.tree.create(root, Terminal, .{ .emulator = emulator });
         self.terminal.setFocusable(true);
         self.key_bar = try self.tree.create(root, KeyBar, .{ .state = state });
-        self.modal = try self.tree.create(root, Modal, .{ .state = state });
+        self.modal = try self.tree.create(root, Modal, .{ .state = state, .emulator = emulator });
         self.modal.setFocusable(true);
         try self.sync();
         return self;
@@ -116,7 +116,7 @@ test "retained app view traps editor paste and restores the active pane after di
     const extra_rect: ui.Rect = .{ .x = 3, .y = 2, .width = 1, .height = 1 };
     extra.setRect(extra_rect);
     view.modal.destroy();
-    view.modal = try view.tree.create(view.tree.root(), Modal, .{ .state = state });
+    view.modal = try view.tree.create(view.tree.root(), Modal, .{ .state = state, .emulator = emulator });
     view.modal.setFocusable(true);
     try view.resize(.{ .width = 80, .height = 24 });
     try std.testing.expectEqual(extra_rect, extra.rect());
@@ -255,4 +255,235 @@ test "view routes Ctrl+G keys to focus policy and preserves Ctrl+G inside termin
     try std.testing.expect(view.panes[0].focused());
     try std.testing.expect(!state.view().quit);
     try std.testing.expectEqualStrings("q\x07\n\x03", emulator.queued());
+}
+
+test "command presentation and direct invocation recheck sources modal focus and job context" {
+    const theme = @import("theme.zig");
+    const Pane = @import("../core/pane.zig").Pane;
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "source", .data = "" });
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buffer);
+    const left = try Pane.create(io, allocator, buffer[0..len], .{});
+    defer left.destroy();
+    const right = try Pane.create(io, allocator, buffer[0..len], .{});
+    defer right.destroy();
+    const emulator = try Emulator.create(io, allocator, 80, 8);
+    defer emulator.destroy();
+    const state = try State.create(std.Io.failing, allocator, .{ left, right });
+    defer state.destroy();
+    const view = try View.create(allocator, state, emulator);
+    defer view.destroy();
+    var frame = ui.Frame.init(allocator);
+    defer frame.deinit();
+    try view.paint(&frame, .{ .width = 80, .height = 24 });
+    try std.testing.expect(!state.available(.copy));
+    try std.testing.expect(!state.available(.move));
+    try std.testing.expect(!state.available(.delete));
+    try std.testing.expect(state.available(.mkdir));
+    try std.testing.expectEqualDeep(theme.disabled_action, frame.cells[23 * 80 + 33].style);
+    try std.testing.expectEqualDeep(theme.action, frame.cells[23 * 80 + 49].style);
+    try view.event(&.{ .key = .f5 });
+    try std.testing.expect(!try state.invoke(.copy, emulator));
+    try std.testing.expect(state.view().modal == .none);
+    try std.testing.expect(state.view().operation == null);
+    try left.refresh();
+    for (0..5000) |_| {
+        _ = try state.poll();
+        if (left.view().status != .loading) break;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try view.event(&.{ .key = .down });
+    try std.testing.expect(state.available(.copy));
+    try view.paint(&frame, .{ .width = 80, .height = 24 });
+    try std.testing.expectEqualDeep(theme.action, frame.cells[23 * 80 + 33].style);
+    // A previously enabled action cannot bypass current pane/source observations.
+    try view.event(&.{ .key = .tab });
+    try std.testing.expect(!try state.invoke(.copy, emulator));
+    try view.event(&.{ .key = .tab });
+    try std.testing.expect(try state.invoke(.help, emulator));
+    try std.testing.expect(!try state.invoke(.copy, emulator));
+    try std.testing.expect(!try state.invoke(.quit, emulator));
+    try std.testing.expect(!try state.invoke(.toggle_terminal, emulator));
+    try view.paint(&frame, .{ .width = 80, .height = 24 });
+    // Help still fits a normal terminal and displays aliases from the binding data.
+    try expectFrameText(&frame, "q/F10 Quit");
+    try expectFrameText(&frame, "Ctrl+G Shell/pane");
+    try expectFrameText(&frame, "Shift+PgDn History down");
+    try expectFrameText(&frame, "Any key closes help");
+    try view.event(&.{ .key = .f5 }); // Help dismissal must not also open Copy.
+    try std.testing.expect(state.view().modal == .none);
+    var decoder: ui.input.Decoder = .{};
+    try feed(view, &decoder, "t");
+    try std.testing.expect(!try state.invoke(.copy, emulator));
+    try std.testing.expect(!try state.invoke(.quit, emulator));
+    try feed(view, &decoder, "\x1b[15~q\x1b[21~t/\x0c\x07");
+    try std.testing.expectEqualStrings("\x1b[15~q\x1b[21~t/\x0c", emulator.queued());
+    try std.testing.expect(!state.view().quit);
+    try std.testing.expect(view.panes[0].focused());
+    try std.testing.expect(try state.invoke(.mkdir, emulator));
+    try std.testing.expect(!try state.invoke(.copy, emulator));
+    try state.submit("created");
+    // Launch failure stays uncollected across availability, invocation and paint.
+    for (0..3) |_| {
+        try std.testing.expect(state.available(.quit));
+        try std.testing.expect(state.available(.toggle_terminal));
+        try std.testing.expect(!state.available(.mkdir));
+        try std.testing.expect(!try state.invoke(.copy, emulator));
+        try view.paint(&frame, .{ .width = 80, .height = 24 });
+        try std.testing.expectEqualDeep(theme.action, frame.cells[23 * 80 + 74].style);
+        try std.testing.expectEqualDeep(theme.disabled_action, frame.cells[23 * 80 + 49].style);
+        try std.testing.expect(state.view().operation.?.status() == .running);
+    }
+    try view.event(&.{ .key = .f5 });
+    try std.testing.expect(state.view().modal == .none);
+    try feed(view, &decoder, "\x07");
+    try std.testing.expect(view.terminal.focused());
+    try std.testing.expect(!try state.invoke(.quit, emulator));
+    try feed(view, &decoder, "\x07");
+    try std.testing.expect(view.modal.focused());
+    try view.event(&.{ .key = .f10 });
+    try std.testing.expect(state.view().quit);
+}
+
+fn expectFrameText(frame: *const ui.Frame, expected: []const u8) !void {
+    for (0..frame.rows) |y| {
+        var row: std.ArrayList(u8) = .empty;
+        defer row.deinit(std.testing.allocator);
+        for (frame.cells[y * frame.cols ..][0..frame.cols]) |cell| try row.appendSlice(std.testing.allocator, cell.text);
+        if (std.mem.indexOf(u8, row.items, expected) != null) return;
+    }
+    return error.MissingFrameText;
+}
+
+test "View retains path aliases terminal geometry and job quit text binding" {
+    const Pane = @import("../core/pane.zig").Pane;
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const left = try Pane.create(io, allocator, "/tmp", .{});
+    defer left.destroy();
+    const right = try Pane.create(io, allocator, "/", .{});
+    defer right.destroy();
+    const emulator = try Emulator.create(io, allocator, 80, 8);
+    defer emulator.destroy();
+    const state = try State.create(std.Io.failing, allocator, .{ left, right });
+    defer state.destroy();
+    const view = try View.create(allocator, state, emulator);
+    defer view.destroy();
+    var decoder: ui.input.Decoder = .{};
+    try feed(view, &decoder, "\x0c");
+    try std.testing.expectEqualStrings("/tmp", state.view().modal.editor.input.text());
+    try view.event(&.{ .key = .escape });
+    try feed(view, &decoder, "/");
+    try std.testing.expectEqualStrings("/", state.view().modal.editor.input.text());
+    try std.testing.expect(!state.view().modal.editor.input.select_all);
+    try view.event(&.{ .key = .escape });
+    try feed(view, &decoder, "++-");
+    try std.testing.expectEqual(@as(i32, 1), state.view().adjustment);
+    try feed(view, &decoder, "z");
+    try std.testing.expect(state.view().zoom);
+    try std.testing.expect(view.terminal.focused());
+    try std.testing.expect(!try state.invoke(.grow_terminal, emulator));
+    try feed(view, &decoder, "\x07");
+    try std.testing.expect(!state.view().zoom);
+    try std.testing.expect(view.panes[0].focused());
+    // Extra key modifiers retain their existing matching behavior.
+    try view.event(&.{ .key = .f7, .shift = true, .alt = true, .ctrl = true });
+    try std.testing.expect(state.view().modal.editor.action == .mkdir);
+    try state.submit("unused");
+    try feed(view, &decoder, "t"); // Only Ctrl+G may switch focus in the job scope.
+    try std.testing.expect(view.modal.focused());
+    try feed(view, &decoder, "q");
+    try std.testing.expect(state.view().quit);
+}
+
+test "View and direct commands share current provider support without starting work" {
+    const directory = @import("../core/directory.zig");
+    const Pane = @import("../core/pane.zig").Pane;
+    const theme = @import("theme.zig");
+    const Fixture = struct {
+        writable: bool = true,
+        scans: std.atomic.Value(usize) = .init(0),
+        fn capabilities(context: ?*anyopaque, _: []const u8) directory.Capabilities {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            return .{ .source_read = true, .destination_write = self.writable };
+        }
+        fn scan(context: ?*anyopaque, io: std.Io, path: []const u8, options: directory.Options, canceled: *const std.atomic.Value(bool)) !directory.Snapshot {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            _ = self.scans.fetchAdd(1, .monotonic);
+            return directory.local.scan(null, io, path, options, canceled);
+        }
+    };
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "source", .data = "" });
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buffer);
+    const foreign_identity: u8 = 0;
+    for ([_]bool{ false, true }) |foreign| {
+        var fixture: Fixture = .{};
+        var provider = directory.local;
+        provider.context = &fixture;
+        provider.capabilities = Fixture.capabilities;
+        provider.scan = Fixture.scan;
+        if (foreign) provider.identity = &foreign_identity;
+        const left = try Pane.create(io, allocator, buffer[0..len], .{});
+        defer left.destroy();
+        const right = try Pane.create(io, allocator, buffer[0..len], .{ .provider = provider });
+        defer right.destroy();
+        const emulator = try Emulator.create(io, allocator, 80, 8);
+        defer emulator.destroy();
+        const state = try State.create(io, allocator, .{ left, right });
+        defer state.destroy();
+        const view = try View.create(allocator, state, emulator);
+        defer view.destroy();
+        for (state.panes()) |pane| try pane.refresh();
+        for (0..5000) |_| {
+            _ = try state.poll();
+            if (left.view().status != .loading and right.view().status != .loading) break;
+            try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+        }
+        try view.event(&.{ .key = .down });
+        try std.testing.expectEqual(!foreign, state.available(.copy));
+        try std.testing.expectEqual(!foreign, state.available(.move));
+        try std.testing.expect(state.available(.delete));
+        // Capabilities can change after an observation, without a scan or focus change.
+        fixture.writable = false;
+        var frame = ui.Frame.init(allocator);
+        defer frame.deinit();
+        for (0..3) |_| {
+            try view.paint(&frame, .{ .width = 80, .height = 24 });
+            try std.testing.expect(!state.available(.copy));
+            try std.testing.expect(!state.available(.move));
+            try std.testing.expect(!try state.invoke(.copy, emulator));
+            try std.testing.expect(!try state.invoke(.move, emulator));
+            try std.testing.expectEqualDeep(theme.disabled_action, frame.cells[23 * 80 + 33].style);
+        }
+        try view.event(&.{ .key = .f5 });
+        try view.event(&.{ .key = .f6 });
+        try std.testing.expect(state.view().modal == .none);
+        try std.testing.expect(state.view().operation == null);
+        try view.event(&.{ .key = .tab });
+        try view.event(&.{ .key = .down });
+        try std.testing.expect(!try state.invoke(.mkdir, emulator));
+        try std.testing.expect(!try state.invoke(.delete, emulator));
+        try view.event(&.{ .key = .f7 });
+        try view.event(&.{ .key = .f8 });
+        try std.testing.expect(state.view().modal == .none);
+        try std.testing.expect(state.view().operation == null);
+        try std.testing.expectEqual(@as(usize, 1), fixture.scans.load(.acquire));
+        fixture.writable = true;
+        // Capability bits alone never authorize an unsupported provider executor.
+        try std.testing.expectEqual(!foreign, state.available(.mkdir));
+        try std.testing.expectEqual(!foreign, state.available(.delete));
+        try std.testing.expectEqual(!foreign, try state.invoke(.mkdir, emulator));
+        if (!foreign) state.dismiss();
+        try std.testing.expectEqual(@as(usize, 1), fixture.scans.load(.acquire));
+        _ = try tmp.dir.statFile(io, "source", .{});
+    }
 }

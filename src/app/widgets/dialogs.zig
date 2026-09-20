@@ -4,6 +4,7 @@ const PathInput = @import("lighthouse-ui").TextInput;
 const Pane = @import("../../core/pane.zig").Pane;
 const operations = @import("../../core/operations.zig");
 const dialog = @import("lighthouse-ui").dialog;
+const commands = @import("../commands.zig");
 const theme = @import("../theme.zig");
 const path_dialog_width = 84;
 const job_dialog_width = 90;
@@ -21,7 +22,7 @@ pub fn deleteSize(job: *const operations.Job) Size {
 }
 
 pub const operation_size: Size = .{ .width = job_dialog_width, .height = 8 };
-pub const help_size: Size = .{ .width = help_dialog_width, .height = help_lines.len + 2 };
+pub const help_size: Size = .{ .width = help_dialog_width, .height = help_lines.len + commands.help_groups.len + 3 };
 
 pub fn paintPathInput(painter: ui.Painter, editor: *const PathInput, action: ?operations.Kind, pane: ?*const Pane) !void {
     const style = theme.dialog;
@@ -115,21 +116,11 @@ const help_lines = [_][]const u8{
     "Arrows / PgUp / PgDn / Home / End   Move cursor",
     "Enter / Right                      Enter directory",
     "Backspace / Left                   Parent directory",
-    "Tab                                Switch pane",
     "Space / Insert                     Mark / mark and advance",
     "Shift+Up/Down/Home/End               Toggle marks while moving",
-    "Ctrl+L / /                         Enter path / absolute path",
-    "F5 / F6 / F7                       Copy / move or rename / mkdir",
-    "F8                                 Delete (with confirmation)",
-    "Ctrl+R                             Refresh current directory",
     "Esc                                Cancel read / clear error",
     ".                                  Toggle hidden files",
     "s / r                              Sort field / reverse order",
-    "Ctrl+G / t                         Focus shell",
-    "+ / - / z                          Terminal height / zoom",
-    "Shift+PgUp / Shift+PgDn             Terminal history",
-    "q / F10                            Quit",
-    "Any key closes help. Shell keys pass through when focused.",
 };
 
 pub fn paintHelp(painter: ui.Painter) void {
@@ -137,6 +128,29 @@ pub fn paintHelp(painter: ui.Painter) void {
     const box = dialog.beginIn(painter, help_size.width, help_size.height, style);
     const inside = box.inset(1);
     for (help_lines, 0..) |line, i| inside.label(0, i, line, style);
+    for (commands.help_groups, 0..) |group, row| {
+        var x: usize = 0;
+        for (group, 0..) |id, i| {
+            const description = commands.describe(id);
+            if (i > 0) {
+                inside.label(x, help_lines.len + row, " | ", style);
+                x += 3;
+            }
+            for (description.bindings, 0..) |binding, j| {
+                if (j > 0) {
+                    inside.label(x, help_lines.len + row, "/", style);
+                    x += 1;
+                }
+                inside.label(x, help_lines.len + row, binding.text, style);
+                x += binding.text.len;
+            }
+            inside.label(x, help_lines.len + row, " ", style);
+            x += 1;
+            inside.label(x, help_lines.len + row, description.help, style);
+            x += description.help.len;
+        }
+    }
+    inside.label(0, help_lines.len + commands.help_groups.len, "Any key closes help. Shell keys pass through when focused.", style);
 }
 
 test "file action dialogs fit tiny windows with Unicode input" {
